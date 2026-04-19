@@ -1,10 +1,30 @@
-# Novelex
-
 <p align="center">
-  <img src="./icon.jpg" alt="Novelex icon" width="240" />
+  <img src="./icon.jpg" alt="Novelex icon" width="360" />
 </p>
 
-Novelex 是一个面向长篇网络小说创作的本地化、人机协同、多 Agent 写作工作台。
+<p align="center">
+  面向长篇网络小说创作的本地化、Human-in-the-loop、多 Agent 写作工作台
+</p>
+
+<p align="center">
+  把大纲、正文、审计、风格、考据、状态管理和人审节点，组织成一条可追踪的长篇写作流水线。
+</p>
+
+<p align="center">
+  <a href="https://github.com/Kailai1104/Novelex"><img src="https://img.shields.io/badge/GitHub-Kailai1104%2FNovelex-181717?logo=github" alt="GitHub"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue" alt="License"></a>
+  <img src="https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white" alt="Node.js >= 20">
+  <img src="https://img.shields.io/badge/status-local%20first-2ea44f" alt="Local First">
+  <img src="https://img.shields.io/badge/workflow-human--in--the--loop-0969da" alt="Human in the loop">
+</p>
+
+<p align="center">
+  <a href="#5-分钟快速上手">快速开始</a> ·
+  <a href="#核心能力">核心能力</a> ·
+  <a href="#这套系统是怎么工作的">工作流</a> ·
+  <a href="#环境准备">环境准备</a> ·
+  <a href="#许可证">许可证</a>
+</p>
 
 ## 设计哲学
 

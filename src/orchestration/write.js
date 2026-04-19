@@ -2,11 +2,8 @@ import path from "node:path";
 
 import { PLAN_STATUS, REVIEW_TARGETS, WRITE_STATUS } from "../core/defaults.js";
 import {
-  assembleChapterMarkdown,
   buildChapterMeta,
   buildStyleGuide,
-  createSceneDraft,
-  reorderChapterScenes,
   updateCharacterStates,
   updateForeshadowingRegistry,
   updateWorldState,
@@ -492,6 +489,7 @@ function buildResearchMarkdown(packet) {
 function collectResearchSources(raw) {
   const seen = new Set();
   const sources = [];
+  const visited = new WeakSet();
 
   function pushSource(candidate, fallbackType = "web") {
     if (!candidate || typeof candidate !== "object") {
@@ -528,6 +526,10 @@ function collectResearchSources(raw) {
     if (typeof node !== "object") {
       return;
     }
+    if (visited.has(node)) {
+      return;
+    }
+    visited.add(node);
 
     if (node.type === "url_citation" && node.url) {
       pushSource(node, "citation");
@@ -550,6 +552,7 @@ function collectResearchSources(raw) {
 
 function hasWebSearchEvidence(raw) {
   let used = false;
+  const visited = new WeakSet();
 
   function visit(node) {
     if (used || !node) {
@@ -562,6 +565,10 @@ function hasWebSearchEvidence(raw) {
     if (typeof node !== "object") {
       return;
     }
+    if (visited.has(node)) {
+      return;
+    }
+    visited.add(node);
 
     if (
       node.type === "web_search_call" ||
@@ -996,6 +1003,13 @@ function validationSummary(validation) {
   return summarizeAuditResult(validation);
 }
 
+function ensureChapterValidationPassed(chapterPlan, validation) {
+  if (validation?.overallPassed) {
+    return;
+  }
+  throw new Error(`${chapterPlan?.chapterId || "chapter"} 审计未通过：${validationSummary(validation)}`);
+}
+
 function buildDerivedChapterStateArtifacts({
   currentCharacterStates,
   chapterPlan,
@@ -1151,11 +1165,17 @@ function buildCharacterDossiers(bundle, chapterPlan, characterStates) {
     });
 }
 
-function scenePromptInput({
+function sanitizeChapterMarkdown(title, markdown = "") {
+  const body = sanitizeDraftText(markdown)
+    .replace(/^#\s+.+\n+/u, "")
+    .trim();
+
+  return body ? `# ${title}\n\n${body}` : `# ${title}`;
+}
+
+function chapterPromptInput({
   project,
   chapterPlan,
-  scene,
-  sceneIndex,
   historyPacket,
   foreshadowingSummary = "",
   characterStateSummary = "",
@@ -1170,13 +1190,25 @@ function scenePromptInput({
   revisionNotes = [],
   mode = "draft",
 }) {
-  const currentEvent = chapterPlan.keyEvents[sceneIndex] || chapterPlan.keyEvents.at(-1);
   const povCharacter = chapterPlan.povCharacter || project.protagonistName || "主角";
   const governanceContract = buildGovernedInputContract({
     chapterIntent: governance?.chapterIntent,
     contextPackage: governance?.contextPackage,
     ruleStack: governance?.ruleStack,
   });
+  const sceneBlueprint = (chapterPlan.scenes || [])
+    .map((scene, index) => [
+      `${index + 1}. ${scene.label}`,
+      `地点=${scene.location}`,
+      `焦点=${scene.focus}`,
+      `张力=${scene.tension}`,
+      `作用=${scene.scenePurpose || scene.focus}`,
+      `承接=${scene.inheritsFromPrevious || "无"}`,
+      `结果=${scene.outcome || "无"}`,
+      `交棒=${scene.handoffToNext || "无"}`,
+      `人物=${(scene.characters || []).join("、") || "无"}`,
+    ].join("｜"))
+    .join("\n");
 
   return [
     `作品：${project.title}`,
@@ -1186,24 +1218,16 @@ function scenePromptInput({
     `硬性视角规则：全文必须使用第三人称有限视角，叙述中只能写“${povCharacter}看见/听见/想到”，禁止使用“我/我们”作为旁白人称；对白里的第一人称不受此限制。`,
     "写法要求：直接输出可发布的网络小说正文，不要解释提纲，不要总结主题，不要写“本章将要”“这一章里”这类元话语。",
     "语言要求：优先用动作、对白、现场反应推进；少写抽象判断、空泛感慨和整段概括性总结。",
+    "结构要求：必须严格按 scene 顺序推进，覆盖每场的职责、结果与交棒，不得重复开场、重置时间线，不能把同一场危机重新从头演一遍。",
     governanceContract ? `治理输入合同：\n${governanceContract}` : "",
-    `场景：${scene.label}`,
-    `地点：${scene.location}`,
-    `焦点：${scene.focus}`,
-    `张力：${scene.tension}`,
     `本章主线：${chapterPlan.dominantThread || "无"}`,
     `本章线索结构：${chapterPlan.threadMode || "single_spine"}`,
     `章节入口承接：${chapterPlan.entryLink || historyPacket.lastEnding}`,
     `章节出口压力：${chapterPlan.exitPressure || chapterPlan.nextHook}`,
-    `本场所属线程：${scene.threadId || "main"}`,
-    `本场情节作用：${scene.scenePurpose || scene.focus}`,
-    `本场承接自：${scene.inheritsFromPrevious || historyPacket.lastEnding || "保持与上文自然衔接"}`,
-    `本场产出结果：${scene.outcome || "把局势推向下一步"}`,
-    `本场交棒给下一场：${scene.handoffToNext || chapterPlan.nextHook || "把问题交给下一场"}`,
-    `本场景必须落地的事件：${currentEvent}`,
+    `本章必须落地的事件：${chapterPlan.keyEvents.join("；")}`,
+    `本章场景蓝图：\n${sceneBlueprint || "无 scene 蓝图"}`,
     `上文衔接：${historyPacket.lastEnding}`,
-    `连续性锚点：${historyPacket.continuityAnchors[sceneIndex] || chapterPlan.continuityAnchors[sceneIndex] || "保持与上文自然衔接"}`,
-    `本章硬性事件：${chapterPlan.keyEvents.join("；")}`,
+    `连续性锚点：${(historyPacket.continuityAnchors || chapterPlan.continuityAnchors || []).join("；") || "保持与上文自然衔接"}`,
     `章末牵引：${chapterPlan.nextHook}`,
     `本章伏笔任务：${foreshadowingSummary || "无"}`,
     `本章角色动态：\n${characterStateSummary || "无"}`,
@@ -1212,18 +1236,28 @@ function scenePromptInput({
     `范文参考包：\n${referencePacket?.briefingMarkdown || "当前没有额外范文参考。"}`,
     `黄金三章参考包：\n${openingReferencePacket?.briefingMarkdown || "当前没有额外黄金三章参考。"}`,
     `整理后的写前上下文：\n${writerContextPacket?.briefingMarkdown || "当前没有额外 Writer 上下文包。"}`,
-    `登场角色：${scene.characters?.join("、") || chapterPlan.charactersPresent.join("、")}`,
+    `登场角色：${chapterPlan.charactersPresent.join("、")}`,
     `人物一致性档案：\n${characterDossiers.length ? characterDossiers.map((item) => item.markdown).join("\n\n") : "本场暂无可用主角色 dossier。"}`,
     `风格指南：\n${styleGuideText}`,
     `历史衔接摘要：\n${historyPacket.briefingMarkdown || historyPacket.contextSummary || "无额外上下文"}`,
-    revisionNotes.length ? `人类修订意见：${revisionNotes.join("；")}` : "",
-    "只输出该场景正文，不要额外标题，不要分点，不要附加解释。",
+    revisionNotes.length ? `人类反馈：${revisionNotes.join("；")}` : "",
+    "只输出完整章节正文，不要额外解释；若未输出章节标题，系统会自动补齐。",
   ]
     .filter(Boolean)
     .join("\n");
 }
 
-async function generateSceneDrafts({
+function chapterDraftFromMarkdown(chapterPlan, markdown = "") {
+  const normalizedMarkdown = sanitizeChapterMarkdown(chapterPlan.title, markdown);
+  return {
+    markdown: normalizedMarkdown,
+    sceneDrafts: [],
+    usedForeshadowings: chapterPlan.foreshadowingActions.map((item) => item.id),
+    dialogueCount: (normalizedMarkdown.match(/“/g) || []).length,
+  };
+}
+
+async function generateChapterDraftText({
   provider,
   project,
   chapterPlan,
@@ -1240,48 +1274,22 @@ async function generateSceneDrafts({
   styleGuideText = "",
   revisionNotes = [],
   mode = "draft",
-  existingSceneDrafts = [],
+  currentDraft = null,
 }) {
-  const sceneDrafts = [];
-  for (let index = 0; index < chapterPlan.scenes.length; index += 1) {
-    const scene = chapterPlan.scenes[index];
-    const currentSceneDraft = existingSceneDrafts.find((item) => item.sceneId === scene.id);
-    const instructions = mode === "style_repair"
-      ? "你是 Novelex 的 WriterAgent。下面会给你一段已有场景草稿。请在不改变既定事件、角色关系和冲突走向的前提下，把它改写成真正可发布的网络小说正文。必须严格使用第三人称有限视角，禁止出现旁白第一人称；不要复述提纲，不要写说明文，不要加入场景标题、系统备注或总结性尾巴。输出前自行检查旁白里是否残留“我/我们”。"
-      : mode === "validation_repair"
-        ? "你是 Novelex 的 WriterAgent。下面会给你一段已有场景草稿和验证反馈。请在保留既定剧情事实、人物关系和冲突方向的前提下，重写这一场，使缺失事件真正落地、人物反应更可信、伏笔更自然、文风更像可发布的网络小说正文。不要输出解释，不要写标题。"
-        : "你是 Novelex 的 WriterAgent。请把输入信息转成真正的网络小说正文。保持 POV 稳定、人物声音清晰、段落节奏自然；不要复述提纲，不要写说明文，不要用总结句替代剧情推进。";
-    const input = (mode === "style_repair" || mode === "validation_repair") && currentSceneDraft
-      ? [
-          `待修正文：\n${currentSceneDraft.markdown}`,
-          scenePromptInput({
-            project,
-            chapterPlan,
-            scene,
-            sceneIndex: index,
-            historyPacket,
-            foreshadowingSummary,
-            characterStateSummary,
-            sceneBeatSummary,
-            researchPacket,
-            referencePacket,
-            openingReferencePacket,
-            writerContextPacket,
-            governance,
-            characterDossiers,
-            styleGuideText,
-            revisionNotes,
-            mode,
-          }),
-          mode === "style_repair"
-            ? "改写要求：保留这一场已经成立的事件、人物立场和场面关系，只修正叙述视角、语言质感与元信息污染。"
-            : "改写要求：严格依据验证反馈补足真正缺失的事件或因果，让场景更像正文，而不是提纲说明。",
-        ].join("\n\n")
-      : scenePromptInput({
+  const instructions = mode === "style_repair"
+    ? "你是 Novelex 的 WriterAgent。下面会给你一整章已有草稿。请在不改变既定事件链、scene 顺序、角色关系和冲突走向的前提下，把它改写成真正可发布的网络小说正文。必须严格使用第三人称有限视角，禁止出现旁白第一人称；不要复述提纲，不要写说明文，不要加入场景标题、系统备注或总结性尾巴。"
+    : mode === "validation_repair"
+      ? "你是 Novelex 的 WriterAgent。下面会给你一整章已有草稿和验证反馈。请在保留既定剧情事实、scene 顺序、人物关系和冲突方向的前提下，重写整章，使缺失事件真正落地、人物反应更可信、伏笔更自然、文风更像可发布的网络小说正文。不要输出解释。"
+      : mode === "rewrite"
+        ? "你是 Novelex 的 WriterAgent。请根据作者反馈重写整章。保持既定 chapter plan、scene 顺序、人物知识边界和章末牵引，同时把语言改得更像可发布的网络小说正文。不要输出解释。"
+        : "你是 Novelex 的 WriterAgent。请把输入信息转成完整可发布的网络小说章节正文。保持 POV 稳定、人物声音清晰、段落节奏自然；不要复述提纲，不要写说明文，不要用总结句替代剧情推进。";
+
+  const input = currentDraft?.markdown
+    ? [
+        `待修正文：\n${currentDraft.markdown}`,
+        chapterPromptInput({
           project,
           chapterPlan,
-          scene,
-          sceneIndex: index,
           historyPacket,
           foreshadowingSummary,
           characterStateSummary,
@@ -1295,147 +1303,41 @@ async function generateSceneDrafts({
           styleGuideText,
           revisionNotes,
           mode,
-        });
-    const result = await provider.generateText({
-      instructions,
-      input,
-      metadata: {
-        feature: "scene_draft",
-        chapterId: chapterPlan.chapterId,
-        sceneId: scene.id,
-      },
-    });
-
-    sceneDrafts.push(
-      createSceneDraft({
+        }),
+        mode === "style_repair"
+          ? "改写要求：保留章节事实、scene 顺序和场面关系，只修正叙述视角、语言质感与元信息污染。"
+          : mode === "validation_repair"
+            ? "改写要求：严格依据验证反馈补足真正缺失的事件或因果，让整章更像正文，而不是提纲说明。"
+            : "改写要求：在不偏离既定章节结构的前提下，响应作者反馈，整章重写。",
+      ].join("\n\n")
+    : chapterPromptInput({
+        project,
         chapterPlan,
-        scene,
-        sceneIndex: index,
-        foreshadowingSummary,
         historyPacket,
+        foreshadowingSummary,
+        characterStateSummary,
+        sceneBeatSummary,
+        researchPacket,
+        referencePacket,
+        openingReferencePacket,
+        writerContextPacket,
+        governance,
+        characterDossiers,
+        styleGuideText,
         revisionNotes,
-        overrideText: result.text,
-      }),
-    );
-  }
+        mode,
+      });
 
-  return sceneDrafts;
-}
-
-async function rewriteChapterForStyle({
-  provider,
-  project,
-  chapterPlan,
-  currentDraft,
-  historyPacket,
-  foreshadowingSummary,
-  characterStateSummary,
-  sceneBeatSummary,
-  researchPacket,
-  referencePacket,
-  openingReferencePacket,
-  writerContextPacket,
-  governance,
-  characterDossiers,
-  styleGuideText,
-  styleIssues = [],
-}) {
-  const repairNotes = [
-    "硬性修正：全文必须改成第三人称有限视角，禁止旁白使用“我/我们”。",
-    "硬性修正：删除一切场景标题、写作备注、人工修订重点、修订补笔等元信息。",
-    ...styleIssues,
-  ];
-
-  const repairedSceneDrafts = await generateSceneDrafts({
-    provider,
-    project,
-    chapterPlan,
-    historyPacket,
-    foreshadowingSummary,
-    characterStateSummary,
-    sceneBeatSummary,
-    researchPacket,
-    referencePacket,
-    openingReferencePacket,
-    writerContextPacket,
-    governance,
-    characterDossiers,
-    styleGuideText,
-    revisionNotes: repairNotes,
-    mode: "style_repair",
-    existingSceneDrafts: currentDraft?.sceneDrafts || [],
+  const result = await provider.generateText({
+    instructions,
+    input,
+    metadata: {
+      feature: mode === "draft" ? "chapter_draft" : "chapter_rewrite",
+      chapterId: chapterPlan.chapterId,
+    },
   });
 
-  return chapterDraftFromScenes(
-    chapterPlan,
-    repairedSceneDrafts,
-    foreshadowingSummary,
-    repairNotes,
-  );
-}
-
-async function rewriteChapterFromValidation({
-  provider,
-  project,
-  chapterPlan,
-  currentDraft,
-  historyPacket,
-  foreshadowingSummary,
-  characterStateSummary,
-  sceneBeatSummary,
-  researchPacket,
-  referencePacket,
-  openingReferencePacket,
-  writerContextPacket,
-  governance,
-  characterDossiers,
-  styleGuideText,
-  validation,
-}) {
-  const repairNotes = collectAuditRepairNotes(validation);
-
-  const repairedSceneDrafts = await generateSceneDrafts({
-    provider,
-    project,
-    chapterPlan,
-    historyPacket,
-    foreshadowingSummary,
-    characterStateSummary,
-    sceneBeatSummary,
-    researchPacket,
-    referencePacket,
-    openingReferencePacket,
-    writerContextPacket,
-    governance,
-    characterDossiers,
-    styleGuideText,
-    revisionNotes: repairNotes,
-    mode: "validation_repair",
-    existingSceneDrafts: currentDraft?.sceneDrafts || [],
-  });
-
-  return chapterDraftFromScenes(
-    chapterPlan,
-    repairedSceneDrafts,
-    foreshadowingSummary,
-    repairNotes,
-  );
-}
-
-function chapterDraftFromScenes(chapterPlan, sceneDrafts, foreshadowingSummary = "", revisionNotes = []) {
-  const markdown = assembleChapterMarkdown(
-    chapterPlan.title,
-    sceneDrafts,
-    revisionNotes,
-    chapterPlan,
-  );
-
-  return {
-    markdown,
-    sceneDrafts,
-    usedForeshadowings: chapterPlan.foreshadowingActions.map((item) => item.id),
-    dialogueCount: (markdown.match(/“/g) || []).length,
-  };
+  return chapterDraftFromMarkdown(chapterPlan, result.text);
 }
 
 function sanitizeDraftText(markdown = "") {
@@ -1448,83 +1350,6 @@ function sanitizeDraftText(markdown = "") {
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-}
-
-async function locallyRewriteScenes({
-  provider,
-  project,
-  chapterPlan,
-  draftBundle,
-  historyPacket,
-  foreshadowingSummary,
-  characterStateSummary,
-  sceneBeatSummary,
-  researchPacket,
-  referencePacket,
-  openingReferencePacket,
-  writerContextPacket,
-  governance,
-  characterDossiers,
-  styleGuideText,
-  feedback,
-  sceneIds,
-}) {
-  const selectedIds = new Set(sceneIds);
-  const rewritten = [];
-
-  for (let index = 0; index < chapterPlan.scenes.length; index += 1) {
-    const scene = chapterPlan.scenes[index];
-    const current = (draftBundle.sceneDrafts || []).find((item) => item.sceneId === scene.id);
-    if (!selectedIds.has(scene.id)) {
-      if (!current) {
-        throw new Error(`聚焦重写时缺少现有场景草稿：${scene.id}`);
-      }
-      rewritten.push(current);
-      continue;
-    }
-    const result = await provider.generateText({
-      instructions:
-        "你是 Novelex 的 WriterAgent。请只重写指定场景，保留既定事件、人物知识边界和 POV，同时把语言改得更像可发布的网络小说正文，不要输出解释。",
-      input: [
-        `重写目标场景：${scene.id} ${scene.label}`,
-        `现有场景文本：${current?.markdown || ""}`,
-        `人类反馈：${feedback}`,
-        scenePromptInput({
-          project,
-          chapterPlan,
-          scene,
-          sceneIndex: index,
-          historyPacket,
-          foreshadowingSummary,
-          characterStateSummary,
-          sceneBeatSummary,
-          researchPacket,
-          referencePacket,
-          openingReferencePacket,
-          writerContextPacket,
-          governance,
-          characterDossiers,
-          styleGuideText,
-          revisionNotes: [feedback],
-          mode: "rewrite",
-        }),
-      ].join("\n\n"),
-      metadata: {
-        feature: "scene_local_rewrite",
-        chapterId: chapterPlan.chapterId,
-        sceneId: scene.id,
-      },
-    });
-
-    rewritten.push({
-      sceneId: scene.id,
-      sceneLabel: scene.label,
-      location: scene.location,
-      markdown: sanitizeDraftText(result.text),
-    });
-  }
-
-  return rewritten;
 }
 
 function parseSceneIdList(rawValue) {
@@ -2942,7 +2767,7 @@ async function generateChapterDraft({
     steps: buildChapterPreparationSteps(resources),
   };
 
-  const sceneDrafts = await generateSceneDrafts({
+  let chapterDraft = await generateChapterDraftText({
     provider,
     project: projectState.project,
     chapterPlan,
@@ -2960,12 +2785,6 @@ async function generateChapterDraft({
     revisionNotes: [],
     mode: "draft",
   });
-  let chapterDraft = chapterDraftFromScenes(
-    chapterPlan,
-    sceneDrafts,
-    resources.foreshadowingSummary,
-    [],
-  );
   let validation = await runChapterAudit({
     store,
     provider,
@@ -2992,11 +2811,10 @@ async function generateChapterDraft({
   );
 
   if (needsAuditStyleRepair(validation)) {
-    chapterDraft = await rewriteChapterForStyle({
+    chapterDraft = await generateChapterDraftText({
       provider,
       project: projectState.project,
       chapterPlan,
-      currentDraft: chapterDraft,
       historyPacket: resources.historyPacket,
       foreshadowingSummary: resources.foreshadowingSummary,
       characterStateSummary: resources.characterStateSummary,
@@ -3008,10 +2826,12 @@ async function generateChapterDraft({
       governance: resources.governance,
       characterDossiers: resources.characterDossiers,
       styleGuideText: resources.styleGuideText,
-      styleIssues: collectAuditRepairNotes(validation, {
+      revisionNotes: collectAuditRepairNotes(validation, {
         dimensionIds: ["pov_consistency", "meta_leak"],
         severities: ["critical", "warning"],
       }),
+      mode: "style_repair",
+      currentDraft: chapterDraft,
     });
     validation = await runChapterAudit({
       store,
@@ -3039,11 +2859,10 @@ async function generateChapterDraft({
   }
 
   if (!validation.overallPassed) {
-    chapterDraft = await rewriteChapterFromValidation({
+    chapterDraft = await generateChapterDraftText({
       provider,
       project: projectState.project,
       chapterPlan,
-      currentDraft: chapterDraft,
       historyPacket: resources.historyPacket,
       foreshadowingSummary: resources.foreshadowingSummary,
       characterStateSummary: resources.characterStateSummary,
@@ -3055,7 +2874,9 @@ async function generateChapterDraft({
       governance: resources.governance,
       characterDossiers: resources.characterDossiers,
       styleGuideText: resources.styleGuideText,
-      validation,
+      revisionNotes: collectAuditRepairNotes(validation),
+      mode: "validation_repair",
+      currentDraft: chapterDraft,
     });
     validation = await runChapterAudit({
       store,
@@ -3081,6 +2902,8 @@ async function generateChapterDraft({
       ),
     );
   }
+
+  ensureChapterValidationPassed(chapterPlan, validation);
 
   const derivedState = buildDerivedChapterStateArtifacts({
     currentCharacterStates: resources.currentCharacterStates,
@@ -3153,7 +2976,7 @@ async function generateChapterDraft({
     providerSnapshot: provider.settings,
     reviewState: {
       mode: "initial",
-      availableSceneIds: chapterPlan.scenes.map((scene) => scene.id),
+      strategy: "chapter_generation",
     },
     rewriteHistory: existingRewriteHistory,
   });
@@ -3391,10 +3214,25 @@ export async function reviewChapter(
   const normalizedSelectedSceneRefs = Array.isArray(selectedSceneRefs) ? selectedSceneRefs : parseSceneIdList(selectedSceneRefs);
   const normalizedSceneIds = Array.isArray(sceneIds) ? sceneIds : parseSceneIdList(sceneIds);
   const normalizedSceneOrder = Array.isArray(sceneOrder) ? sceneOrder : parseSceneIdList(sceneOrder);
+  const rawReviewAction = String(reviewAction || "").trim();
+  if (
+    pendingTarget === REVIEW_TARGETS.CHAPTER &&
+    !approved &&
+    (
+      rawReviewAction === "local_rewrite" ||
+      rawReviewAction === "structural_rewrite" ||
+      normalizedSceneIds.length ||
+      normalizedSceneOrder.length
+    )
+  ) {
+    throw new Error("章节审查已切换为整章模式，不再支持 local_rewrite、structural_rewrite、sceneIds 或 sceneOrder。");
+  }
   const normalizedReviewAction = normalizeChapterReviewAction(reviewAction, approved);
   const rewriteStrategy = approved
     ? null
-    : resolveRewriteStrategy(reviewAction, normalizedSceneIds, normalizedSceneOrder);
+    : pendingTarget === REVIEW_TARGETS.CHAPTER
+      ? "chapter_rewrite"
+      : resolveRewriteStrategy(reviewAction, normalizedSceneIds, normalizedSceneOrder);
 
   if (pendingTarget === REVIEW_TARGETS.CHAPTER && !approved && normalizedReviewAction !== "rewrite") {
     throw new Error(`未知的章节审查动作：${reviewAction}`);
@@ -3591,23 +3429,54 @@ export async function reviewChapter(
     sceneIds: normalizedSceneIds,
     sceneOrder: normalizedSceneOrder,
   }];
+  const historyPacket = historyContextFromDraft(draftBundle);
+  const writerContext = writerContextFromDraft(draftBundle);
+  const governance = governanceFromDraft(draftBundle, chapterPlanBase);
+  const foreshadowingSummary = summarizeForeshadowingAdvice(foreshadowingAdvice, chapterPlanBase);
+  const characterStateSummary = summarizeCharacterStates(focusedCharacterStates);
+  const sceneBeatSummary = summarizeSceneBeats(chapterPlanBase);
 
-  if (rewriteStrategy === "scene_patch") {
-    if (!normalizedSceneIds.length) {
-      throw new Error("按场景聚焦重写时至少需要指定一个 sceneId。");
-    }
+  let rewrittenDraft = await generateChapterDraftText({
+    provider,
+    project: projectState.project,
+    chapterPlan: chapterPlanBase,
+    historyPacket,
+    foreshadowingSummary,
+    characterStateSummary,
+    sceneBeatSummary,
+    researchPacket,
+    referencePacket,
+    openingReferencePacket,
+    writerContextPacket: writerContext,
+    governance,
+    characterDossiers,
+    styleGuideText,
+    revisionNotes: [feedback].filter(Boolean),
+    mode: "rewrite",
+    currentDraft: {
+      markdown: draftBundle.chapterMarkdown || "",
+    },
+  });
+  let validation = await runChapterAudit({
+    store,
+    provider,
+    project: projectState.project,
+    chapterPlan: chapterPlanBase,
+    chapterDraft: rewrittenDraft,
+    historyPacket,
+    foreshadowingAdvice,
+    researchPacket,
+    styleGuideText,
+    characterStates: currentCharacterStates,
+    foreshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
+    chapterMetas,
+  });
 
-    const historyPacket = historyContextFromDraft(draftBundle);
-    const writerContext = writerContextFromDraft(draftBundle);
-    const governance = governanceFromDraft(draftBundle, chapterPlanBase);
-    const foreshadowingSummary = summarizeForeshadowingAdvice(foreshadowingAdvice, chapterPlanBase);
-    const characterStateSummary = summarizeCharacterStates(focusedCharacterStates);
-    const sceneBeatSummary = summarizeSceneBeats(chapterPlanBase);
-    const rewrittenSceneDrafts = await locallyRewriteScenes({
+  if (needsAuditStyleRepair(validation)) {
+    rewrittenDraft = await generateChapterDraftText({
       provider,
       project: projectState.project,
       chapterPlan: chapterPlanBase,
-      draftBundle,
       historyPacket,
       foreshadowingSummary,
       characterStateSummary,
@@ -3619,17 +3488,14 @@ export async function reviewChapter(
       governance,
       characterDossiers,
       styleGuideText,
-      feedback,
-      sceneIds: normalizedSceneIds,
+      revisionNotes: collectAuditRepairNotes(validation, {
+        dimensionIds: ["pov_consistency", "meta_leak"],
+        severities: ["critical", "warning"],
+      }),
+      mode: "style_repair",
+      currentDraft: rewrittenDraft,
     });
-
-    let rewrittenDraft = chapterDraftFromScenes(
-      chapterPlanBase,
-      rewrittenSceneDrafts,
-      foreshadowingSummary,
-      [feedback],
-    );
-    let validation = await runChapterAudit({
+    validation = await runChapterAudit({
       store,
       provider,
       project: projectState.project,
@@ -3643,408 +3509,122 @@ export async function reviewChapter(
       foreshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
       chapterMetas,
     });
-    if (needsAuditStyleRepair(validation)) {
-      rewrittenDraft = await rewriteChapterForStyle({
-        provider,
-        project: projectState.project,
-        chapterPlan: chapterPlanBase,
-        currentDraft: rewrittenDraft,
-        historyPacket,
-        foreshadowingSummary,
-        characterStateSummary,
-        sceneBeatSummary,
-        researchPacket,
-        referencePacket,
-        openingReferencePacket,
-        writerContextPacket: writerContext,
-        governance,
-        characterDossiers,
-        styleGuideText,
-        styleIssues: collectAuditRepairNotes(validation, {
-          dimensionIds: ["pov_consistency", "meta_leak"],
-          severities: ["critical", "warning"],
-        }),
-      });
-      validation = await runChapterAudit({
-        store,
-        provider,
-        project: projectState.project,
-        chapterPlan: chapterPlanBase,
-        chapterDraft: rewrittenDraft,
-        historyPacket,
-        foreshadowingAdvice,
-        researchPacket,
-        styleGuideText,
-        characterStates: currentCharacterStates,
-        foreshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
-        chapterMetas,
-      });
-    }
-    if (!validation.overallPassed) {
-      rewrittenDraft = await rewriteChapterFromValidation({
-        provider,
-        project: projectState.project,
-        chapterPlan: chapterPlanBase,
-        currentDraft: rewrittenDraft,
-        historyPacket,
-        foreshadowingSummary,
-        characterStateSummary,
-        sceneBeatSummary,
-        researchPacket,
-        referencePacket,
-        openingReferencePacket,
-        writerContextPacket: writerContext,
-        governance,
-        characterDossiers,
-        styleGuideText,
-        validation,
-      });
-      validation = await runChapterAudit({
-        store,
-        provider,
-        project: projectState.project,
-        chapterPlan: chapterPlanBase,
-        chapterDraft: rewrittenDraft,
-        historyPacket,
-        foreshadowingAdvice,
-        researchPacket,
-        styleGuideText,
-        characterStates: currentCharacterStates,
-        foreshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
-        chapterMetas,
-      });
-    }
-
-    const scenePatchState = buildDerivedChapterStateArtifacts({
-      currentCharacterStates,
-      chapterPlan: chapterPlanBase,
-      project: projectState.project,
-      chapterDraft: rewrittenDraft,
-      worldStateBase: bundle.worldState,
-      structureData: bundle.structureData,
-      foreshadowingRegistryBase: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
-    });
-
-    await store.stageChapterDraft({
-      ...draftBundle,
-      chapterPlan: chapterPlanBase,
-      chapterMarkdown: rewrittenDraft.markdown,
-      sceneDrafts: rewrittenDraft.sceneDrafts,
-      researchPacket,
-      referencePacket,
-      openingReferencePacket,
-      validation,
-      auditDrift: validation.auditDrift,
-      chapterMeta: scenePatchState.chapterMeta,
-      characterStates: scenePatchState.characterStates,
-      worldState: scenePatchState.worldState,
-      foreshadowingRegistry: scenePatchState.foreshadowingRegistry,
-      retrieval: historyPacket,
-      historyContext: historyPacket,
-      planContext: draftBundle.planContext || {},
-      writerContext,
-      chapterIntent: governance.chapterIntent,
-      contextPackage: governance.contextPackage,
-      ruleStack: governance.ruleStack,
-      contextTrace: governance.contextTrace,
-      reviewState: {
-        mode: "rewrite",
-        strategy: rewriteStrategy,
-        availableSceneIds: chapterPlanBase.scenes.map((scene) => scene.id),
-        lastFeedback: feedback || "",
-      },
-      rewriteHistory,
-    });
-
-    const rewriteRun = {
-      id: runId("write"),
-      phase: "write",
-      startedAt: nowIso(),
-      finishedAt: nowIso(),
-      target: REVIEW_TARGETS.CHAPTER,
-      chapterId: pending.chapterId,
-      summary: `${pending.chapterId} 已根据人类反馈重写并回到待审状态。`,
-      steps: [
-        step(
-          "rewrite",
-          "WriterAgent",
-          "write",
-          `根据人类反馈聚焦重写场景：${normalizedSceneIds.join("、")}`,
-          { preview: createExcerpt(feedback || "", 160) },
-        ),
-        step("validation_after_rewrite", "Validation", "write", validationSummary(validation)),
-      ],
-    };
-    await store.saveRun(rewriteRun);
-
-    projectState.phase.write = {
-      ...projectState.phase.write,
-      status: WRITE_STATUS.CHAPTER_PENDING_REVIEW,
-      pendingReview: {
-        ...pending,
-        requestedAt: nowIso(),
-        runId: rewriteRun.id,
-      },
-      rejectionNotes: [feedback].filter(Boolean),
-      rewriteHistory,
-    };
-    const savedProject = await store.saveProject(projectState);
-    return {
-      project: savedProject,
-      run: rewriteRun,
-      summary: `${pending.chapterId} 已完成重写，等待再次审查。`,
-    };
   }
 
-  if (rewriteStrategy === "chapter_rebuild") {
-    const rewrittenChapterPlan = reorderChapterScenes(chapterPlanBase, normalizedSceneOrder);
-    const {
-      planContext,
-      historyContext: historyPacket,
-      writerContext: baseWriterContext,
-    } = await buildWriterContextBundle({
-      store,
+  if (!validation.overallPassed) {
+    rewrittenDraft = await generateChapterDraftText({
       provider,
       project: projectState.project,
-      bundle,
-      chapterPlan: rewrittenChapterPlan,
-      chapterMetas,
-      characterStates: currentCharacterStates,
-      foreshadowingAdvice,
-      styleGuideText,
-      styleGuideSourcePath,
-      researchPacket,
-    });
-    const rebuiltReferencePacket = await buildReferencePacket({
-      store,
-      provider,
-      project: projectState.project,
-      chapterPlan: rewrittenChapterPlan,
-      planContext,
-      historyContext: historyPacket,
-      researchPacket,
-    });
-    let rebuiltOpeningReferencePacket = createEmptyOpeningReferencePacket({
-      mode: "chapter_write",
-    });
-    if (Number(rewrittenChapterPlan?.chapterNumber || 0) <= 3) {
-      rebuiltOpeningReferencePacket = await buildOpeningReferencePacket({
-        store,
-        provider,
-        project: projectState.project,
-        mode: "chapter_write",
-        chapterPlan: rewrittenChapterPlan,
-        planContext,
-        historyContext: historyPacket,
-      });
-    }
-    const writerContextWithReference = mergeReferenceIntoWriterContext(baseWriterContext, rebuiltReferencePacket);
-    const writerContext = mergeOpeningIntoWriterContext(writerContextWithReference, rebuiltOpeningReferencePacket);
-    const governance = buildGovernanceResources({
-      chapterPlan: rewrittenChapterPlan,
-      planContext,
-      historyPacket,
-      writerContext,
-      foreshadowingAdvice,
-      researchPacket,
-      referencePacket: rebuiltReferencePacket,
-      openingReferencePacket: rebuiltOpeningReferencePacket,
-      styleGuideText,
-      styleGuideSourcePath,
-    });
-    const foreshadowingSummary = summarizeForeshadowingAdvice(foreshadowingAdvice, rewrittenChapterPlan);
-    const characterStateSummary = summarizeCharacterStates(focusedCharacterStates);
-    const sceneBeatSummary = summarizeSceneBeats(rewrittenChapterPlan);
-    const rewrittenSceneDrafts = await generateSceneDrafts({
-      provider,
-      project: projectState.project,
-      chapterPlan: rewrittenChapterPlan,
+      chapterPlan: chapterPlanBase,
       historyPacket,
       foreshadowingSummary,
       characterStateSummary,
       sceneBeatSummary,
       researchPacket,
-      referencePacket: rebuiltReferencePacket,
-      openingReferencePacket: rebuiltOpeningReferencePacket,
+      referencePacket,
+      openingReferencePacket,
       writerContextPacket: writerContext,
       governance,
       characterDossiers,
       styleGuideText,
-      revisionNotes: [feedback].filter(Boolean),
+      revisionNotes: collectAuditRepairNotes(validation),
+      mode: "validation_repair",
+      currentDraft: rewrittenDraft,
+    });
+    validation = await runChapterAudit({
+      store,
+      provider,
+      project: projectState.project,
+      chapterPlan: chapterPlanBase,
+      chapterDraft: rewrittenDraft,
+      historyPacket,
+      foreshadowingAdvice,
+      researchPacket,
+      styleGuideText,
+      characterStates: currentCharacterStates,
+      foreshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
+      chapterMetas,
+    });
+  }
+
+  ensureChapterValidationPassed(chapterPlanBase, validation);
+
+  const rewrittenState = buildDerivedChapterStateArtifacts({
+    currentCharacterStates,
+    chapterPlan: chapterPlanBase,
+    project: projectState.project,
+    chapterDraft: rewrittenDraft,
+    worldStateBase: bundle.worldState,
+    structureData: bundle.structureData,
+    foreshadowingRegistryBase: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
+  });
+
+  await store.stageChapterDraft({
+    ...draftBundle,
+    chapterPlan: chapterPlanBase,
+    chapterMarkdown: rewrittenDraft.markdown,
+    sceneDrafts: [],
+    researchPacket,
+    referencePacket,
+    openingReferencePacket,
+    validation,
+    auditDrift: validation.auditDrift,
+    chapterMeta: rewrittenState.chapterMeta,
+    characterStates: rewrittenState.characterStates,
+    worldState: rewrittenState.worldState,
+    foreshadowingRegistry: rewrittenState.foreshadowingRegistry,
+    retrieval: historyPacket,
+    historyContext: historyPacket,
+    planContext: draftBundle.planContext || {},
+    writerContext,
+    chapterIntent: governance.chapterIntent,
+    contextPackage: governance.contextPackage,
+    ruleStack: governance.ruleStack,
+    contextTrace: governance.contextTrace,
+    reviewState: {
       mode: "rewrite",
-    });
+      strategy: rewriteStrategy,
+      lastFeedback: feedback || "",
+    },
+    rewriteHistory,
+  });
 
-    let rewrittenDraft =
-      chapterDraftFromScenes(rewrittenChapterPlan, rewrittenSceneDrafts, foreshadowingSummary, [feedback].filter(Boolean));
-    let validation = await runChapterAudit({
-      store,
-      provider,
-      project: projectState.project,
-      chapterPlan: rewrittenChapterPlan,
-      chapterDraft: rewrittenDraft,
-      historyPacket,
-      foreshadowingAdvice,
-      researchPacket,
-      styleGuideText,
-      characterStates: currentCharacterStates,
-      foreshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
-      chapterMetas,
-    });
-    if (needsAuditStyleRepair(validation)) {
-      rewrittenDraft = await rewriteChapterForStyle({
-        provider,
-        project: projectState.project,
-        chapterPlan: rewrittenChapterPlan,
-        currentDraft: rewrittenDraft,
-        historyPacket,
-        foreshadowingSummary,
-        characterStateSummary,
-        sceneBeatSummary,
-        researchPacket,
-        referencePacket: rebuiltReferencePacket,
-        openingReferencePacket: rebuiltOpeningReferencePacket,
-        writerContextPacket: writerContext,
-        governance,
-        characterDossiers,
-        styleGuideText,
-        styleIssues: collectAuditRepairNotes(validation, {
-          dimensionIds: ["pov_consistency", "meta_leak"],
-          severities: ["critical", "warning"],
-        }),
-      });
-      validation = await runChapterAudit({
-        store,
-        provider,
-        project: projectState.project,
-        chapterPlan: rewrittenChapterPlan,
-        chapterDraft: rewrittenDraft,
-        historyPacket,
-        foreshadowingAdvice,
-        researchPacket,
-        styleGuideText,
-        characterStates: currentCharacterStates,
-        foreshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
-        chapterMetas,
-      });
-    }
-    if (!validation.overallPassed) {
-      rewrittenDraft = await rewriteChapterFromValidation({
-        provider,
-        project: projectState.project,
-        chapterPlan: rewrittenChapterPlan,
-        currentDraft: rewrittenDraft,
-        historyPacket,
-        foreshadowingSummary,
-        characterStateSummary,
-        sceneBeatSummary,
-        researchPacket,
-        referencePacket: rebuiltReferencePacket,
-        openingReferencePacket: rebuiltOpeningReferencePacket,
-        writerContextPacket: writerContext,
-        governance,
-        characterDossiers,
-        styleGuideText,
-        validation,
-      });
-      validation = await runChapterAudit({
-        store,
-        provider,
-        project: projectState.project,
-        chapterPlan: rewrittenChapterPlan,
-        chapterDraft: rewrittenDraft,
-        historyPacket,
-        foreshadowingAdvice,
-        researchPacket,
-        styleGuideText,
-        characterStates: currentCharacterStates,
-        foreshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
-        chapterMetas,
-      });
-    }
+  const rewriteRun = {
+    id: runId("write"),
+    phase: "write",
+    startedAt: nowIso(),
+    finishedAt: nowIso(),
+    target: REVIEW_TARGETS.CHAPTER,
+    chapterId: pending.chapterId,
+    summary: `${pending.chapterId} 已根据人类反馈重写并回到待审状态。`,
+    steps: [
+      step(
+        "rewrite",
+        "WriterAgent",
+        "write",
+        "根据人类反馈重写整章。",
+        { preview: createExcerpt(feedback || "", 160) },
+      ),
+      step("validation_after_rewrite", "Validation", "write", validationSummary(validation)),
+    ],
+  };
+  await store.saveRun(rewriteRun);
 
-    const rebuiltState = buildDerivedChapterStateArtifacts({
-      currentCharacterStates,
-      chapterPlan: rewrittenChapterPlan,
-      project: projectState.project,
-      chapterDraft: rewrittenDraft,
-      worldStateBase: bundle.worldState,
-      structureData: bundle.structureData,
-      foreshadowingRegistryBase: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
-    });
-
-    await store.stageChapterDraft({
-      ...draftBundle,
-      chapterPlan: rewrittenChapterPlan,
-      chapterMarkdown: rewrittenDraft.markdown,
-      sceneDrafts: rewrittenDraft.sceneDrafts,
-      researchPacket,
-      referencePacket: rebuiltReferencePacket,
-      openingReferencePacket: rebuiltOpeningReferencePacket,
-      validation,
-      auditDrift: validation.auditDrift,
-      chapterMeta: rebuiltState.chapterMeta,
-      characterStates: rebuiltState.characterStates,
-      worldState: rebuiltState.worldState,
-      foreshadowingRegistry: rebuiltState.foreshadowingRegistry,
-      retrieval: historyPacket,
-      historyContext: historyPacket,
-      planContext,
-      writerContext,
-      chapterIntent: governance.chapterIntent,
-      contextPackage: governance.contextPackage,
-      ruleStack: governance.ruleStack,
-      contextTrace: governance.contextTrace,
-      reviewState: {
-        mode: "rewrite",
-        strategy: rewriteStrategy,
-        availableSceneIds: rewrittenChapterPlan.scenes.map((scene) => scene.id),
-        lastFeedback: feedback || "",
-      },
-      rewriteHistory,
-    });
-
-    const rewriteRun = {
-      id: runId("write"),
-      phase: "write",
-      startedAt: nowIso(),
-      finishedAt: nowIso(),
-      target: REVIEW_TARGETS.CHAPTER,
-      chapterId: pending.chapterId,
-      summary: `${pending.chapterId} 已根据人类反馈重写并回到待审状态。`,
-      steps: [
-        step(
-          "rewrite",
-          normalizedSceneOrder.length ? "CoordinatorAgent" : "WriterAgent",
-          "write",
-          normalizedSceneOrder.length
-            ? `根据人类反馈重排场景顺序：${normalizedSceneOrder.join(" -> ")}`
-            : "根据人类反馈重建上下文并重写整章。",
-          { preview: createExcerpt(feedback || "", 160) },
-        ),
-        step("writer_after_rewrite", "WriterAgent", "write", "整章已按反馈完成重写。"),
-        step("validation_after_rewrite", "Validation", "write", validationSummary(validation)),
-      ],
-    };
-    await store.saveRun(rewriteRun);
-
-    projectState.phase.write = {
-      ...projectState.phase.write,
-      status: WRITE_STATUS.CHAPTER_PENDING_REVIEW,
-      pendingReview: {
-        ...pending,
-        requestedAt: nowIso(),
-        runId: rewriteRun.id,
-      },
-      rejectionNotes: [feedback].filter(Boolean),
-      rewriteHistory,
-    };
-    const savedProject = await store.saveProject(projectState);
-    return {
-      project: savedProject,
-      run: rewriteRun,
-      summary: `${pending.chapterId} 已完成重写，等待再次审查。`,
-    };
-  }
-
-  throw new Error(`未能解析重写策略：${reviewAction}`);
+  projectState.phase.write = {
+    ...projectState.phase.write,
+    status: WRITE_STATUS.CHAPTER_PENDING_REVIEW,
+    pendingReview: {
+      ...pending,
+      requestedAt: nowIso(),
+      runId: rewriteRun.id,
+    },
+    rejectionNotes: [feedback].filter(Boolean),
+    rewriteHistory,
+  };
+  const savedProject = await store.saveProject(projectState);
+  return {
+    project: savedProject,
+    run: rewriteRun,
+    summary: `${pending.chapterId} 已完成重写，等待再次审查。`,
+  };
 }

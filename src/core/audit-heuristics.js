@@ -149,6 +149,111 @@ function detectRepeatedParagraphs(markdown = "") {
   return unique(duplicates).slice(0, 2);
 }
 
+const CHAPTER_REPLAY_PATTERNS = [
+  {
+    id: "impact",
+    pattern: /方向盘|刹车|车灯|白灯|轮胎|玻璃炸碎|撞来|撞上|惊醒|醒了|睁开眼|睁眼|呛醒|咳醒|炮震|炮声|耳鸣/u,
+  },
+  {
+    id: "survival",
+    pattern: /甲板|桅杆|风浪|海水|咸水|木船|船身|唐鹞|炮门|右舷|铜山|岸影/u,
+  },
+  {
+    id: "setup",
+    pattern: /崇祯|通敌|嫌疑|林定海|马会魁|先砍|丢海里|那盏灯|老规矩|昨夜/u,
+  },
+  {
+    id: "verification",
+    pattern: /不是船底|不是龙骨|右舷那扇炮门|右舷腰间|两三浪|水涨慢了|横摇一模一样|先把那扇炮门关上/u,
+  },
+];
+
+function detectRepeatedChapterReplay(markdown = "") {
+  const paragraphs = extractParagraphs(markdown);
+  if (paragraphs.length < 8) {
+    return null;
+  }
+
+  const paragraphSignals = paragraphs.map((paragraph, index) => ({
+    index,
+    text: paragraph,
+    groups: CHAPTER_REPLAY_PATTERNS
+      .filter(({ pattern }) => pattern.test(paragraph))
+      .map(({ id }) => id),
+  }));
+
+  function collapseSignals(items = []) {
+    const clusters = [];
+    for (const item of items) {
+      const window = {
+        start: item.index,
+        end: item.index,
+        groups: [...item.groups],
+        excerpt: createExcerpt(item.text, 120),
+      };
+      const previous = clusters.at(-1);
+      if (previous && window.start <= previous.end + 2) {
+        previous.end = window.end;
+        previous.groups = unique([...previous.groups, ...window.groups]);
+        continue;
+      }
+      clusters.push(window);
+    }
+    return clusters;
+  }
+
+  const restartClusters = collapseSignals(
+    paragraphSignals.filter((item) =>
+      item.groups.includes("impact") || item.groups.includes("survival")),
+  )
+    .filter((cluster) =>
+      cluster.groups.includes("impact") && cluster.groups.includes("survival"));
+  const setupClusters = collapseSignals(
+    paragraphSignals.filter((item) => item.groups.includes("setup")),
+  );
+  const verificationClusters = collapseSignals(
+    paragraphSignals.filter((item) => item.groups.includes("verification")),
+  );
+
+  const hasReplayGap = (clusters = []) =>
+    clusters.length >= 2 && clusters.at(-1).start >= clusters[0].start + 4;
+
+  const repeatedRestart = hasReplayGap(restartClusters);
+  const repeatedSetup = hasReplayGap(setupClusters);
+  const repeatedVerification = hasReplayGap(verificationClusters);
+
+  if (
+    !(repeatedRestart && repeatedSetup) &&
+    !(repeatedRestart && repeatedVerification) &&
+    !(repeatedSetup && repeatedVerification)
+  ) {
+    return null;
+  }
+
+  const evidence = [];
+  const reasons = [];
+
+  if (repeatedRestart) {
+    reasons.push("同章内出现了不止一次“冷启动开场/重新进入险局”的片段。");
+    evidence.push(restartClusters[0].excerpt, restartClusters.at(-1).excerpt);
+  }
+
+  if (repeatedSetup) {
+    reasons.push("同一初始困局被重新建立，像又从开头把人物关系和指控重演了一遍。");
+    evidence.push(setupClusters[0].excerpt, setupClusters.at(-1).excerpt);
+  }
+
+  if (repeatedVerification) {
+    reasons.push("同一条核心验证链被重新演了一遍，像把另一版正文又接进来了。");
+    evidence.push(verificationClusters[0].excerpt, verificationClusters.at(-1).excerpt);
+  }
+
+  return {
+    reasons,
+    evidence: unique(evidence).slice(0, 3),
+  };
+}
+
 function detectSummaryHeavyPacing(markdown = "") {
   const body = removeTitle(markdown);
   const paragraphs = extractParagraphs(markdown);
@@ -493,6 +598,18 @@ export function runAuditHeuristics({
       "章节存在明显重复段落或草稿拼接痕迹，推进感会被严重稀释。",
       repeatedParagraphEvidence.join(" / "),
       "删除重复版本，只保留一条最清晰的事件链，并重接前后因果。",
+    ));
+  }
+
+  const replayEvidence = detectRepeatedChapterReplay(markdown);
+  if (replayEvidence) {
+    issues.push(createIssue(
+      "chapter_restart_replay",
+      "critical",
+      "单章节奏",
+      "章节疑似把多个版本或多次重启的正文串在了一起，时间线被反复拉回开场状态。",
+      replayEvidence.evidence.join(" / "),
+      "只保留一条完整事件链，删除重复开场、重复建立初始困局和重复验证段落。",
     ));
   }
 

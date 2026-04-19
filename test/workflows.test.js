@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { saveCodexApiConfig } from "../src/config/codex-config.js";
+import { runAuditHeuristics } from "../src/core/audit-heuristics.js";
 import { assembleChapterMarkdown, buildStructure, runValidations } from "../src/core/generators.js";
 import { buildStyleFingerprintSummary, renderStyleFingerprintPrompt } from "../src/core/style-fingerprint.js";
 import { createProvider, resolveProviderSettings } from "../src/llm/provider.js";
@@ -1247,7 +1248,7 @@ async function withStubbedOpenAI(callback) {
     }
 
     if (instructions.includes("WriterAgent")) {
-      const eventMatch = inputText.match(/本场景(?:对应|必须落地的)事件：(.+)/);
+      const eventMatch = inputText.match(/本(?:场景|章)(?:对应|必须落地的)事件：(.+)/);
       const feedbackMatch = inputText.match(/人类反馈：(.+)/);
       const event = (eventMatch?.[1] || "推进关键事件").trim();
       const feedback = (feedbackMatch?.[1] || "").trim();
@@ -1287,9 +1288,10 @@ async function withStubbedOpenAI(callback) {
     }
 
     if (instructions.includes("StyleAgent")) {
-      const narrativeOnly = inputText.replace(/“[^”]*”/g, "");
+      const auditedText = inputText.split(/\n\n正文全文：\n/u).at(-1) || inputText;
+      const narrativeOnly = auditedText.replace(/“[^”]*”/g, "");
       const hasFirstPersonNarration = /(^|[。！？\n])\s*我/.test(narrativeOnly);
-      const hasMetaLeakage = /写作备注：|人工修订重点：|修订补笔：|本章的节奏基调保持在|^##\s*场景/m.test(inputText);
+      const hasMetaLeakage = /写作备注：|人工修订重点：|修订补笔：|本章的节奏基调保持在|^##\s*场景/m.test(auditedText);
       const issues = [];
       if (hasFirstPersonNarration) {
         issues.push("正文叙述视角偏向第一人称，未保持第三人称有限视角。");
@@ -1307,9 +1309,10 @@ async function withStubbedOpenAI(callback) {
     }
 
     if (instructions.includes("AuditOrchestrator")) {
-      const narrativeOnly = inputText.replace(/“[^”]*”/g, "");
+      const auditedText = inputText.split(/\n\n正文全文：\n/u).at(-1) || inputText;
+      const narrativeOnly = auditedText.replace(/“[^”]*”/g, "");
       const hasFirstPersonNarration = /(^|[。！？\n])\s*我/.test(narrativeOnly);
-      const hasMetaLeakage = /写作备注：|人工修订重点：|修订补笔：|本章将|这一章里|^##\s*场景/m.test(inputText);
+      const hasMetaLeakage = /写作备注：|人工修订重点：|修订补笔：|本章将|这一章里|^##\s*场景/m.test(auditedText);
       const issues = [];
 
       if (hasFirstPersonNarration) {
@@ -1465,6 +1468,8 @@ test("Novelex workflows can complete a full draft-and-approve cycle", async () =
   assert.equal(stagedChapterDraft.contextTrace?.chapterId, "ch001");
   assert.equal(stagedChapterDraft.historyContext?.retrievalMode, "history-context-agents");
   assert.equal("writingBriefMarkdown" in stagedChapterDraft, false);
+  assert.deepEqual(stagedChapterDraft.sceneDrafts, []);
+  assert.equal(stagedChapterDraft.reviewState?.strategy, "chapter_generation");
   assert.match(stagedChapterDraft.chapterMarkdown || "", /第一章|第一十|# /);
 
   const chapterLocked = await reviewChapter(store, {
@@ -1703,43 +1708,163 @@ test("chapter review uses a unified rewrite action", async () => withIsolatedPro
   await reviewPlanFinal(store, { approved: true, feedback: "" });
   await runWriteChapterThroughOutline(store);
 
-  const localRewrite = await reviewChapter(store, {
+  const rewriteRun = await reviewChapter(store, {
     target: "chapter",
     approved: false,
     reviewAction: "rewrite",
-    feedback: "加强第一场的压迫感和人物试探。",
-    sceneIds: ["ch001_scene_1"],
+    feedback: "加强整章压迫感和人物试探。",
   });
-  assert.equal(localRewrite.project.phase.write.status, "chapter_pending_review");
+  assert.equal(rewriteRun.project.phase.write.status, "chapter_pending_review");
 
-  const locallyRewrittenDraft = await store.loadChapterDraft("ch001");
-  assert.equal(locallyRewrittenDraft.reviewState.mode, "rewrite");
-  assert.equal(locallyRewrittenDraft.reviewState.strategy, "scene_patch");
-  assert.equal(locallyRewrittenDraft.rewriteHistory.length, 1);
-  assert.match(locallyRewrittenDraft.chapterMarkdown, /李凡没有浪费任何时间|推进已经把盘面往更大的方向抬高了/);
+  const rewrittenDraft = await store.loadChapterDraft("ch001");
+  assert.equal(rewrittenDraft.reviewState.mode, "rewrite");
+  assert.equal(rewrittenDraft.reviewState.strategy, "chapter_rewrite");
+  assert.equal(rewrittenDraft.rewriteHistory.length, 1);
+  assert.deepEqual(rewrittenDraft.sceneDrafts, []);
+  assert.match(rewrittenDraft.chapterMarkdown, /加强整章压迫感和人物试探|李凡没有浪费任何时间|推进已经把盘面往更大的方向抬高了/);
 
-  const structuralRewrite = await reviewChapter(store, {
-    target: "chapter",
-    approved: false,
-    reviewAction: "rewrite",
-    feedback: "把碰撞场提前，让开头更快进入冲突。",
-    sceneOrder: ["ch001_scene_3", "ch001_scene_1", "ch001_scene_2"],
+  await assert.rejects(
+    () =>
+      reviewChapter(store, {
+        target: "chapter",
+        approved: false,
+        reviewAction: "local_rewrite",
+        feedback: "只动第一场。",
+        sceneIds: ["ch001_scene_1"],
+      }),
+    /章节审查已切换为整章模式/,
+  );
+
+  await assert.rejects(
+    () =>
+      reviewChapter(store, {
+        target: "chapter",
+        approved: false,
+        reviewAction: "rewrite",
+        feedback: "重排一下。",
+        sceneOrder: ["ch001_scene_3", "ch001_scene_1", "ch001_scene_2"],
+      }),
+    /章节审查已切换为整章模式/,
+  );
+})));
+
+test("chapter generation uses a single WriterAgent pass on a clean draft", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-single-pass-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+
+  const previousFetch = globalThis.fetch;
+  let chapterWriterCalls = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input);
+
+    if (
+      instructions.includes("WriterAgent") &&
+      /^章节：ch001 /m.test(inputText) &&
+      !/模式：style_repair|模式：validation_repair/u.test(inputText) &&
+      !inputText.includes("待修正文：")
+    ) {
+      chapterWriterCalls += 1;
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    const writeRun = await runWriteChapterThroughOutline(store);
+    assert.equal(writeRun.project.phase.write.status, "chapter_pending_review");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const stagedDraft = await store.loadChapterDraft("ch001");
+  assert.equal(chapterWriterCalls, 1);
+  assert.deepEqual(stagedDraft.sceneDrafts, []);
+})));
+
+test("audit heuristics flag repeated chapter restarts as critical issues", () => {
+  const badChapter = [
+    "# 第一章 先把那扇炮门关上",
+    "方向盘顶进胸口的那一下还没来得及疼完，一声炮震就把李凡从黑里砸醒。",
+    "船板猛地一斜，他半张脸拍进冰冷咸水里，唐鹞的炮声和甲板上的喊杀一起压了过来。",
+    "林定海把刀架在他下巴上，问昨夜那盏灯是给谁打的，马会魁在旁边嚷着通敌的先砍。",
+    "李凡盯着右舷那扇炮门，咬死不是船底全裂了，只要再看两三浪，水涨就会慢下来。",
+    "白灯迎面撞来，轮胎尖叫，玻璃炸碎。",
+    "下一瞬又是一门炮在耳边开花，他猛地睁眼，咸水、木船和甲板把同一场海上险局重新拍回脸上。",
+    "这一次还是崇祯二年铜山外海，唐鹞在后头咬着，林定海与马会魁仍在为通敌嫌疑争执。",
+    "他又一次喊先把那扇炮门关上，说不是船底裂了，只要水涨慢下来，就证明右舷腰间才是倒灌口。",
+  ].join("\n\n");
+
+  const heuristics = runAuditHeuristics({
+    chapterPlan: {
+      chapterId: "ch001",
+      title: "先把那扇炮门关上",
+      chapterNumber: 1,
+      emotionalTone: "高压",
+    },
+    chapterDraft: { markdown: badChapter },
+    researchPacket: null,
+    foreshadowingRegistry: { foreshadowings: [] },
+    recentChapters: [],
   });
-  assert.equal(structuralRewrite.project.phase.write.status, "chapter_pending_review");
 
-  const structurallyRewrittenDraft = await store.loadChapterDraft("ch001");
-  assert.equal(structurallyRewrittenDraft.reviewState.mode, "rewrite");
-  assert.equal(structurallyRewrittenDraft.reviewState.strategy, "chapter_rebuild");
-  assert.equal(structurallyRewrittenDraft.chapterPlan.scenes[0].id, "ch001_scene_3");
-  assert.equal(structurallyRewrittenDraft.rewriteHistory.length, 2);
-  assert.equal(
-    structurallyRewrittenDraft.worldState.current_primary_location,
-    structurallyRewrittenDraft.chapterPlan.scenes.at(-1).location,
-  );
-  assert.equal(
-    structurallyRewrittenDraft.characterStates.find((item) => item.name === "李凡")?.physical?.location,
-    structurallyRewrittenDraft.chapterPlan.scenes.at(-1).location,
-  );
+  const replayIssue = heuristics.issues.find((item) => item.id === "chapter_restart_replay");
+  assert.equal(replayIssue?.severity, "critical");
+});
+
+test("chapter generation rejects stitched drafts that replay the opening", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-replay-audit-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+
+  const badChapter = [
+    "# 第一章 先把那扇炮门关上",
+    "方向盘顶进胸口的那一下还没来得及疼完，一声炮震就把李凡从黑里砸醒。",
+    "船板猛地一斜，他半张脸拍进冰冷咸水里，唐鹞的炮声和甲板上的喊杀一起压了过来。",
+    "林定海把刀架在他下巴上，问昨夜那盏灯是给谁打的，马会魁在旁边嚷着通敌的先砍。",
+    "李凡盯着右舷那扇炮门，咬死不是船底全裂了，只要再看两三浪，水涨就会慢下来。",
+    "白灯迎面撞来，轮胎尖叫，玻璃炸碎。",
+    "下一瞬又是一门炮在耳边开花，他猛地睁眼，咸水、木船和甲板把同一场海上险局重新拍回脸上。",
+    "这一次还是崇祯二年铜山外海，唐鹞在后头咬着，林定海与马会魁仍在为通敌嫌疑争执。",
+    "他又一次喊先把那扇炮门关上，说不是船底裂了，只要水涨慢下来，就证明右舷腰间才是倒灌口。",
+  ].join("\n\n");
+
+  const previousFetch = globalThis.fetch;
+  let writerCalls = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+
+    if (instructions.includes("WriterAgent")) {
+      writerCalls += 1;
+      return jsonResponse({
+        output_text: badChapter,
+      });
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    await assert.rejects(
+      () => runWriteChapterThroughOutline(store),
+      /审计未通过/u,
+    );
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  assert.ok(writerCalls >= 2);
 })));
 
 test("WriterAgent prompt includes chapter character dossiers", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
@@ -2167,6 +2292,109 @@ test("ResearchRetriever uses OpenAI web search and passes research findings to W
   assert.ok(Array.isArray(stagedDraft.researchPacket?.sources));
   assert.ok(stagedDraft.researchPacket.sources.length >= 1);
   assert.match(stagedDraft.researchPacket?.briefingMarkdown || "", /研究资料包/);
+})));
+
+test("ResearchRetriever preserves streamed web search evidence when responses are forced to stream", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-research-agent-stream-"));
+  saveCodexApiConfig(tempRoot, {
+    model_provider: "Compat",
+    model: "compat-responses",
+    review_model: "compat-responses",
+    codex_model: "compat-responses",
+    disable_response_storage: true,
+    model_providers: {
+      Compat: {
+        name: "Compat",
+        base_url: "https://compat.example/v1",
+        wire_api: "responses",
+        api_key: "compat-key",
+        response_model: "compat-responses",
+        review_model: "compat-responses",
+        codex_model: "compat-responses",
+      },
+      OpenAI: {
+        name: "OpenAI",
+        base_url: "https://capi.quan2go.com/openai",
+        wire_api: "responses",
+        api_key: "test-key",
+        response_model: "gpt-5.4",
+        review_model: "gpt-5.4",
+        codex_model: "gpt-5.3-codex",
+      },
+    },
+  });
+
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+
+  const previousFetch = globalThis.fetch;
+  const openStreams = [];
+  let sawStreamedResearchRetriever = false;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+
+    if (instructions.includes("ResearchRetriever")) {
+      sawStreamedResearchRetriever = true;
+      assert.equal(payload.stream, true);
+      const streamedRetrieverText = JSON.stringify({
+        summary: "明末福建沿海场景应强调港口、船厂、巡检、营汛与海商网络的混杂秩序，避免现代港务和公司化表达。",
+        factsToUse: [
+          "港口与船厂往往和巡检、营汛、防务组织连在一起，不是现代化单一运营空间。",
+          "海商势力与地方军政力量关系复杂，合作与戒备并存。",
+        ],
+        factsToAvoid: [
+          "不要使用现代企业管理、码头调度中心、安保系统之类说法。",
+          "不要把明末港口写成高度标准化的近代工业港。",
+        ],
+        termBank: [
+          "营汛：沿海驻防与汛地体系",
+          "巡检：基层巡防与缉查职责相关称呼",
+        ],
+        uncertainPoints: ["具体官职细分仍需按具体地域继续核实。"],
+        sourceNotes: [
+          "来源交叉提到沿海防务与海商网络并存。",
+          "地方志和史料性文章都强调场景的军商混杂属性。",
+        ],
+      });
+
+      const stream = hangingSseResponse(
+        [
+          "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_research_stream\",\"output\":[],\"output_text\":\"\"}}\n\n",
+          "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"action\":{\"query\":\"明末福建沿海港口与海防术语\"}}}\n\n",
+          "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"action\":{\"sources\":[{\"title\":\"明代海防研究资料\",\"url\":\"https://example.com/ming-haifang\",\"snippet\":\"沿海卫所、巡检与港口贸易互相交织。\"},{\"title\":\"福建海商与港口秩序\",\"url\":\"https://example.com/fujian-port\",\"snippet\":\"海商网络与地方防务呈复杂共生关系。\"}]}}}\n\n",
+          `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: streamedRetrieverText })}\n\n`,
+          "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_research_stream\",\"output\":[],\"output_text\":\"\"}}\n\n",
+        ],
+        "text/plain; charset=utf-8",
+      );
+      openStreams.push(stream);
+      return stream.response;
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    const writeRun = await runWriteChapterThroughOutline(store);
+    assert.equal(writeRun.project.phase.write.status, "chapter_pending_review");
+  } finally {
+    for (const stream of openStreams) {
+      stream.close();
+    }
+    globalThis.fetch = previousFetch;
+  }
+
+  const stagedDraft = await store.loadChapterDraft("ch001");
+  assert.equal(sawStreamedResearchRetriever, true);
+  assert.equal(stagedDraft.researchPacket?.mode, "search_tool");
+  assert.ok(Array.isArray(stagedDraft.researchPacket?.sources));
+  assert.equal(stagedDraft.researchPacket.sources.length, 2);
+  assert.match(stagedDraft.researchPacket?.summary || "", /军商混杂|明末沿海/);
 })));
 
 test("ResearchPlannerAgent still runs for non-historical chapters", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {

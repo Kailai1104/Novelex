@@ -1404,8 +1404,6 @@ function renderChapterOutlineReviewBox(pending = null) {
 }
 
 function renderChapterReviewBox(pending = null) {
-  const scenes = pending?.chapterPlan?.scenes || [];
-  const defaultSceneOrder = scenes.map((scene) => scene.id).join(", ");
   return renderCollapsibleCard({
     key: "review-chapter",
     className: "review-box",
@@ -1413,31 +1411,9 @@ function renderChapterReviewBox(pending = null) {
     bodyHtml: `
       <p>批准会直接锁章；如果不满意，只需要写清楚修改意见，系统会根据反馈自动重写本章。</p>
       <textarea id="feedback-chapter" placeholder="写下你的修改意见，比如要加强哪段冲突、调整节奏、补足人物动机或优化章末牵引。" ${disabledAttr(mutationBusy())}></textarea>
-      ${scenes.length ? `
-      <div style="margin-top: 14px;">
-        <label style="display:block; font-weight: 600; margin-bottom: 8px;">只重写这些场景</label>
-        <div style="display:grid; gap:8px;">
-          ${scenes
-            .map(
-              (scene) => `
-                <label style="display:flex; gap:8px; align-items:flex-start;">
-                  <input type="checkbox" data-scene-id="${escapeHtml(scene.id)}" ${disabledAttr(mutationBusy())} />
-                  <span><strong>${escapeHtml(scene.id)}</strong> · ${escapeHtml(scene.label)}<br /><small>${escapeHtml(scene.focus || scene.location || "")}</small></span>
-                </label>`,
-            )
-            .join("")}
-        </div>
-      </div>
-      <div style="margin-top: 14px;">
-        <label style="display:block; font-weight: 600; margin-bottom: 8px;">按此顺序重排场景后再重写</label>
-        <input id="scene-order-chapter" value="${escapeHtml(defaultSceneOrder)}" placeholder="例如 ch001_scene_2, ch001_scene_1, ch001_scene_3" ${disabledAttr(mutationBusy())} />
-        <p style="margin-top: 8px;"><small>留空表示不重排。点“仅重写选中场景”时会忽略这里的顺序。</small></p>
-      </div>` : ""}
       <div class="actions">
         <button class="button button-primary" data-review-target="chapter" data-review-action="approve" ${disabledAttr(mutationBusy())}>${mutationBusy("chapter_review") ? "提交中..." : "批准"}</button>
         <button class="button button-danger" data-review-target="chapter" data-review-action="rewrite" ${disabledAttr(mutationBusy())}>${mutationBusy("chapter_review") ? "提交中..." : "根据反馈重写"}</button>
-        ${scenes.length ? `<button class="button button-secondary" data-review-target="chapter" data-review-action="local_rewrite" ${disabledAttr(mutationBusy())}>${mutationBusy("chapter_review") ? "提交中..." : "仅重写选中场景"}</button>` : ""}
-        ${scenes.length ? `<button class="button button-secondary" data-review-target="chapter" data-review-action="structural_rewrite" ${disabledAttr(mutationBusy())}>${mutationBusy("chapter_review") ? "提交中..." : "重排场景并重写"}</button>` : ""}
       </div>
     `,
   });
@@ -2059,12 +2035,6 @@ function bindEvents() {
         : reviewAction === "approve" ? true : button.getAttribute("data-approved") === "true";
       const textarea = document.querySelector(`#feedback-${target}`);
       const feedback = textarea?.value || "";
-      const sceneIds = isWriteReview && reviewAction === "local_rewrite"
-        ? [...document.querySelectorAll("[data-scene-id]:checked")].map((item) => item.getAttribute("data-scene-id"))
-        : [];
-      const sceneOrder = isWriteReview && reviewAction === "structural_rewrite"
-        ? parseCsvList(document.querySelector("#scene-order-chapter")?.value || "")
-        : [];
       const pending = snapshot?.staged?.pendingChapter || null;
       const chapterId = pending?.chapterPlan?.chapterId || pending?.chapterId || "";
       const outlineWorkbench = isOutlineReview ? outlineWorkbenchFor(chapterId, pending) : null;
@@ -2076,16 +2046,6 @@ function bindEvents() {
         variantCount: Number(document.querySelector("#outline-variant-count")?.value || 3),
         diversityPreset: document.querySelector("#outline-diversity-preset")?.value || "wide",
       };
-
-      if (isWriteReview && reviewAction === "local_rewrite" && !sceneIds.length) {
-        showToast("先勾选至少一个场景，再提交局部重写。");
-        return;
-      }
-
-      if (isWriteReview && reviewAction === "structural_rewrite" && !sceneOrder.length) {
-        showToast("先填写新的场景顺序，再提交结构重写。");
-        return;
-      }
 
       if (isOutlineReview && reviewAction === "approve_composed" && !selectedSceneRefs.length) {
         showToast("先往最终细纲工作区加入至少一个 scene，再提交组合定稿。");
@@ -2109,8 +2069,6 @@ function bindEvents() {
               selectedSceneRefs,
               authorNotes: feedback,
               outlineOptions,
-              sceneIds,
-              sceneOrder,
             }),
           });
           applyServerState(data);

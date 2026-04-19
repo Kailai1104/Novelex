@@ -394,6 +394,35 @@ async function parseResponseEventStream(response) {
   let finalPayload = null;
   let streamError = null;
   let sawTerminalEvent = false;
+  const structuredStreamEvents = [];
+  const streamedOutputItems = [];
+
+  function rememberStructuredEvent(payload, type) {
+    // Keep the low-volume structural events so downstream code can still inspect
+    // tool calls or citations even when the proxy omits them from response.completed.
+    if (type === "response.output_text.delta" || type === "response.created" || type === "response.completed") {
+      return;
+    }
+    structuredStreamEvents.push(JSON.parse(JSON.stringify(payload)));
+  }
+
+  function rememberOutputItem(payload, type) {
+    if (
+      (type !== "response.output_item.added" && type !== "response.output_item.done") ||
+      !payload?.item ||
+      typeof payload.item !== "object"
+    ) {
+      return;
+    }
+
+    const outputIndex = Number(payload.output_index);
+    if (Number.isInteger(outputIndex) && outputIndex >= 0) {
+      streamedOutputItems[outputIndex] = payload.item;
+      return;
+    }
+
+    streamedOutputItems.push(payload.item);
+  }
 
   function processChunk(chunk) {
     const lines = chunk.split("\n");
@@ -432,6 +461,9 @@ async function parseResponseEventStream(response) {
     }
 
     const type = payload?.type || eventName;
+    rememberStructuredEvent(payload, type);
+    rememberOutputItem(payload, type);
+
     if (type === "response.output_text.delta" && typeof payload.delta === "string") {
       accumulatedText += payload.delta;
       return;
@@ -502,6 +534,12 @@ async function parseResponseEventStream(response) {
       finalPayload.output_text = accumulatedText.trim();
     }
     if (
+      streamedOutputItems.length &&
+      (!Array.isArray(finalPayload.output) || !finalPayload.output.length)
+    ) {
+      finalPayload.output = streamedOutputItems.filter(Boolean);
+    }
+    if (
       accumulatedText.trim() &&
       (!Array.isArray(finalPayload.output) || !finalPayload.output.length)
     ) {
@@ -518,25 +556,31 @@ async function parseResponseEventStream(response) {
         },
       ];
     }
+    if (structuredStreamEvents.length) {
+      finalPayload.stream_events = structuredStreamEvents;
+    }
     return finalPayload;
   }
 
   return {
     output_text: accumulatedText.trim(),
-    output: accumulatedText.trim()
-      ? [
-          {
-            type: "message",
-            role: "assistant",
-            content: [
-              {
-                type: "output_text",
-                text: accumulatedText.trim(),
-              },
-            ],
-          },
-        ]
-      : [],
+    output: streamedOutputItems.length
+      ? streamedOutputItems.filter(Boolean)
+      : accumulatedText.trim()
+        ? [
+            {
+              type: "message",
+              role: "assistant",
+              content: [
+                {
+                  type: "output_text",
+                  text: accumulatedText.trim(),
+                },
+              ],
+            },
+          ]
+        : [],
+    ...(structuredStreamEvents.length ? { stream_events: structuredStreamEvents } : {}),
   };
 }
 

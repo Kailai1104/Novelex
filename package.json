@@ -1,0 +1,12 @@
+{
+  "name": "novelex",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Novelex: a human-in-the-loop multi-agent web novel writing system",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test"
+  }
+}

@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Node.js
+node_modules/
+coverage/
+*.log
+npm-debug.log*
+
+# Local secrets
+novelex.codex.toml
+.env
+.env.*
+!.env.example
+
+# Local workspace data
+novel_state/
+projects/
+runtime/

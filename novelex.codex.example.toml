@@ -1,0 +1,17 @@
+model_provider = "OpenAI"
+model = "gpt-5.4"
+review_model = "gpt-5.4"
+codex_model = "gpt-5.3-codex"
+model_reasoning_effort = "xhigh"
+disable_response_storage = true
+zhipu_api_key = "YOUR_ZHIPU_API_KEY"
+
+[model_providers.OpenAI]
+name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+wire_api = "responses"
+response_model = "gpt-5.4"
+review_model = "gpt-5.4"
+codex_model = "gpt-5.3-codex"
+requires_openai_auth = true
+api_key = "YOUR_OPENAI_API_KEY"

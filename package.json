@@ -2,6 +2,7 @@
   "name": "novelex",
   "version": "0.1.0",
   "private": true,
+  "license": "SEE LICENSE IN LICENSE",
   "type": "module",
   "description": "Novelex: a human-in-the-loop multi-agent web novel writing system",
   "scripts": {

@@ -887,3 +887,9 @@ projects/<project-id>/novel_state/chapters/
 - 如何把人审节点纳入自动写作流水线
 
 那么 Novelex 的代码会很值得读。
+
+## 许可证
+
+本项目采用 `PolyForm Noncommercial 1.0.0` 许可证发布，允许学习、研究、个人项目及其他非商业用途使用、修改和分发，但**不允许商业使用**。
+
+如需商业授权，请联系仓库维护者另行获得许可。更严格地说，这是一种“源码可见 / source-available”许可证，而不是 OSI 定义下的开源许可证。

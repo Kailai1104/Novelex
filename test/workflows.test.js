@@ -9,15 +9,22 @@ import { runAuditHeuristics } from "../src/core/audit-heuristics.js";
 import { assembleChapterMarkdown, buildStructure, runValidations } from "../src/core/generators.js";
 import { buildStyleFingerprintSummary, renderStyleFingerprintPrompt } from "../src/core/style-fingerprint.js";
 import { createProvider, resolveProviderSettings } from "../src/llm/provider.js";
+import { closeAllWorkspaceMcpManagers } from "../src/mcp/index.js";
 import { buildOpeningReferencePacket } from "../src/opening/reference.js";
 import { generateStyleFingerprint } from "../src/orchestration/style-fingerprint.js";
 import { reviewPlanDraft, reviewPlanFinal, runPlanDraft } from "../src/orchestration/plan.js";
-import { reviewChapter, runWriteChapter } from "../src/orchestration/write.js";
+import { deleteLatestLockedChapter, reviewChapter, runWriteChapter } from "../src/orchestration/write.js";
 import { rebuildOpeningCollectionIndex } from "../src/opening/index.js";
 import { rebuildRagCollectionIndex } from "../src/rag/index.js";
 import { createZhipuEmbeddingClient } from "../src/rag/zhipu.js";
 import { createStore } from "../src/utils/store.js";
 import { createProjectWorkspace, deleteProjectWorkspace, listProjects } from "../src/utils/workspace.js";
+
+const FIXTURE_RUNTIME_SERVER = path.join(process.cwd(), "test", "fixtures", "mcp", "runtime-server.js");
+
+test.afterEach(async () => {
+  await closeAllWorkspaceMcpManagers();
+});
 
 async function withIsolatedProviderEnv(callback) {
   const keys = [
@@ -35,6 +42,7 @@ async function withIsolatedProviderEnv(callback) {
     "NOVELEX_CODEX_MODEL",
     "NOVELEX_REASONING_EFFORT",
     "NOVELEX_FORCE_STREAM",
+    "NOVELEX_FAKE_ZHIPU_EMBEDDINGS",
     "ZHIPU_API_KEY",
   ];
   const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
@@ -69,6 +77,51 @@ function jsonResponse(payload) {
     headers: {
       "Content-Type": "application/json; charset=utf-8",
     },
+  });
+}
+
+function saveFixtureWebSearchMcpConfig(rootDir, overrides = {}) {
+  saveCodexApiConfig(rootDir, {
+    model_provider: "OpenAI",
+    model: "gpt-5.4",
+    review_model: "gpt-5.4",
+    codex_model: "gpt-5.3-codex",
+    disable_response_storage: true,
+    model_providers: {
+      OpenAI: {
+        name: "OpenAI",
+        base_url: "https://openai.example/v1",
+        wire_api: "responses",
+        api_key: "openai-key",
+        response_model: "gpt-5.4",
+        review_model: "gpt-5.4",
+        codex_model: "gpt-5.3-codex",
+      },
+      MiniMax: {
+        name: "MiniMax",
+        base_url: "https://api.minimaxi.com/v1",
+        wire_api: "chat_completions",
+        api_key: "minimax-key",
+        response_model: "MiniMax-M2.5-highspeed",
+        review_model: "MiniMax-M2.5-highspeed",
+        codex_model: "MiniMax-M2.5-highspeed",
+      },
+    },
+    mcp: {
+      enabled: true,
+      servers: {
+        web_search: {
+          enabled: true,
+          transport: "stdio",
+          command: process.execPath,
+          args: [path.join(process.cwd(), "test", "fixtures", "mcp", "web-search-server.js")],
+          startup_timeout_ms: 5000,
+          call_timeout_ms: 5000,
+          env: {},
+        },
+      },
+    },
+    ...overrides,
   });
 }
 
@@ -423,14 +476,16 @@ async function withStubbedOpenAI(callback) {
   const previousFetch = globalThis.fetch;
   const previousKey = process.env.OPENAI_API_KEY;
   const previousZhipuKey = process.env.ZHIPU_API_KEY;
+  const previousFakeEmbeddings = process.env.NOVELEX_FAKE_ZHIPU_EMBEDDINGS;
   process.env.OPENAI_API_KEY = "test-key";
   process.env.ZHIPU_API_KEY = "test-zhipu-key";
+  process.env.NOVELEX_FAKE_ZHIPU_EMBEDDINGS = "true";
 
   globalThis.fetch = async (_url, options = {}) => {
     const targetUrl = String(_url || "");
     const payload = JSON.parse(String(options.body || "{}"));
     const instructions = String(payload.instructions || "");
-    const inputText = extractInputText(payload.input);
+    const inputText = extractInputText(payload.input) || String(payload.input || "");
 
     if (targetUrl.includes("open.bigmodel.cn/api/paas/v4/embeddings")) {
       return jsonResponse({
@@ -588,6 +643,19 @@ async function withStubbedOpenAI(callback) {
             { stage: "阶段3·三线争霸", content: "李凡在明廷、流寇、女真之间周旋与开战，把此前经营成果全面转化为军政优势。" },
             { stage: "阶段4·问鼎中原", content: "李凡完成最终势力整合，在大战与制度重建中决定自己能否真正问鼎天下。" },
           ],
+        }),
+      });
+    }
+
+    if (instructions.includes("FeedbackSupervisorAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          passed: true,
+          summary: "当前版本已经落实作者反馈。",
+          missingItems: [],
+          revisionNotes: [],
+          evidence: "",
+          scopeBlocked: false,
         }),
       });
     }
@@ -851,8 +919,9 @@ async function withStubbedOpenAI(callback) {
     }
 
     if (instructions.includes("ResearchRetriever")) {
-      assert.ok(Array.isArray(payload.tools));
-      assert.ok(payload.tools.some((item) => item?.type === "web_search"));
+      assert.equal(Array.isArray(payload.tools), false);
+      assert.match(inputText, /MCP web_search 结果：/);
+      assert.match(inputText, /明代海防研究资料/);
       return jsonResponse({
         output_text: JSON.stringify({
           summary: "明末福建沿海场景应强调港口、船厂、巡检、营汛与海商网络的混杂秩序，避免现代港务和公司化表达。",
@@ -874,25 +943,6 @@ async function withStubbedOpenAI(callback) {
             "地方志和史料性文章都强调场景的军商混杂属性。",
           ],
         }),
-        output: [
-          {
-            type: "web_search_call",
-            action: {
-              sources: [
-                {
-                  title: "明代海防研究资料",
-                  url: "https://example.com/ming-haifang",
-                  snippet: "沿海卫所、巡检与港口贸易互相交织。",
-                },
-                {
-                  title: "福建海商与港口秩序",
-                  url: "https://example.com/fujian-port",
-                  snippet: "海商网络与地方防务呈复杂共生关系。",
-                },
-              ],
-            },
-          },
-        ],
       });
     }
 
@@ -1165,6 +1215,52 @@ async function withStubbedOpenAI(callback) {
       });
     }
 
+    if (instructions.includes("FactSelectorAgent")) {
+      const selectedFactIds = [...new Set([...inputText.matchAll(/fact_ch\d+_\d+/g)]
+        .map((match) => match[0])
+        .filter(Boolean))]
+        .slice(0, 3);
+      return jsonResponse({
+        output_text: JSON.stringify({
+          selectedFactIds,
+          rationale: "这些既定事实会直接影响当前章节的执行与冲突写法。",
+          establishedFocus: "延续前章已经落地的命令与判断。",
+          tensionFocus: "保留前章留下的风险与争执余波。",
+        }),
+      });
+    }
+
+    if (instructions.includes("ChapterFactExtractionAgent")) {
+      const chapterMatch = inputText.match(/章节：(ch\d+)/);
+      const chapterId = chapterMatch?.[1] || "ch001";
+      return jsonResponse({
+        output_text: JSON.stringify({
+          established_facts: [
+            {
+              type: "order",
+              subject: "李凡",
+              assertion: `${chapterId} 已经明确下令火药与易燃物必须垫高远火摆放。`,
+              evidence: "主角已经把命令当场讲清并要求所有人执行。",
+            },
+            {
+              type: "allocation",
+              subject: "船上人手",
+              assertion: `${chapterId} 已经完成当章核心人手与任务分派。`,
+              evidence: "正文里已经把谁去做什么安排下去了。",
+            },
+          ],
+          open_tensions: [
+            {
+              type: "judgement",
+              subject: "反对者",
+              assertion: `${chapterId} 留下了对新规矩的不满与观望，后续可以继续发酵。`,
+              evidence: "仍有人在等主角的安排出问题。",
+            },
+          ],
+        }),
+      });
+    }
+
     if (instructions.includes("HistoryContextAgent")) {
       return jsonResponse({
         output_text: JSON.stringify({
@@ -1244,6 +1340,16 @@ async function withStubbedOpenAI(callback) {
             style_guide: "需要维持既有写作约束。",
           },
         }),
+      });
+    }
+
+    if (instructions.includes("RevisionAgent")) {
+      const selectionMatch = inputText.match(/只允许改写的原文片段：\n([\s\S]*?)\n\n选区前文锚点：/);
+      const feedbackMatch = inputText.match(/作者修改要求：(.+)/);
+      const selectedText = String(selectionMatch?.[1] || "局部片段").trim();
+      const feedback = (feedbackMatch?.[1] || "").trim();
+      return jsonResponse({
+        output_text: `修订后：${selectedText}${feedback ? `（已按“${feedback}”调整）` : "（已做局部精修）"}`,
       });
     }
 
@@ -1366,6 +1472,11 @@ async function withStubbedOpenAI(callback) {
     } else {
       process.env.ZHIPU_API_KEY = previousZhipuKey;
     }
+    if (previousFakeEmbeddings === undefined) {
+      delete process.env.NOVELEX_FAKE_ZHIPU_EMBEDDINGS;
+    } else {
+      process.env.NOVELEX_FAKE_ZHIPU_EMBEDDINGS = previousFakeEmbeddings;
+    }
   }
 }
 
@@ -1394,6 +1505,16 @@ async function runWriteChapterThroughOutline(store, options = {}) {
     authorNotes: options.authorNotes || "",
     feedback: options.feedback || "",
     outlineOptions: options.outlineOptions || null,
+  });
+}
+
+async function lockNextChapter(store, options = {}) {
+  const writeRun = await runWriteChapterThroughOutline(store, options);
+  assert.equal(writeRun.project.phase.write.status, "chapter_pending_review");
+  return reviewChapter(store, {
+    target: "chapter",
+    approved: true,
+    feedback: "",
   });
 }
 
@@ -1526,6 +1647,139 @@ test("Novelex workflows can complete a full draft-and-approve cycle", async () =
   assert.equal(selectedOutlineExists.selectedProposalId, outlineDraft.chapterOutlineCandidates[0].proposalId);
   assert.equal(committedOutlineExists.chapterPlan.threadMode, "single_spine");
   assert.ok(committedOutlineExists.chapterPlan.entryLink);
+})));
+
+test("deleteLatestLockedChapter removes the latest committed chapter and restores prior write state", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-delete-latest-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanFinal(store, {
+    approved: true,
+    feedback: "",
+  });
+
+  await lockNextChapter(store);
+
+  const deleted = await deleteLatestLockedChapter(store, { chapterId: "ch001" });
+  assert.equal(deleted.project.phase.write.currentChapterNumber, 0);
+  assert.equal(deleted.project.phase.write.pendingReview, null);
+  assert.equal(deleted.project.phase.write.lastRunId, null);
+
+  await assert.rejects(fs.access(path.join(tempRoot, "novel_state", "chapters", "ch001.md")));
+  await assert.rejects(fs.access(path.join(tempRoot, "novel_state", "chapters", "ch001_meta.json")));
+  await assert.rejects(fs.access(path.join(tempRoot, "novel_state", "chapters", "ch001_facts.json")));
+
+  const styleGuideAfterDelete = await fs.readFile(path.join(tempRoot, "novel_state", "style_guide.md"), "utf8");
+  assert.match(styleGuideAfterDelete, /待第1章通过后生成/);
+
+  const factLedger = JSON.parse(await fs.readFile(path.join(tempRoot, "novel_state", "fact_ledger.json"), "utf8"));
+  assert.equal(factLedger.chapterCount, 0);
+  assert.equal(factLedger.factCount, 0);
+
+  const chapterMetas = await store.listChapterMeta();
+  assert.equal(chapterMetas.length, 0);
+  assert.deepEqual(await store.listRuns("write"), []);
+  assert.ok(
+    deleted.project.history.reviews.every((review) =>
+      review.target !== "chapter" && review.target !== "chapter_outline"
+    ),
+  );
+
+  const rerun = await runWriteChapter(store);
+  assert.equal(rerun.project.phase.write.pendingReview?.chapterId, "ch001");
+})));
+
+test("deleteLatestLockedChapter rejects deleting a non-latest committed chapter", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-delete-order-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanFinal(store, {
+    approved: true,
+    feedback: "",
+  });
+
+  await lockNextChapter(store);
+  await lockNextChapter(store);
+
+  await assert.rejects(
+    deleteLatestLockedChapter(store, { chapterId: "ch001" }),
+    /只能删除最新锁定章节 ch002/,
+  );
+
+  const chapterMetas = await store.listChapterMeta();
+  assert.equal(chapterMetas.length, 2);
+  assert.equal(chapterMetas.at(-1)?.chapter_id, "ch002");
+})));
+
+test("chapter approval extracts canon facts into chapter sidecars and the global ledger", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-facts-commit-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+  await runWriteChapterThroughOutline(store);
+  await reviewChapter(store, {
+    target: "chapter",
+    approved: true,
+    feedback: "",
+  });
+
+  const chapterFacts = JSON.parse(await fs.readFile(path.join(tempRoot, "novel_state", "chapters", "ch001_facts.json"), "utf8"));
+  const factLedger = JSON.parse(await fs.readFile(path.join(tempRoot, "novel_state", "fact_ledger.json"), "utf8"));
+
+  assert.equal(chapterFacts.chapterId, "ch001");
+  assert.ok(chapterFacts.factCount >= 1);
+  assert.ok(Array.isArray(chapterFacts.facts));
+  assert.ok(chapterFacts.facts.some((item) => item.status === "established"));
+  assert.ok(factLedger.factCount >= chapterFacts.factCount);
+  assert.ok(factLedger.facts.some((item) => item.chapterId === "ch001"));
+})));
+
+test("later outline prompts expose canon fact sections and trigger fact selection", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-facts-prompts-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+  await runWriteChapterThroughOutline(store);
+  await reviewChapter(store, {
+    target: "chapter",
+    approved: true,
+    feedback: "",
+  });
+
+  const previousFetch = globalThis.fetch;
+  let outlinePrompt = "";
+  let factSelectorCalls = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input) || String(payload.input || "");
+
+    if (instructions.includes("FactSelectorAgent") && inputText.includes("当前章节：ch002")) {
+      factSelectorCalls += 1;
+    }
+    if (!outlinePrompt && instructions.includes("ChapterOutlineAgent") && inputText.includes("当前章节：ch002")) {
+      outlinePrompt = inputText;
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    await runWriteChapterThroughOutline(store);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  assert.match(outlinePrompt, /必须继承的已定事实：/);
+  assert.match(outlinePrompt, /可以继续发酵但不能改写底层结论的开放张力：/);
+  assert.ok(factSelectorCalls >= 1);
 })));
 
 test("plan final approval only commits locally without triggering model calls", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
@@ -1719,7 +1973,10 @@ test("chapter review uses a unified rewrite action", async () => withIsolatedPro
   const rewrittenDraft = await store.loadChapterDraft("ch001");
   assert.equal(rewrittenDraft.reviewState.mode, "rewrite");
   assert.equal(rewrittenDraft.reviewState.strategy, "chapter_rewrite");
+  assert.equal(rewrittenDraft.reviewState.feedbackSupervisionPassed, true);
+  assert.equal(rewrittenDraft.reviewState.feedbackSupervisionAttempts >= 1, true);
   assert.equal(rewrittenDraft.rewriteHistory.length, 1);
+  assert.equal(rewrittenDraft.rewriteHistory[0].feedbackSupervisionPassed, true);
   assert.deepEqual(rewrittenDraft.sceneDrafts, []);
   assert.match(rewrittenDraft.chapterMarkdown, /加强整章压迫感和人物试探|李凡没有浪费任何时间|推进已经把盘面往更大的方向抬高了/);
 
@@ -1745,6 +2002,353 @@ test("chapter review uses a unified rewrite action", async () => withIsolatedPro
         sceneOrder: ["ch001_scene_3", "ch001_scene_1", "ch001_scene_2"],
       }),
     /章节审查已切换为整章模式/,
+  );
+})));
+
+test("chapter rewrite retries when the first rewrite is a no-op", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-rewrite-retry-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+  await runWriteChapterThroughOutline(store);
+
+  const originalDraft = await store.loadChapterDraft("ch001");
+  const previousFetch = globalThis.fetch;
+  let rewriteCalls = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input);
+
+    if (instructions.includes("WriterAgent") && inputText.includes("待修正文：")) {
+      rewriteCalls += 1;
+      if (rewriteCalls === 1) {
+        return jsonResponse({
+          output_text: originalDraft.chapterMarkdown,
+        });
+      }
+      return jsonResponse({
+        output_text: "# 第一章\n\n李凡把呼吸压稳，先盯住最要命的破口，再逼所有人跟上他的节奏。\n这一次他没有重复旧话，而是按“加强整章压迫感和人物试探。”把每一步都推到更险的位置。\n甲板上的人谁也不敢先松那口气，因为下一步只会更狠。",
+      });
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    const rewriteRun = await reviewChapter(store, {
+      target: "chapter",
+      approved: false,
+      reviewAction: "rewrite",
+      feedback: "加强整章压迫感和人物试探。",
+    });
+
+    assert.equal(rewriteRun.project.phase.write.status, "chapter_pending_review");
+    assert.ok(rewriteRun.run.steps.some((item) => item.id === "rewrite_retry"));
+    assert.ok(rewriteRun.run.steps.some((item) => item.label === "FeedbackSupervisorAgent"));
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const rewrittenDraft = await store.loadChapterDraft("ch001");
+  assert.equal(rewriteCalls, 2);
+  assert.notEqual(rewrittenDraft.chapterMarkdown, originalDraft.chapterMarkdown);
+  assert.match(rewrittenDraft.chapterMarkdown, /每一步都推到更险的位置/);
+})));
+
+test("chapter review supports partial rewrite with revision agent context and selection-only replacement", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-partial-rewrite-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+  await runWriteChapterThroughOutline(store);
+
+  const originalDraft = await store.loadChapterDraft("ch001");
+  const originalTitle = originalDraft.chapterMarkdown.split("\n")[0];
+  const originalBody = originalDraft.chapterMarkdown.replace(/^#.+\n\n/u, "");
+  const originalLines = originalBody.split("\n");
+  const selectedText = originalLines[1];
+  const prefixContext = `${originalLines[0]}\n`;
+  const suffixContext = `\n${originalLines.slice(2).join("\n")}`;
+
+  const previousFetch = globalThis.fetch;
+  let sawRevisionPrompt = false;
+  let writerCallsAfterSelection = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input);
+
+    if (instructions.includes("RevisionAgent")) {
+      sawRevisionPrompt = true;
+      assert.match(inputText, /原文全文：/);
+      assert.match(inputText, /只允许改写的原文片段：/);
+      assert.match(inputText, /作者修改要求：把这一段压得更紧，增加试探感。/);
+      assert.match(inputText, /风格指南：/);
+      assert.match(inputText, /整理后的写前上下文：/);
+      assert.match(inputText, /历史衔接摘要：/);
+      assert.match(inputText, /输出要求：只输出替换片段本身/);
+      return jsonResponse({
+        output_text: "替换片段：李凡把话压得更低，先试出对方的底，再把下一步逼近眼前。",
+      });
+    }
+
+    if (instructions.includes("WriterAgent")) {
+      writerCallsAfterSelection += 1;
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    const rewriteRun = await reviewChapter(store, {
+      target: "chapter",
+      approved: false,
+      reviewAction: "partial_rewrite",
+      feedback: "把这一段压得更紧，增加试探感。",
+      selection: {
+        selectedText,
+        prefixContext,
+        suffixContext,
+      },
+    });
+
+    assert.equal(rewriteRun.project.phase.write.status, "chapter_pending_review");
+    assert.ok(rewriteRun.run.steps.some((item) => item.id === "partial_rewrite"));
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const rewrittenDraft = await store.loadChapterDraft("ch001");
+  const rewrittenBody = rewrittenDraft.chapterMarkdown.replace(/^#.+\n\n/u, "");
+  const rewrittenLines = rewrittenBody.split("\n");
+  assert.equal(sawRevisionPrompt, true);
+  assert.equal(writerCallsAfterSelection, 0);
+  assert.equal(rewrittenDraft.chapterMarkdown.split("\n")[0], originalTitle);
+  assert.equal(rewrittenLines[0], originalLines[0]);
+  assert.equal(rewrittenLines[2], originalLines[2]);
+  assert.equal(rewrittenDraft.reviewState.mode, "partial_rewrite");
+  assert.equal(rewrittenDraft.reviewState.strategy, "selection_patch");
+  assert.equal(rewrittenDraft.reviewState.feedbackSupervisionPassed, true);
+  assert.equal(rewrittenDraft.rewriteHistory.length, 1);
+  assert.equal(rewrittenDraft.rewriteHistory[0].mode, "partial_rewrite");
+  assert.equal(rewrittenDraft.rewriteHistory[0].feedbackSupervisionPassed, true);
+  assert.match(rewrittenLines[1], /李凡把话压得更低/);
+  assert.doesNotMatch(rewrittenLines[1], new RegExp(selectedText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+})));
+
+test("partial rewrite retries when the first revision is a no-op", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-partial-rewrite-retry-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+  await runWriteChapterThroughOutline(store);
+
+  const originalDraft = await store.loadChapterDraft("ch001");
+  const originalBody = originalDraft.chapterMarkdown.replace(/^#.+\n\n/u, "");
+  const originalLines = originalBody.split("\n");
+  const selectedText = originalLines[1];
+  const prefixContext = `${originalLines[0]}\n`;
+  const suffixContext = `\n${originalLines.slice(2).join("\n")}`;
+
+  const previousFetch = globalThis.fetch;
+  let revisionCalls = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input);
+
+    if (instructions.includes("RevisionAgent")) {
+      revisionCalls += 1;
+      if (revisionCalls === 1) {
+        return jsonResponse({
+          output_text: selectedText,
+        });
+      }
+      assert.match(inputText, /不能原样重复选中的原文/);
+      return jsonResponse({
+        output_text: "李凡没有立刻把话说满，只把真正致命的那一步压到众人眼前。",
+      });
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    const rewriteRun = await reviewChapter(store, {
+      target: "chapter",
+      approved: false,
+      reviewAction: "partial_rewrite",
+      feedback: "把这一段压得更紧，增加试探感。",
+      selection: {
+        selectedText,
+        prefixContext,
+        suffixContext,
+      },
+    });
+
+    assert.equal(rewriteRun.project.phase.write.status, "chapter_pending_review");
+    assert.ok(rewriteRun.run.steps.some((item) => item.id === "partial_rewrite_retry"));
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const rewrittenDraft = await store.loadChapterDraft("ch001");
+  assert.equal(revisionCalls, 2);
+  assert.equal(rewrittenDraft.reviewState.feedbackSupervisionAttempts, 2);
+  assert.match(rewrittenDraft.chapterMarkdown, /李凡没有立刻把话说满/);
+  assert.doesNotMatch(rewrittenDraft.chapterMarkdown, new RegExp(selectedText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+})));
+
+test("chapter rewrite enters feedback manual review after three unresolved supervision rounds", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-feedback-manual-review-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+  await runWriteChapterThroughOutline(store);
+
+  const previousFetch = globalThis.fetch;
+  let writerCalls = 0;
+  let feedbackCalls = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input);
+
+    if (instructions.includes("FeedbackSupervisorAgent")) {
+      feedbackCalls += 1;
+      return jsonResponse({
+        output_text: JSON.stringify({
+          passed: false,
+          summary: "压迫感仍然不够，人物试探还没有真正压到场上。",
+          missingItems: ["整章压迫感仍然偏弱。", "人物试探还不够锋利。"],
+          revisionNotes: ["把场上压迫感继续压高，让每一步都更危险。", "让人物试探带出更明确的风险与博弈。"],
+          evidence: "局势看起来仍然偏稳，没有真正逼近失控。",
+          scopeBlocked: false,
+        }),
+      });
+    }
+
+    if (instructions.includes("WriterAgent") && inputText.includes("待修正文：")) {
+      writerCalls += 1;
+      return jsonResponse({
+        output_text: `# 第一章\n\n李凡把呼吸压稳，先盯住最要命的破口，再把第 ${writerCalls} 轮应对往更险处推。\n他知道局面还不够狠，于是每一句试探都压得更低，却仍没有真正把所有人的退路逼断。\n甲板上的风越刮越硬，但这一轮局势还没有被彻底顶到失控边缘。`,
+      });
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    const rewriteRun = await reviewChapter(store, {
+      target: "chapter",
+      approved: false,
+      reviewAction: "rewrite",
+      feedback: "加强整章压迫感和人物试探。",
+    });
+
+    assert.equal(rewriteRun.project.phase.write.status, "chapter_pending_review");
+    assert.ok(rewriteRun.run.steps.some((item) => item.id === "feedback_manual_review"));
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const rewrittenDraft = await store.loadChapterDraft("ch001");
+  assert.equal(writerCalls >= 3, true);
+  assert.equal(feedbackCalls >= 3, true);
+  assert.equal(rewrittenDraft.reviewState.strategy, "feedback_manual_review");
+  assert.equal(rewrittenDraft.reviewState.manualReviewRequired, true);
+  assert.equal(rewrittenDraft.reviewState.feedbackSupervisionPassed, false);
+  assert.ok(rewrittenDraft.reviewState.blockingFeedbackIssues.length >= 1);
+})));
+
+test("partial rewrite stops at feedback manual review when supervision says the selection is too narrow", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-partial-scope-blocked-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+  await runWriteChapterThroughOutline(store);
+
+  const originalDraft = await store.loadChapterDraft("ch001");
+  const originalBody = originalDraft.chapterMarkdown.replace(/^#.+\n\n/u, "");
+  const originalLines = originalBody.split("\n");
+  const selectedText = originalLines[1];
+  const prefixContext = `${originalLines[0]}\n`;
+  const suffixContext = `\n${originalLines.slice(2).join("\n")}`;
+
+  const previousFetch = globalThis.fetch;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+
+    if (instructions.includes("RevisionAgent")) {
+      return jsonResponse({
+        output_text: "李凡把话压得更低，先把刀锋递到桌面上，却还没动到后续真正要变的盘面。",
+      });
+    }
+
+    if (instructions.includes("FeedbackSupervisorAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          passed: false,
+          summary: "这条反馈需要改到选区外的承接与结果段，当前选区内无法完整完成。",
+          missingItems: ["选区后的承接段也必须同步改写，当前反馈无法只靠这一段完成。"],
+          revisionNotes: ["如果坚持局部修订，需要人工重新选择更大的连续片段。"],
+          evidence: "当前替换片段只改了局部语气，没有改到后续结果链。",
+          scopeBlocked: true,
+        }),
+      });
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    const rewriteRun = await reviewChapter(store, {
+      target: "chapter",
+      approved: false,
+      reviewAction: "partial_rewrite",
+      feedback: "把这一段压得更紧，并让后续结果直接接上这次试探。",
+      selection: {
+        selectedText,
+        prefixContext,
+        suffixContext,
+      },
+    });
+
+    assert.equal(rewriteRun.project.phase.write.status, "chapter_pending_review");
+    assert.ok(rewriteRun.run.steps.some((item) => item.id === "feedback_manual_review"));
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const rewrittenDraft = await store.loadChapterDraft("ch001");
+  assert.equal(rewrittenDraft.reviewState.strategy, "feedback_manual_review");
+  assert.equal(rewrittenDraft.reviewState.feedbackSupervisionPassed, false);
+  assert.ok(rewrittenDraft.reviewState.blockingFeedbackIssues.some((item) => /选区/u.test(item)));
+
+  await assert.rejects(
+    () => reviewChapter(store, {
+      target: "chapter",
+      approved: true,
+      feedback: "",
+    }),
+    /显式确认 override 风险/,
   );
 })));
 
@@ -1788,6 +2392,78 @@ test("chapter generation uses a single WriterAgent pass on a clean draft", async
   assert.deepEqual(stagedDraft.sceneDrafts, []);
 })));
 
+test("canon fact conflicts stop after two auto-repairs and return to manual review", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-canon-manual-review-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+  await runWriteChapterThroughOutline(store);
+  await reviewChapter(store, {
+    target: "chapter",
+    approved: true,
+    feedback: "",
+  });
+
+  const previousFetch = globalThis.fetch;
+  let chapterWriterCalls = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input) || String(payload.input || "");
+
+    if (instructions.includes("WriterAgent") && inputText.includes("章节：ch002")) {
+      chapterWriterCalls += 1;
+      return jsonResponse({
+        output_text: "李凡把话一压，又把上一章已经落实的火药规矩重新当成第一次临时新提出来。",
+      });
+    }
+
+    if (instructions.includes("AuditOrchestrator") && inputText.includes("ch002")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: "审计发现章节级 canon facts 连续性冲突。",
+          issues: [
+            {
+              id: "canon_fact_continuity",
+              severity: "critical",
+              category: "连续性与边界",
+              description: "把上一章已经落地的火药摆放命令重新写成了首次提出的新规。",
+              evidence: "本章把既定命令重新定义成未定事项。",
+              suggestion: "保留争执后果，但不要重开既定命令本身。",
+            },
+          ],
+          dimensionSummaries: {
+            canon_fact_continuity: "本章重置了上一章已经建立的章节级既定事实。",
+          },
+        }),
+      });
+    }
+
+    return previousFetch(url, options);
+  };
+
+  let writeRun;
+  try {
+    writeRun = await runWriteChapterThroughOutline(store);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const stagedChapterDraft = await store.loadChapterDraft("ch002");
+  assert.equal(writeRun.project.phase.write.status, "chapter_pending_review");
+  assert.equal(stagedChapterDraft.reviewState?.strategy, "canon_fact_manual_review");
+  assert.equal(stagedChapterDraft.reviewState?.manualReviewRequired, true);
+  assert.equal(stagedChapterDraft.reviewState?.canonFactAutoRepairAttempts, 2);
+  assert.ok(Array.isArray(stagedChapterDraft.reviewState?.canonFactIssues));
+  assert.ok(stagedChapterDraft.reviewState.canonFactIssues.length >= 1);
+  assert.ok(writeRun.project.phase.write.rejectionNotes.length >= 1);
+  assert.match(writeRun.run.summary, /人工审核/u);
+  assert.ok(chapterWriterCalls >= 3);
+})));
+
 test("audit heuristics flag repeated chapter restarts as critical issues", () => {
   const badChapter = [
     "# 第一章 先把那扇炮门关上",
@@ -1818,7 +2494,7 @@ test("audit heuristics flag repeated chapter restarts as critical issues", () =>
   assert.equal(replayIssue?.severity, "critical");
 });
 
-test("chapter generation rejects stitched drafts that replay the opening", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+test("chapter generation sends stitched replay drafts to manual review after targeted and full auto-repairs", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-replay-audit-"));
   const store = await createStore(tempRoot);
 
@@ -1840,13 +2516,18 @@ test("chapter generation rejects stitched drafts that replay the opening", async
 
   const previousFetch = globalThis.fetch;
   let writerCalls = 0;
+  let targetedRepairCalls = 0;
 
   globalThis.fetch = async (url, options = {}) => {
     const payload = JSON.parse(String(options.body || "{}"));
     const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input) || String(payload.input || "");
 
     if (instructions.includes("WriterAgent")) {
       writerCalls += 1;
+      if (inputText.includes("模式：targeted_repair")) {
+        targetedRepairCalls += 1;
+      }
       return jsonResponse({
         output_text: badChapter,
       });
@@ -1855,16 +2536,214 @@ test("chapter generation rejects stitched drafts that replay the opening", async
     return previousFetch(url, options);
   };
 
+  let writeRun;
   try {
-    await assert.rejects(
-      () => runWriteChapterThroughOutline(store),
-      /审计未通过/u,
-    );
+    writeRun = await runWriteChapterThroughOutline(store);
   } finally {
     globalThis.fetch = previousFetch;
   }
 
-  assert.ok(writerCalls >= 2);
+  const stagedChapterDraft = await store.loadChapterDraft("ch001");
+  assert.equal(writeRun.project.phase.write.status, "chapter_pending_review");
+  assert.equal(stagedChapterDraft.reviewState?.strategy, "audit_manual_review");
+  assert.equal(stagedChapterDraft.reviewState?.manualReviewRequired, true);
+  assert.equal(stagedChapterDraft.reviewState?.auditAutoRepairAttempts, 3);
+  assert.ok(Array.isArray(stagedChapterDraft.reviewState?.blockingAuditIssues));
+  assert.ok(stagedChapterDraft.reviewState.blockingAuditIssues.length >= 1);
+  assert.ok(writerCalls >= 4);
+  assert.ok(targetedRepairCalls >= 1);
+  assert.match(writeRun.run.summary, /人工审核/u);
+})));
+
+test("chapter generation sends critically short drafts to manual review after targeted and focused auto-repairs", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-word-count-manual-review-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+
+  const projectState = await store.loadProject();
+  projectState.project.targetWordsPerChapter = 800;
+  await store.saveProject(projectState);
+
+  const previousFetch = globalThis.fetch;
+  let writerCalls = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+
+    if (instructions.includes("WriterAgent")) {
+      writerCalls += 1;
+      return jsonResponse({
+        output_text: "李凡只说了一句先稳住。",
+      });
+    }
+
+    return previousFetch(url, options);
+  };
+
+  let writeRun;
+  try {
+    writeRun = await runWriteChapterThroughOutline(store);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const stagedChapterDraft = await store.loadChapterDraft("ch001");
+  assert.equal(writeRun.project.phase.write.status, "chapter_pending_review");
+  assert.equal(stagedChapterDraft.reviewState?.strategy, "audit_manual_review");
+  assert.equal(stagedChapterDraft.reviewState?.manualReviewRequired, true);
+  assert.equal(stagedChapterDraft.reviewState?.auditAutoRepairAttempts, 3);
+  assert.ok(Array.isArray(stagedChapterDraft.reviewState?.blockingAuditIssues));
+  assert.ok(stagedChapterDraft.reviewState.blockingAuditIssues.some((item) => /字数/u.test(item)));
+  assert.ok((stagedChapterDraft.validation?.issues || []).some((item) => item.id === "chapter_word_count"));
+  assert.ok(writerCalls >= 4);
+  assert.match(writeRun.run.summary, /人工审核/u);
+})));
+
+test("chapter approval requires explicit override acknowledgement when audit is still failing", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-approval-override-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+
+  const badChapter = [
+    "# 第一章 先把那扇炮门关上",
+    "方向盘顶进胸口的那一下还没来得及疼完，一声炮震就把李凡从黑里砸醒。",
+    "白灯迎面撞来，轮胎尖叫，玻璃炸碎。",
+    "下一瞬又是一门炮在耳边开花，他猛地睁眼，咸水、木船和甲板把同一场海上险局重新拍回脸上。",
+  ].join("\n\n");
+
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    if (instructions.includes("WriterAgent")) {
+      return jsonResponse({ output_text: badChapter });
+    }
+    return previousFetch(url, options);
+  };
+
+  try {
+    await runWriteChapterThroughOutline(store);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  await assert.rejects(
+    reviewChapter(store, {
+      target: "chapter",
+      approved: true,
+      feedback: "",
+    }),
+    /显式确认 override 风险/u,
+  );
+
+  const locked = await reviewChapter(store, {
+    target: "chapter",
+    approved: true,
+    feedback: "人工确认保留当前版本。",
+    approvalOverrideAcknowledged: true,
+  });
+  assert.equal(locked.project.phase.write.currentChapterNumber, 1);
+
+  const projectState = await store.loadProject();
+  const overrideReview = projectState.history.reviews.at(-1);
+  assert.equal(overrideReview?.approvalOverride, true);
+  assert.equal(overrideReview?.approvalOverrideReason, "人工确认保留当前版本。");
+  assert.equal(overrideReview?.approvalValidationSnapshot?.overallPassed, false);
+})));
+
+test("knowledge boundary issues are repaired via targeted revision before full-chapter rewrite", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-knowledge-boundary-repair-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+
+  const previousFetch = globalThis.fetch;
+  let revisionCalls = 0;
+  let targetedRepairCalls = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input) || String(payload.input || "");
+
+    if (instructions.includes("WriterAgent") && /^章节：ch001 /m.test(inputText)) {
+      if (inputText.includes("模式：targeted_repair")) {
+        targetedRepairCalls += 1;
+      }
+      return jsonResponse({
+        output_text: [
+          "# 第一章：铜山外海",
+          "许三娘把账册亮出来，冷声说他和岸上的人有往来，有欠票、有暗号、有交易记录。",
+          "李凡心里一沉。通敌。原来那个李凡通敌。",
+          "他甚至不知道许三娘为什么要把这东西亮给他看。",
+        ].join("\n\n"),
+      });
+    }
+
+    if (instructions.includes("RevisionAgent")) {
+      revisionCalls += 1;
+      return jsonResponse({
+        output_text: "李凡没有立刻接话。他脑子里一片空白，只知道账册上的名字是自己，可那些欠票和暗号，他一个都认不出来。",
+      });
+    }
+
+    if (instructions.includes("AuditOrchestrator") && inputText.includes("通敌。原来那个李凡通敌。")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: "审计发现信息越界。",
+          issues: [
+            {
+              id: "knowledge_boundary",
+              severity: "critical",
+              category: "信息越界",
+              description: "李凡立刻接受了原主通敌这一结论，越过了当前信息边界。",
+              evidence: "‘通敌。原来那个李凡通敌。’ / ‘他甚至不知道许三娘为什么要把这东西亮给他看。’",
+              suggestion: "把反应改成困惑、搜索记忆、暂不下结论。",
+            },
+          ],
+          dimensionSummaries: {
+            knowledge_boundary: "当前李凡的判断速度超过了他应有的信息掌握程度。",
+          },
+        }),
+      });
+    }
+
+    if (instructions.includes("AuditOrchestrator")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: "审计通过。",
+          issues: [],
+          dimensionSummaries: {},
+        }),
+      });
+    }
+
+    return previousFetch(url, options);
+  };
+
+  let writeRun;
+  try {
+    writeRun = await runWriteChapterThroughOutline(store);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const stagedChapterDraft = await store.loadChapterDraft("ch001");
+  assert.equal(writeRun.project.phase.write.status, "chapter_pending_review");
+  assert.equal(stagedChapterDraft.validation?.overallPassed, true);
+  assert.equal(stagedChapterDraft.reviewState?.auditAutoRepairAttempts, 1);
+  assert.equal(revisionCalls, 1);
+  assert.equal(targetedRepairCalls, 0);
+  assert.match(stagedChapterDraft.chapterMarkdown || "", /李凡没有立刻接话/);
 })));
 
 test("WriterAgent prompt includes chapter character dossiers", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
@@ -2153,6 +3032,8 @@ test("embedding failure degrades to reference_packet fallback without blocking w
   });
 
   const previousFetch = globalThis.fetch;
+  const previousFakeEmbeddings = process.env.NOVELEX_FAKE_ZHIPU_EMBEDDINGS;
+  process.env.NOVELEX_FAKE_ZHIPU_EMBEDDINGS = "fail";
   globalThis.fetch = async (url, options = {}) => {
     if (String(url || "").includes("open.bigmodel.cn/api/paas/v4/embeddings")) {
       return new Response(JSON.stringify({ message: "embedding unavailable" }), {
@@ -2174,6 +3055,11 @@ test("embedding failure degrades to reference_packet fallback without blocking w
     assert.match(staged.referencePacket?.summary || "", /范文检索失败|Zhipu embedding request failed/);
     assert.match(staged.chapterMarkdown || "", /李凡没有浪费任何时间/);
   } finally {
+    if (previousFakeEmbeddings === undefined) {
+      delete process.env.NOVELEX_FAKE_ZHIPU_EMBEDDINGS;
+    } else {
+      process.env.NOVELEX_FAKE_ZHIPU_EMBEDDINGS = previousFakeEmbeddings;
+    }
     globalThis.fetch = previousFetch;
   }
 })));
@@ -2242,8 +3128,9 @@ test("selected style fingerprints feed WriterAgent and prevent first chapter fro
   assert.match(styleGuideText, /待第1章通过后生成/);
 })));
 
-test("ResearchRetriever uses OpenAI web search and passes research findings to WriterAgent", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+test("ResearchRetriever uses MCP web search and passes research findings to WriterAgent", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-research-agent-"));
+  saveFixtureWebSearchMcpConfig(tempRoot);
   const store = await createStore(tempRoot);
 
   await runPlanDraft(store);
@@ -2261,10 +3148,10 @@ test("ResearchRetriever uses OpenAI web search and passes research findings to W
 
     if (instructions.includes("ResearchRetriever")) {
       sawResearchRetriever = true;
-      assert.ok(Array.isArray(payload.tools));
-      assert.ok(payload.tools.some((item) => item?.type === "web_search"));
-      assert.ok(Array.isArray(payload.include));
-      assert.ok(payload.include.includes("web_search_call.action.sources"));
+      assert.equal(Array.isArray(payload.tools), false);
+      assert.equal(Array.isArray(payload.include), false);
+      assert.match(inputText, /MCP web_search 结果：/);
+      assert.match(inputText, /明代海防研究资料/);
     }
 
     if (instructions.includes("WriterAgent") && !sawWriterResearchPrompt) {
@@ -2294,13 +3181,160 @@ test("ResearchRetriever uses OpenAI web search and passes research findings to W
   assert.match(stagedDraft.researchPacket?.briefingMarkdown || "", /研究资料包/);
 })));
 
-test("ResearchRetriever preserves streamed web search evidence when responses are forced to stream", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+test("ResearchRetriever falls back to provider web search when MCP web_search fails", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-research-provider-fallback-"));
+  saveFixtureWebSearchMcpConfig(tempRoot, {
+    mcp: {
+      enabled: true,
+      servers: {
+        web_search: {
+          enabled: true,
+          transport: "stdio",
+          command: process.execPath,
+          args: [FIXTURE_RUNTIME_SERVER],
+          startup_timeout_ms: 5000,
+          call_timeout_ms: 5000,
+          env: {
+            FIXTURE_MODE: "crash",
+            FIXTURE_TOOL_NAME: "web_search",
+          },
+        },
+      },
+    },
+  });
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+
+  const previousFetch = globalThis.fetch;
+  let sawProviderFallbackRetriever = false;
+  let sawFallbackSynthesizer = false;
+  let sawWriterResearchPrompt = false;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input);
+
+    if (instructions.includes("ResearchRetriever") && Array.isArray(payload.tools)) {
+      sawProviderFallbackRetriever = true;
+      assert.deepEqual(payload.tools, [{ type: "web_search" }]);
+      assert.deepEqual(payload.include, ["web_search_call.action.sources"]);
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: "provider web search 研究摘要：本章要写出军商混杂、港汛牵连的明末沿海秩序。",
+          factsToUse: [
+            "港口、船厂、巡检与营汛通常是缠在一起运作的，不是现代分工明确的港务系统。",
+            "海商与地方军政关系复杂，既互用也互防。",
+          ],
+          factsToAvoid: [
+            "不要出现现代港务公司、调度中心或安保系统等表达。",
+          ],
+          termBank: [
+            "营汛：沿海驻防与汛地体系",
+          ],
+          uncertainPoints: [
+            "具体官职细分仍需按地域继续核实。",
+          ],
+          sourceNotes: [
+            "provider web_search 已返回可追溯来源。",
+          ],
+        }),
+        output: [
+          {
+            content: [
+              {
+                type: "web_search_call",
+                action: {
+                  sources: [
+                    {
+                      title: "明代海防研究资料",
+                      url: "https://example.com/provider-ming-haifang",
+                      snippet: "沿海卫所、巡检与港口贸易互相交织。",
+                    },
+                    {
+                      title: "福建海商与港口秩序",
+                      url: "https://example.com/provider-fujian-port",
+                      snippet: "海商网络与地方防务呈复杂共生关系。",
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      });
+    }
+
+    if (instructions.includes("ResearchSynthesizerAgent")) {
+      sawFallbackSynthesizer = true;
+      assert.match(inputText, /provider_web_search/);
+      assert.match(inputText, /MCP web_search 不可用，已回退到 provider 级 web_search。/);
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: "本章港口与海防场景应写出军商混杂、港汛牵连的明末沿海质感。",
+          factsToUse: [
+            "港口、船厂、巡检和营汛彼此纠缠。",
+            "海商与地方军政既交易又互相防备。",
+          ],
+          factsToAvoid: [
+            "不要出现现代港务管理语言。",
+          ],
+          termBank: [
+            "营汛：沿海驻防与汛地体系",
+          ],
+          uncertainPoints: [
+            "具体官职层级仍需谨慎。",
+          ],
+          sourceNotes: [
+            "MCP web_search 不可用，已回退到 provider 级 web_search。",
+            "provider web_search 已返回可追溯来源。",
+          ],
+        }),
+      });
+    }
+
+    if (instructions.includes("WriterAgent") && !sawWriterResearchPrompt) {
+      sawWriterResearchPrompt = true;
+      assert.match(inputText, /研究资料包：/);
+      assert.match(inputText, /军商混杂/);
+      assert.match(inputText, /营汛：沿海驻防与汛地体系/);
+      assert.match(inputText, /MCP web_search 不可用，已回退到 provider 级 web_search。/);
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    const writeRun = await runWriteChapterThroughOutline(store);
+    assert.equal(writeRun.project.phase.write.status, "chapter_pending_review");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const stagedDraft = await store.loadChapterDraft("ch001");
+  assert.equal(sawProviderFallbackRetriever, true);
+  assert.equal(sawFallbackSynthesizer, true);
+  assert.equal(sawWriterResearchPrompt, true);
+  assert.equal(stagedDraft.researchPacket?.mode, "provider_web_search");
+  assert.ok(Array.isArray(stagedDraft.researchPacket?.sources));
+  assert.ok(stagedDraft.researchPacket.sources.length >= 1);
+  assert.match(
+    (stagedDraft.researchPacket?.sourceNotes || []).join("；"),
+    /provider 级 web_search|provider web_search/,
+  );
+})));
+
+test("ResearchRetriever preserves MCP web search evidence when responses are forced to stream", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-research-agent-stream-"));
-  saveCodexApiConfig(tempRoot, {
+  saveFixtureWebSearchMcpConfig(tempRoot, {
     model_provider: "Compat",
     model: "compat-responses",
     review_model: "compat-responses",
     codex_model: "compat-responses",
+    force_stream: true,
     disable_response_storage: true,
     model_providers: {
       Compat: {
@@ -2326,10 +3360,6 @@ test("ResearchRetriever preserves streamed web search evidence when responses ar
 
   const store = await createStore(tempRoot);
 
-  await runPlanDraft(store);
-  await reviewPlanDraft(store, { approved: true, feedback: "" });
-  await reviewPlanFinal(store, { approved: true, feedback: "" });
-
   const previousFetch = globalThis.fetch;
   const openStreams = [];
   let sawStreamedResearchRetriever = false;
@@ -2337,10 +3367,13 @@ test("ResearchRetriever preserves streamed web search evidence when responses ar
   globalThis.fetch = async (url, options = {}) => {
     const payload = JSON.parse(String(options.body || "{}"));
     const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input);
 
     if (instructions.includes("ResearchRetriever")) {
       sawStreamedResearchRetriever = true;
       assert.equal(payload.stream, true);
+      assert.equal(Array.isArray(payload.tools), false);
+      assert.match(inputText, /MCP web_search 结果：/);
       const streamedRetrieverText = JSON.stringify({
         summary: "明末福建沿海场景应强调港口、船厂、巡检、营汛与海商网络的混杂秩序，避免现代港务和公司化表达。",
         factsToUse: [
@@ -2365,10 +3398,26 @@ test("ResearchRetriever preserves streamed web search evidence when responses ar
       const stream = hangingSseResponse(
         [
           "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_research_stream\",\"output\":[],\"output_text\":\"\"}}\n\n",
-          "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"action\":{\"query\":\"明末福建沿海港口与海防术语\"}}}\n\n",
-          "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"action\":{\"sources\":[{\"title\":\"明代海防研究资料\",\"url\":\"https://example.com/ming-haifang\",\"snippet\":\"沿海卫所、巡检与港口贸易互相交织。\"},{\"title\":\"福建海商与港口秩序\",\"url\":\"https://example.com/fujian-port\",\"snippet\":\"海商网络与地方防务呈复杂共生关系。\"}]}}}\n\n",
           `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: streamedRetrieverText })}\n\n`,
           "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_research_stream\",\"output\":[],\"output_text\":\"\"}}\n\n",
+        ],
+        "text/plain; charset=utf-8",
+      );
+      openStreams.push(stream);
+      return stream.response;
+    }
+
+    if (payload.stream === true) {
+      const baseResponse = await previousFetch(url, options);
+      const basePayload = await baseResponse.json();
+      const stream = hangingSseResponse(
+        [
+          "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_generic_stream\",\"output\":[],\"output_text\":\"\"}}\n\n",
+          `event: response.output_text.delta\ndata: ${JSON.stringify({
+            type: "response.output_text.delta",
+            delta: String(basePayload.output_text || ""),
+          })}\n\n`,
+          "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_generic_stream\",\"output\":[],\"output_text\":\"\"}}\n\n",
         ],
         "text/plain; charset=utf-8",
       );
@@ -2380,6 +3429,9 @@ test("ResearchRetriever preserves streamed web search evidence when responses ar
   };
 
   try {
+    await runPlanDraft(store);
+    await reviewPlanDraft(store, { approved: true, feedback: "" });
+    await reviewPlanFinal(store, { approved: true, feedback: "" });
     const writeRun = await runWriteChapterThroughOutline(store);
     assert.equal(writeRun.project.phase.write.status, "chapter_pending_review");
   } finally {
@@ -2605,7 +3657,9 @@ test("write run and audit results surface fallback usage instead of hiding it", 
   assert.equal(stagedDraft.planContext.usedFallback, true);
   assert.equal(stagedDraft.historyContext.usedFallback, true);
   assert.equal(stagedDraft.writerContext.usedFallback, true);
+  assert.equal(stagedDraft.validation.auditDegraded, true);
   assert.equal(stagedDraft.validation.semanticAudit.source, "heuristics_only");
+  assert.equal(stagedDraft.reviewState?.auditDegraded, true);
   assert.match(writeRun.run.steps.find((item) => item.id === "audit_orchestrator")?.summary || "", /仅依赖启发式审计/);
 })));
 
@@ -3054,6 +4108,182 @@ test("provider retries with a lean payload after repeated 5xx responses", async 
   }
 }));
 
+test("provider keeps retrying overloaded 529 responses beyond the standard attempt limit", async () => withIsolatedProviderEnv(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-provider-overload-success-"));
+  const previousFetch = globalThis.fetch;
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = "https://example.com";
+  process.env.NOVELEX_PROVIDER_MODE = "openai-responses";
+
+  let callCount = 0;
+
+  globalThis.fetch = async () => {
+    callCount += 1;
+
+    if (callCount <= 6) {
+      return new Response(JSON.stringify({
+        type: "error",
+        error: {
+          type: "overloaded_error",
+          message: "当前时段请求拥挤",
+          http_code: "529",
+        },
+      }), {
+        status: 529,
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+        },
+      });
+    }
+
+    return jsonResponse({ output_text: "overload retry success" });
+  };
+
+  try {
+    const provider = createProvider(
+      {
+        providerMode: "openai-responses",
+        providerConfig: {
+          responseModel: "gpt-5.4",
+        },
+      },
+      {
+        rootDir: tempRoot,
+        overloadRetryWindowMs: 200,
+        overloadBaseDelayMs: 1,
+        overloadMaxDelayMs: 1,
+        overloadJitterRatio: 0,
+      },
+    );
+
+    const result = await provider.generateText({
+      instructions: "测试 overloaded 重试成功",
+      input: "hello",
+    });
+
+    assert.equal(result.text, "overload retry success");
+    assert.equal(callCount, 7);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}));
+
+test("provider stops overloaded retries once the overload window expires", async () => withIsolatedProviderEnv(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-provider-overload-deadline-"));
+  const previousFetch = globalThis.fetch;
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = "https://example.com";
+  process.env.NOVELEX_PROVIDER_MODE = "openai-responses";
+
+  let callCount = 0;
+
+  globalThis.fetch = async () => {
+    callCount += 1;
+    return new Response(JSON.stringify({
+      type: "error",
+      error: {
+        type: "overloaded_error",
+        message: "当前时段请求拥挤",
+        http_code: "529",
+      },
+    }), {
+      status: 529,
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+      },
+    });
+  };
+
+  try {
+    const provider = createProvider(
+      {
+        providerMode: "openai-responses",
+        providerConfig: {
+          responseModel: "gpt-5.4",
+        },
+      },
+      {
+        rootDir: tempRoot,
+        overloadRetryWindowMs: 15,
+        overloadBaseDelayMs: 10,
+        overloadMaxDelayMs: 10,
+        overloadJitterRatio: 0,
+      },
+    );
+
+    await assert.rejects(
+      provider.generateText({
+        instructions: "测试 overloaded 截止窗口",
+        input: "hello",
+      }),
+      (error) => {
+        assert.equal(error?.overloaded, true);
+        assert.match(String(error?.message || ""), /\b529\b/);
+        return true;
+      },
+    );
+
+    assert.equal(callCount, 2);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}));
+
+test("provider limits concurrent requests through a shared queue", async () => withIsolatedProviderEnv(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-provider-concurrency-limit-"));
+  const previousFetch = globalThis.fetch;
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = "https://example.com";
+  process.env.NOVELEX_PROVIDER_MODE = "openai-responses";
+
+  let activeRequests = 0;
+  let maxActiveRequests = 0;
+  let callCount = 0;
+
+  globalThis.fetch = async (_url, _options = {}) => {
+    callCount += 1;
+    const currentCall = callCount;
+    activeRequests += 1;
+    maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    activeRequests -= 1;
+    return jsonResponse({ output_text: `queued-${currentCall}` });
+  };
+
+  try {
+    const provider = createProvider(
+      {
+        providerMode: "openai-responses",
+        providerConfig: {
+          responseModel: "gpt-5.4",
+        },
+      },
+      {
+        rootDir: tempRoot,
+        maxConcurrency: 1,
+      },
+    );
+
+    const results = await Promise.all([
+      provider.generateText({ instructions: "queue-a", input: "a" }),
+      provider.generateText({ instructions: "queue-b", input: "b" }),
+      provider.generateText({ instructions: "queue-c", input: "c" }),
+    ]);
+
+    assert.equal(results.length, 3);
+    assert.equal(callCount, 3);
+    assert.ok(
+      maxActiveRequests <= 1,
+      `expected provider concurrency to stay at 1 or below, got ${maxActiveRequests}`,
+    );
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}));
+
 test("provider retries without temperature when the model rejects that parameter", async () => withIsolatedProviderEnv(async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-provider-temperature-"));
   const previousFetch = globalThis.fetch;
@@ -3397,7 +4627,7 @@ requires_openai_auth = true
   assert.equal(settings.availableProviders.length, 1);
 }));
 
-test("provider settings ignore unsupported Kimi and MiniMax entries from codex config", async () => withIsolatedProviderEnv(async () => {
+test("provider settings ignore unsupported Kimi entries but keep MiniMax from codex config", async () => withIsolatedProviderEnv(async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-unsupported-provider-config-"));
   saveCodexApiConfig(tempRoot, {
     model_provider: "Kimi",
@@ -3459,11 +4689,199 @@ test("provider settings ignore unsupported Kimi and MiniMax entries from codex c
   assert.equal(settings.hasApiKey, true);
   assert.deepEqual(
     settings.availableProviders.map((item) => item.id),
-    ["OpenAI"],
+    ["OpenAI", "MiniMax"],
   );
 }));
 
-test("web search is always routed through OpenAI GPT", async () => withIsolatedProviderEnv(async () => {
+test("MiniMax provider settings default to a conservative max concurrency", async () => withIsolatedProviderEnv(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-minimax-max-concurrency-"));
+  saveCodexApiConfig(tempRoot, {
+    model_provider: "MiniMax",
+    model: "MiniMax-M2.7",
+    review_model: "MiniMax-M2.7",
+    codex_model: "MiniMax-M2.7",
+    model_providers: {
+      MiniMax: {
+        name: "MiniMax",
+        base_url: "https://api.minimaxi.com/v1",
+        wire_api: "chat_completions",
+        api_key: "minimax-key",
+        response_model: "MiniMax-M2.7",
+        review_model: "MiniMax-M2.7",
+        codex_model: "MiniMax-M2.7",
+      },
+    },
+  });
+
+  const settings = resolveProviderSettings({}, tempRoot);
+  assert.equal(settings.providerId, "MiniMax");
+  assert.equal(settings.maxConcurrency, 2);
+  assert.equal(settings.requestTimeoutMs, 300000);
+  assert.equal(settings.overloadRetryWindowMs, 1800000);
+}));
+
+test("MiniMax provider settings honor explicit timeout and retry-window overrides from config", async () => withIsolatedProviderEnv(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-minimax-timeout-config-"));
+  saveCodexApiConfig(tempRoot, {
+    model_provider: "MiniMax",
+    model: "MiniMax-M2.7",
+    review_model: "MiniMax-M2.7",
+    codex_model: "MiniMax-M2.7",
+    model_providers: {
+      MiniMax: {
+        name: "MiniMax",
+        base_url: "https://api.minimaxi.com/v1",
+        wire_api: "chat_completions",
+        api_key: "minimax-key",
+        response_model: "MiniMax-M2.7",
+        review_model: "MiniMax-M2.7",
+        codex_model: "MiniMax-M2.7",
+        max_concurrency: 1,
+        request_timeout_ms: 420000,
+        overload_retry_window_ms: 2700000,
+      },
+    },
+  });
+
+  const settings = resolveProviderSettings({}, tempRoot);
+  assert.equal(settings.providerId, "MiniMax");
+  assert.equal(settings.maxConcurrency, 1);
+  assert.equal(settings.requestTimeoutMs, 420000);
+  assert.equal(settings.overloadRetryWindowMs, 2700000);
+}));
+
+test("MiniMax native web search is preferred when the active provider supports it", async () => withIsolatedProviderEnv(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-minimax-tool-provider-"));
+  saveCodexApiConfig(tempRoot, {
+    model_provider: "MiniMax",
+    model: "MiniMax-M2.5-highspeed",
+    review_model: "MiniMax-M2.5-highspeed",
+    codex_model: "MiniMax-M2.5-highspeed",
+    model_providers: {
+      OpenAI: {
+        name: "OpenAI",
+        base_url: "https://openai.example/v1",
+        wire_api: "responses",
+        api_key: "openai-key",
+        response_model: "gpt-5.4",
+        review_model: "gpt-5.4",
+        codex_model: "gpt-5.3-codex",
+      },
+      MiniMax: {
+        name: "MiniMax",
+        base_url: "https://api.minimaxi.com/v1",
+        wire_api: "chat_completions",
+        api_key: "minimax-key",
+        response_model: "MiniMax-M2.5-highspeed",
+        review_model: "MiniMax-M2.5-highspeed",
+        codex_model: "MiniMax-M2.5-highspeed",
+      },
+    },
+  });
+
+  const previousFetch = globalThis.fetch;
+  const seenCalls = [];
+  let openAiCalled = false;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const targetUrl = String(url || "");
+    const payload = JSON.parse(String(options.body || "{}"));
+    seenCalls.push({ targetUrl, payload });
+
+    if (targetUrl === "https://api.minimaxi.com/v1/chat/completions" && Array.isArray(payload.plugins)) {
+      return jsonResponse({
+        choices: [
+          {
+            index: 0,
+            finish_reason: "stop",
+            message: {
+              role: "assistant",
+              content: JSON.stringify({
+                summary: "来自 MiniMax 原生搜索",
+                factsToUse: ["港口与巡检体系紧密相连。"],
+                factsToAvoid: ["不要写成现代化港务公司。"],
+                termBank: ["营汛：沿海驻防体系"],
+                uncertainPoints: ["具体官职仍需结合地区核实。"],
+                sourceNotes: ["MiniMax 原生搜索已触发。"],
+              }),
+            },
+          },
+        ],
+      });
+    }
+
+    if (
+      targetUrl === "https://api.minimaxi.com/v1/chat/completions" &&
+      Array.isArray(payload.tools) &&
+      payload.tools.some((item) => item?.type === "web_search")
+    ) {
+      return jsonResponse({
+        choices: [
+          {
+            index: 0,
+            finish_reason: "tool_calls",
+            message: {
+              role: "assistant",
+              content: "",
+              tool_calls: [
+                {
+                  id: "call_1",
+                  type: "function",
+                  function: {
+                    name: "plugin_web_search",
+                    arguments: "{\"query_key\":\"明末福建沿海港口与海防术语\"}",
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      });
+    }
+
+    if (targetUrl === "https://openai.example/v1/responses") {
+      openAiCalled = true;
+      return jsonResponse({ output_text: "openai fallback" });
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    const provider = createProvider({}, { rootDir: tempRoot });
+    const result = await provider.generateText({
+      instructions: "test MiniMax native search",
+      input: "请联网搜索并输出 JSON。",
+      tools: [{ type: "web_search" }],
+      toolChoice: "auto",
+    });
+
+    assert.match(result.text, /来自 MiniMax 原生搜索/);
+    assert.equal(openAiCalled, false);
+    assert.equal(result.raw?.native_web_search_requested, true);
+    assert.ok(result.raw?.native_web_search_probe);
+    assert.ok(
+      seenCalls.some(
+        (entry) =>
+          entry.targetUrl === "https://api.minimaxi.com/v1/chat/completions" &&
+          Array.isArray(entry.payload.plugins) &&
+          entry.payload.plugins.includes("plugin_web_search"),
+      ),
+    );
+    assert.ok(
+      seenCalls.some(
+        (entry) =>
+          entry.targetUrl === "https://api.minimaxi.com/v1/chat/completions" &&
+          Array.isArray(entry.payload.tools) &&
+          entry.payload.tools.some((item) => item?.type === "web_search"),
+      ),
+    );
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}));
+
+test("web search falls back to OpenAI GPT for providers without native search", async () => withIsolatedProviderEnv(async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-tool-provider-"));
   saveCodexApiConfig(tempRoot, {
     model_provider: "Compat",

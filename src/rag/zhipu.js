@@ -3,6 +3,18 @@ import { loadCodexApiConfig } from "../config/codex-config.js";
 const ZHIPU_EMBEDDING_URL = "https://open.bigmodel.cn/api/paas/v4/embeddings";
 const ZHIPU_EMBEDDING_MODEL = "embedding-3";
 
+function buildFakeEmbeddingVector(text) {
+  const source = String(text || "");
+  return [
+    /海|礁|潮/.test(source) ? 1 : 0,
+    /港|船|帆/.test(source) ? 1 : 0,
+    /对白|命令|短促/.test(source) ? 1 : 0,
+    /压迫|紧绷|冷/.test(source) ? 1 : 0,
+    Math.min(1, source.length / 400),
+    /李凡|主角/.test(source) ? 1 : 0,
+  ];
+}
+
 export class ZhipuEmbeddingError extends Error {
   constructor(message, options = {}) {
     super(message);
@@ -105,6 +117,14 @@ function resolveApiKey(rootDir = process.cwd()) {
 }
 
 async function requestEmbedding(text, rootDir = process.cwd()) {
+  const fakeEmbeddingsMode = String(process.env.NOVELEX_FAKE_ZHIPU_EMBEDDINGS || "").trim();
+  if (fakeEmbeddingsMode === "fail") {
+    throw new ZhipuEmbeddingError("Zhipu embedding request failed: fake embedding failure");
+  }
+  if (fakeEmbeddingsMode === "true") {
+    return buildFakeEmbeddingVector(text);
+  }
+
   const apiKey = resolveApiKey(rootDir);
   if (!apiKey) {
     throw new ZhipuEmbeddingError("Missing ZHIPU_API_KEY or novelex.codex.toml zhipu_api_key.");
@@ -188,6 +208,9 @@ export function createZhipuEmbeddingClient(options = {}) {
     endpoint: ZHIPU_EMBEDDING_URL,
     model: ZHIPU_EMBEDDING_MODEL,
     isConfigured() {
+      if (["true", "fail"].includes(String(process.env.NOVELEX_FAKE_ZHIPU_EMBEDDINGS || "").trim())) {
+        return true;
+      }
       return Boolean(resolveApiKey(rootDir));
     },
     async embedText(text) {

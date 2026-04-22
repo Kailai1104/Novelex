@@ -2,6 +2,14 @@ import { loadCodexApiConfig, normalizeCodexConfigData } from "../config/codex-co
 
 const MAX_RECONNECT_ATTEMPTS = 5;
 const RETRYABLE_STATUS_CODES = new Set([408, 409, 425, 429]);
+const DEFAULT_REQUEST_TIMEOUT_MS = 120000;
+const DEFAULT_OVERLOAD_RETRY_WINDOW_MS = 15 * 60 * 1000;
+const DEFAULT_OVERLOAD_BASE_DELAY_MS = 3000;
+const DEFAULT_OVERLOAD_MAX_DELAY_MS = 30000;
+const DEFAULT_OVERLOAD_JITTER_RATIO = 0.2;
+const DEFAULT_MINIMAX_MAX_CONCURRENCY = 2;
+const providerCooldowns = new Map();
+const providerConcurrencyStates = new Map();
 
 class ProviderRequestError extends Error {
   constructor(message, options = {}) {
@@ -9,7 +17,113 @@ class ProviderRequestError extends Error {
     this.name = "ProviderRequestError";
     this.status = options.status;
     this.attempts = options.attempts;
+    this.overloaded = Boolean(options.overloaded);
+    this.elapsedMs = options.elapsedMs;
   }
+}
+
+function numericOption(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function nonNegativeNumericOption(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function resolveRetryPolicy(options = {}) {
+  const overloadBaseDelayMs = numericOption(options.overloadBaseDelayMs, DEFAULT_OVERLOAD_BASE_DELAY_MS);
+  const overloadMaxDelayMs = Math.max(
+    overloadBaseDelayMs,
+    numericOption(options.overloadMaxDelayMs, DEFAULT_OVERLOAD_MAX_DELAY_MS),
+  );
+
+  return {
+    requestTimeoutMs: numericOption(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS),
+    overloadRetryWindowMs: numericOption(options.overloadRetryWindowMs, DEFAULT_OVERLOAD_RETRY_WINDOW_MS),
+    overloadBaseDelayMs,
+    overloadMaxDelayMs,
+    overloadJitterRatio: nonNegativeNumericOption(options.overloadJitterRatio, DEFAULT_OVERLOAD_JITTER_RATIO),
+  };
+}
+
+function resolveMaxConcurrency({ providerId = "", providerBlock = {}, options = {} } = {}) {
+  const explicit =
+    options.maxConcurrency ??
+    providerBlock.max_concurrency ??
+    process.env.NOVELEX_PROVIDER_MAX_CONCURRENCY;
+
+  const parsedExplicit = Number(explicit);
+  if (Number.isFinite(parsedExplicit) && parsedExplicit > 0) {
+    return Math.max(1, Math.round(parsedExplicit));
+  }
+
+  if (String(providerId || "").trim() === "MiniMax") {
+    return DEFAULT_MINIMAX_MAX_CONCURRENCY;
+  }
+
+  return Infinity;
+}
+
+function resolveRequestTimeoutMs({ providerId = "", providerBlock = {}, options = {} } = {}) {
+  const explicit =
+    options.requestTimeoutMs ??
+    providerBlock.request_timeout_ms ??
+    process.env.NOVELEX_PROVIDER_REQUEST_TIMEOUT_MS;
+
+  const parsedExplicit = Number(explicit);
+  if (Number.isFinite(parsedExplicit) && parsedExplicit > 0) {
+    return Math.max(1, Math.round(parsedExplicit));
+  }
+
+  if (String(providerId || "").trim() === "MiniMax") {
+    return 300000;
+  }
+
+  return DEFAULT_REQUEST_TIMEOUT_MS;
+}
+
+function resolveOverloadRetryWindowMs({ providerId = "", providerBlock = {}, options = {} } = {}) {
+  const explicit =
+    options.overloadRetryWindowMs ??
+    providerBlock.overload_retry_window_ms ??
+    process.env.NOVELEX_PROVIDER_OVERLOAD_RETRY_WINDOW_MS;
+
+  const parsedExplicit = Number(explicit);
+  if (Number.isFinite(parsedExplicit) && parsedExplicit > 0) {
+    return Math.max(1, Math.round(parsedExplicit));
+  }
+
+  if (String(providerId || "").trim() === "MiniMax") {
+    return 30 * 60 * 1000;
+  }
+
+  return DEFAULT_OVERLOAD_RETRY_WINDOW_MS;
+}
+
+function resolveOverloadBaseDelayMs({ providerBlock = {}, options = {} } = {}) {
+  const explicit =
+    options.overloadBaseDelayMs ??
+    providerBlock.overload_base_delay_ms ??
+    process.env.NOVELEX_PROVIDER_OVERLOAD_BASE_DELAY_MS;
+  return numericOption(explicit, DEFAULT_OVERLOAD_BASE_DELAY_MS);
+}
+
+function resolveOverloadMaxDelayMs({ providerBlock = {}, options = {}, overloadBaseDelayMs } = {}) {
+  const explicit =
+    options.overloadMaxDelayMs ??
+    providerBlock.overload_max_delay_ms ??
+    process.env.NOVELEX_PROVIDER_OVERLOAD_MAX_DELAY_MS;
+  return Math.max(overloadBaseDelayMs, numericOption(explicit, DEFAULT_OVERLOAD_MAX_DELAY_MS));
+}
+
+function resolveOverloadJitterRatio({ providerBlock = {}, options = {} } = {}) {
+  const explicit =
+    options.overloadJitterRatio ??
+    providerBlock.overload_jitter_ratio ??
+    process.env.NOVELEX_PROVIDER_OVERLOAD_JITTER_RATIO;
+  return nonNegativeNumericOption(explicit, DEFAULT_OVERLOAD_JITTER_RATIO);
 }
 
 function roleToInputRole(role) {
@@ -193,6 +307,45 @@ function extractChatCompletionText(payload) {
   return extractChatContentText(payload?.choices?.[0]?.message?.content);
 }
 
+function hasOnlyWebSearchTools(tools = []) {
+  return Array.isArray(tools) && tools.length > 0 && tools.every((tool) => tool?.type === "web_search");
+}
+
+function visitJsonTree(node, visitor, visited = new WeakSet()) {
+  if (!node) {
+    return;
+  }
+  if (Array.isArray(node)) {
+    node.forEach((item) => visitJsonTree(item, visitor, visited));
+    return;
+  }
+  if (typeof node !== "object") {
+    return;
+  }
+  if (visited.has(node)) {
+    return;
+  }
+  visited.add(node);
+
+  visitor(node);
+  for (const value of Object.values(node)) {
+    visitJsonTree(value, visitor, visited);
+  }
+}
+
+function hasMiniMaxWebSearchToolCall(raw) {
+  let matched = false;
+
+  visitJsonTree(raw, (node) => {
+    if (matched || !Array.isArray(node?.tool_calls)) {
+      return;
+    }
+    matched = node.tool_calls.some((toolCall) => /web_search/i.test(String(toolCall?.function?.name || "")));
+  });
+
+  return matched;
+}
+
 function normalizeSseBuffer(buffer) {
   return String(buffer || "").replace(/\r\n/g, "\n");
 }
@@ -350,12 +503,220 @@ async function wait(ms) {
   });
 }
 
+function providerCircuitKey(settings = {}) {
+  return `${String(settings.providerId || settings.providerName || "provider").trim()}:${String(settings.baseUrl || "").trim()}`;
+}
+
+async function waitForProviderCooldown(providerKey) {
+  const key = String(providerKey || "").trim();
+  if (!key) {
+    return;
+  }
+
+  const cooldownUntil = Number(providerCooldowns.get(key) || 0);
+  if (!cooldownUntil) {
+    return;
+  }
+
+  const remainingMs = cooldownUntil - Date.now();
+  if (remainingMs <= 0) {
+    providerCooldowns.delete(key);
+    return;
+  }
+
+  await wait(remainingMs);
+}
+
+function scheduleProviderCooldown(providerKey, delayMs) {
+  const key = String(providerKey || "").trim();
+  const normalizedDelayMs = Math.max(0, Math.round(Number(delayMs) || 0));
+  if (!key || !normalizedDelayMs) {
+    return;
+  }
+
+  const nextAllowedAt = Date.now() + normalizedDelayMs;
+  providerCooldowns.set(key, Math.max(Number(providerCooldowns.get(key) || 0), nextAllowedAt));
+}
+
+function getProviderConcurrencyState(providerKey, maxConcurrency = Infinity) {
+  const key = String(providerKey || "").trim();
+  if (!providerConcurrencyStates.has(key)) {
+    providerConcurrencyStates.set(key, {
+      active: 0,
+      waiters: [],
+      maxConcurrency,
+    });
+  }
+
+  const state = providerConcurrencyStates.get(key);
+  if (Number.isFinite(maxConcurrency) && maxConcurrency > 0) {
+    state.maxConcurrency = Math.max(1, Math.round(maxConcurrency));
+  } else {
+    state.maxConcurrency = Infinity;
+  }
+  return state;
+}
+
+async function acquireProviderSlot(providerKey, maxConcurrency = Infinity) {
+  if (!String(providerKey || "").trim() || !Number.isFinite(maxConcurrency)) {
+    return () => {};
+  }
+
+  const state = getProviderConcurrencyState(providerKey, maxConcurrency);
+  if (state.active < state.maxConcurrency) {
+    state.active += 1;
+    return () => releaseProviderSlot(providerKey);
+  }
+
+  await new Promise((resolve) => {
+    state.waiters.push(resolve);
+  });
+
+  state.active += 1;
+  return () => releaseProviderSlot(providerKey);
+}
+
+function releaseProviderSlot(providerKey) {
+  const key = String(providerKey || "").trim();
+  if (!key || !providerConcurrencyStates.has(key)) {
+    return;
+  }
+
+  const state = providerConcurrencyStates.get(key);
+  state.active = Math.max(0, state.active - 1);
+
+  if (state.waiters.length) {
+    const next = state.waiters.shift();
+    next();
+    return;
+  }
+
+  if (state.active === 0) {
+    providerConcurrencyStates.delete(key);
+  }
+}
+
 function isRetryableStatus(status) {
   return RETRYABLE_STATUS_CODES.has(status) || status >= 500;
 }
 
 function reconnectDelayMs(attempt) {
   return 250 * 2 ** (attempt - 1);
+}
+
+function overloadDelayMs(attempt, retryPolicy = {}) {
+  const baseDelayMs = Math.min(
+    Number(retryPolicy.overloadMaxDelayMs || DEFAULT_OVERLOAD_MAX_DELAY_MS),
+    Number(retryPolicy.overloadBaseDelayMs || DEFAULT_OVERLOAD_BASE_DELAY_MS) * 2 ** Math.max(0, attempt - 1),
+  );
+  const jitterRatio = Math.max(0, Number(retryPolicy.overloadJitterRatio || 0));
+  if (!jitterRatio) {
+    return Math.max(1, Math.round(baseDelayMs));
+  }
+
+  const minMultiplier = Math.max(0, 1 - jitterRatio);
+  const maxMultiplier = 1 + jitterRatio;
+  const multiplier = minMultiplier + (Math.random() * (maxMultiplier - minMultiplier));
+  return Math.max(1, Math.round(baseDelayMs * multiplier));
+}
+
+function safeJsonParse(value) {
+  try {
+    return JSON.parse(String(value || ""));
+  } catch {
+    return null;
+  }
+}
+
+function payloadLooksOverloaded(payload) {
+  let matched = false;
+
+  visitJsonTree(payload, (node) => {
+    if (matched || !node || typeof node !== "object") {
+      return;
+    }
+
+    if (String(node.type || "").trim() === "overloaded_error") {
+      matched = true;
+      return;
+    }
+
+    if (String(node.http_code || "").trim() === "529") {
+      matched = true;
+      return;
+    }
+
+    const message = String(node.message || node.error_message || "").trim();
+    if (/overloaded_error|当前时段请求拥挤/i.test(message)) {
+      matched = true;
+    }
+  });
+
+  return matched;
+}
+
+function isOverloadResponse(status, errorText = "") {
+  if (Number(status) === 529) {
+    return true;
+  }
+
+  const text = String(errorText || "");
+  if (/overloaded_error|当前时段请求拥挤/i.test(text)) {
+    return true;
+  }
+
+  return payloadLooksOverloaded(safeJsonParse(text));
+}
+
+function isOverloadError(error) {
+  if (error instanceof ProviderRequestError) {
+    return error.overloaded || isOverloadResponse(error.status, error.message);
+  }
+
+  const message = error instanceof Error ? error.message : String(error || "");
+  return /overloaded_error|当前时段请求拥挤|\b529\b/i.test(message);
+}
+
+function shouldContinueOverloadRetry({
+  startedAt,
+  overloadAttempt,
+  providerKey,
+  retryPolicy,
+}) {
+  const delayMs = overloadDelayMs(overloadAttempt, retryPolicy);
+  const elapsedMs = Date.now() - startedAt;
+  const withinWindow = elapsedMs + delayMs <= Number(retryPolicy.overloadRetryWindowMs || DEFAULT_OVERLOAD_RETRY_WINDOW_MS);
+
+  if (withinWindow) {
+    scheduleProviderCooldown(providerKey, delayMs);
+  }
+
+  return {
+    delayMs,
+    elapsedMs,
+    withinWindow,
+  };
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`request timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function shouldForceStream(settings) {
@@ -589,16 +950,25 @@ async function requestProviderJson({
   apiKey,
   payload,
   providerName,
+  providerKey = "",
+  maxConcurrency = Infinity,
+  retryPolicy = resolveRetryPolicy(),
   streamFallbackAllowed = true,
   parseStream = null,
 }) {
   let activePayload = payload;
+  const startedAt = Date.now();
+  let overloadAttempt = 0;
+  let attempt = 0;
 
-  for (let attempt = 1; attempt <= MAX_RECONNECT_ATTEMPTS; attempt += 1) {
+  while (true) {
+    attempt += 1;
+    await waitForProviderCooldown(providerKey);
     const wantsStream = Boolean(activePayload?.stream);
+    const releaseSlot = await acquireProviderSlot(providerKey, maxConcurrency);
 
     try {
-      const response = await fetch(url, {
+      const response = await fetchWithTimeout(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -606,7 +976,7 @@ async function requestProviderJson({
           ...(wantsStream ? { Accept: "text/event-stream" } : {}),
         },
         body: JSON.stringify(activePayload),
-      });
+      }, retryPolicy.requestTimeoutMs);
 
       if (!response.ok) {
         const errorText = await response.text();
@@ -625,6 +995,29 @@ async function requestProviderJson({
             },
           };
           continue;
+        }
+
+        if (isOverloadResponse(response.status, errorText)) {
+          overloadAttempt += 1;
+          const overloadState = shouldContinueOverloadRetry({
+            startedAt,
+            overloadAttempt,
+            providerKey,
+            retryPolicy,
+          });
+          if (overloadState.withinWindow) {
+            continue;
+          }
+
+          throw new ProviderRequestError(
+            `${providerName} request failed after ${attempt} attempts: ${response.status} ${errorText}`,
+            {
+              status: response.status,
+              attempts: attempt,
+              overloaded: true,
+              elapsedMs: overloadState.elapsedMs,
+            },
+          );
         }
 
         if (attempt < MAX_RECONNECT_ATTEMPTS && isRetryableStatus(response.status)) {
@@ -646,6 +1039,29 @@ async function requestProviderJson({
         try {
           return await parseStream(response);
         } catch (error) {
+          if (isOverloadError(error)) {
+            overloadAttempt += 1;
+            const overloadState = shouldContinueOverloadRetry({
+              startedAt,
+              overloadAttempt,
+              providerKey,
+              retryPolicy,
+            });
+            if (overloadState.withinWindow) {
+              continue;
+            }
+
+            const message = error instanceof Error ? error.message : String(error || "");
+            throw new ProviderRequestError(
+              `${providerName} request failed after ${attempt} attempts: ${message}`,
+              {
+                attempts: attempt,
+                overloaded: true,
+                elapsedMs: overloadState.elapsedMs,
+              },
+            );
+          }
+
           if (attempt < MAX_RECONNECT_ATTEMPTS) {
             await wait(reconnectDelayMs(attempt));
             continue;
@@ -660,6 +1076,29 @@ async function requestProviderJson({
         throw error;
       }
 
+      if (isOverloadError(error)) {
+        overloadAttempt += 1;
+        const overloadState = shouldContinueOverloadRetry({
+          startedAt,
+          overloadAttempt,
+          providerKey,
+          retryPolicy,
+        });
+        if (overloadState.withinWindow) {
+          continue;
+        }
+
+        const message = error instanceof Error ? error.message : String(error || "");
+        throw new ProviderRequestError(
+          `${providerName} request failed after ${attempt} attempts: ${message}`,
+          {
+            attempts: attempt,
+            overloaded: true,
+            elapsedMs: overloadState.elapsedMs,
+          },
+        );
+      }
+
       if (attempt < MAX_RECONNECT_ATTEMPTS) {
         await wait(reconnectDelayMs(attempt));
         continue;
@@ -672,12 +1111,10 @@ async function requestProviderJson({
           attempts: attempt,
         },
       );
+    } finally {
+      releaseSlot();
     }
   }
-
-  throw new ProviderRequestError(`${providerName} request failed after exhausting reconnect attempts.`, {
-    attempts: MAX_RECONNECT_ATTEMPTS,
-  });
 }
 
 function shouldRetryWithLeanResponsePayload(error, payload) {
@@ -692,11 +1129,11 @@ function shouldRetryWithLeanResponsePayload(error, payload) {
   }
 
   if (error instanceof ProviderRequestError) {
-    return typeof error.status === "number" && error.status >= 500;
+    return !error.overloaded && typeof error.status === "number" && error.status >= 500;
   }
 
   const message = error instanceof Error ? error.message : String(error || "");
-  return /request failed(?: after \d+ attempts)?:.*\b5\d{2}\b/i.test(message);
+  return !isOverloadError(error) && /request failed(?: after \d+ attempts)?:.*\b5\d{2}\b/i.test(message);
 }
 
 function buildLeanResponseRetryPayload(payload) {
@@ -913,6 +1350,10 @@ function resolveWebSearchModel(settings) {
     : "gpt-5.4";
 }
 
+function providerSupportsNativeWebSearch(settings) {
+  return settings.providerId === "MiniMax";
+}
+
 export function resolveProviderSettings(projectState, rootDir = process.cwd(), options = {}) {
   const codexConfig = loadCodexApiConfig(rootDir);
   const providerConfig = {
@@ -953,6 +1394,34 @@ export function resolveProviderSettings(projectState, rootDir = process.cwd(), o
     fileData,
     useRootFallback: true,
   });
+  const requestTimeoutMs = resolveRequestTimeoutMs({
+    providerId: activeProviderId,
+    providerBlock: activeProviderBlock,
+    options,
+  });
+  const overloadRetryWindowMs = resolveOverloadRetryWindowMs({
+    providerId: activeProviderId,
+    providerBlock: activeProviderBlock,
+    options,
+  });
+  const overloadBaseDelayMs = resolveOverloadBaseDelayMs({
+    providerBlock: activeProviderBlock,
+    options,
+  });
+  const overloadMaxDelayMs = resolveOverloadMaxDelayMs({
+    providerBlock: activeProviderBlock,
+    options,
+    overloadBaseDelayMs,
+  });
+  const overloadJitterRatio = resolveOverloadJitterRatio({
+    providerBlock: activeProviderBlock,
+    options,
+  });
+  const maxConcurrency = resolveMaxConcurrency({
+    providerId: activeProviderId,
+    providerBlock: activeProviderBlock,
+    options,
+  });
   const effectiveMode = configuredMode !== "unavailable" && apiKey ? configuredMode : "unavailable";
 
   return {
@@ -985,6 +1454,13 @@ export function resolveProviderSettings(projectState, rootDir = process.cwd(), o
       Boolean(providerConfig.forceStream),
     providerId: activeProviderId,
     providerName: String(activeProvider?.name || activeProviderId).trim() || activeProviderId,
+    maxConcurrency,
+    requestTimeoutMs,
+    overloadRetryWindowMs,
+    overloadBaseDelayMs,
+    overloadMaxDelayMs,
+    overloadJitterRatio,
+    supportsNativeWebSearch: activeProviderId === "MiniMax",
     availableProviders,
     configSource: codexConfig.exists ? "codex_file" : "runtime_or_env",
     configPath: codexConfig.path,
@@ -1008,6 +1484,13 @@ export function publicProviderSettings(settings) {
     forceStream: settings.forceStream,
     providerId: settings.providerId,
     providerName: settings.providerName,
+    maxConcurrency: settings.maxConcurrency,
+    requestTimeoutMs: settings.requestTimeoutMs,
+    overloadRetryWindowMs: settings.overloadRetryWindowMs,
+    overloadBaseDelayMs: settings.overloadBaseDelayMs,
+    overloadMaxDelayMs: settings.overloadMaxDelayMs,
+    overloadJitterRatio: settings.overloadJitterRatio,
+    supportsNativeWebSearch: settings.supportsNativeWebSearch,
     availableProviders: settings.availableProviders,
     configSource: settings.configSource,
     configPath: settings.configPath,
@@ -1020,7 +1503,22 @@ export function createProvider(projectState, options = {}) {
   const outerOptions = options;
   const settings = resolveProviderSettings(projectState, options.rootDir, {
     providerIdOverride: options.providerIdOverride,
+    maxConcurrency: options.maxConcurrency,
+    requestTimeoutMs: options.requestTimeoutMs,
+    overloadRetryWindowMs: options.overloadRetryWindowMs,
+    overloadBaseDelayMs: options.overloadBaseDelayMs,
+    overloadMaxDelayMs: options.overloadMaxDelayMs,
+    overloadJitterRatio: options.overloadJitterRatio,
   });
+  const retryPolicy = resolveRetryPolicy({
+    ...outerOptions,
+    requestTimeoutMs: settings.requestTimeoutMs,
+    overloadRetryWindowMs: settings.overloadRetryWindowMs,
+    overloadBaseDelayMs: settings.overloadBaseDelayMs,
+    overloadMaxDelayMs: settings.overloadMaxDelayMs,
+    overloadJitterRatio: settings.overloadJitterRatio,
+  });
+  const providerKey = providerCircuitKey(settings);
 
   function pickModel({ useCodexModel = false, useReviewModel = false, model } = {}) {
     if (model) {
@@ -1041,6 +1539,9 @@ export function createProvider(projectState, options = {}) {
         url: `${settings.baseUrl}/responses`,
         apiKey: settings.apiKey,
         providerName: settings.providerName,
+        providerKey,
+        maxConcurrency: settings.maxConcurrency,
+        retryPolicy,
         payload: buildCompatibleResponsePayload(payload, settings),
         parseStream: parseResponseEventStream,
       });
@@ -1053,6 +1554,9 @@ export function createProvider(projectState, options = {}) {
         url: `${settings.baseUrl}/responses`,
         apiKey: settings.apiKey,
         providerName: settings.providerName,
+        providerKey,
+        maxConcurrency: settings.maxConcurrency,
+        retryPolicy,
         payload: buildLeanResponseRetryPayload(payload),
         streamFallbackAllowed: false,
         parseStream: parseResponseEventStream,
@@ -1131,6 +1635,72 @@ export function createProvider(projectState, options = {}) {
     };
   }
 
+  async function executeChatCompletionsRequest(payload) {
+    return requestProviderJson({
+      url: `${settings.baseUrl}/chat/completions`,
+      apiKey: settings.apiKey,
+      providerName: settings.providerName,
+      providerKey,
+      maxConcurrency: settings.maxConcurrency,
+      retryPolicy,
+      payload,
+      streamFallbackAllowed: false,
+      parseStream: payload.stream ? parseChatCompletionEventStream : null,
+    });
+  }
+
+  function buildChatCompletionPayload({
+    instructions,
+    input,
+    messages,
+    useCodexModel = false,
+    useReviewModel = false,
+    model,
+    temperature,
+    tools,
+    toolChoice,
+    extraBody = {},
+  }) {
+    const payload = {
+      model: pickModel({ useCodexModel, useReviewModel, model }),
+      messages: normalizeChatMessages({ instructions, input, messages }),
+      ...(extraBody || {}),
+    };
+
+    if (Number.isFinite(Number(temperature))) {
+      payload.temperature = Number(temperature);
+    }
+    if (Array.isArray(tools) && tools.length) {
+      payload.tools = tools;
+    }
+    if (toolChoice) {
+      payload.tool_choice = toolChoice;
+    }
+
+    return payload;
+  }
+
+  async function executeChatCompletionWithRetry(buildPayload) {
+    let payload = buildPayload(false);
+
+    try {
+      return {
+        payload,
+        response: await executeChatCompletionsRequest(payload),
+      };
+    } catch (error) {
+      if (!Object.prototype.hasOwnProperty.call(payload, "temperature") || !shouldRetryWithoutTemperature(error)) {
+        throw error;
+      }
+
+      payload = buildPayload(true);
+      return {
+        payload,
+        response: await executeChatCompletionsRequest(payload),
+      };
+    }
+  }
+
   async function generateWithChatCompletions({
     instructions,
     input,
@@ -1139,50 +1709,67 @@ export function createProvider(projectState, options = {}) {
     useReviewModel = false,
     model,
     temperature,
+    tools,
+    toolChoice,
+    extraBody,
   }) {
-    const payload = {
-      model: pickModel({ useCodexModel, useReviewModel, model }),
-      messages: normalizeChatMessages({ instructions, input, messages }),
-    };
-
-    if (Number.isFinite(Number(temperature))) {
-      payload.temperature = Number(temperature);
-    }
-
-    let response;
-    try {
-      response = await requestProviderJson({
-        url: `${settings.baseUrl}/chat/completions`,
-        apiKey: settings.apiKey,
-        providerName: settings.providerName,
-        payload,
-        streamFallbackAllowed: false,
-        parseStream: payload.stream ? parseChatCompletionEventStream : null,
-      });
-    } catch (error) {
-      if (!Object.prototype.hasOwnProperty.call(payload, "temperature") || !shouldRetryWithoutTemperature(error)) {
-        throw error;
-      }
-
-      const payloadWithoutTemperature = {
-        ...payload,
-      };
-      delete payloadWithoutTemperature.temperature;
-      response = await requestProviderJson({
-        url: `${settings.baseUrl}/chat/completions`,
-        apiKey: settings.apiKey,
-        providerName: settings.providerName,
-        payload: payloadWithoutTemperature,
-        streamFallbackAllowed: false,
-        parseStream: payloadWithoutTemperature.stream ? parseChatCompletionEventStream : null,
-      });
-    }
+    const { payload, response } = await executeChatCompletionWithRetry((omitTemperature = false) =>
+      buildChatCompletionPayload({
+        instructions,
+        input,
+        messages,
+        useCodexModel,
+        useReviewModel,
+        model,
+        temperature: omitTemperature ? undefined : temperature,
+        tools,
+        toolChoice,
+        extraBody,
+      }));
 
     return {
       mode: settings.effectiveMode,
       model: payload.model,
       text: extractChatCompletionText(response),
       raw: response,
+    };
+  }
+
+  async function generateWithMiniMaxNativeWebSearch(options = {}) {
+    const pluginResult = await generateWithChatCompletions({
+      ...options,
+      tools: undefined,
+      toolChoice: undefined,
+      extraBody: {
+        plugins: ["plugin_web_search"],
+      },
+    });
+    const raw = {
+      ...(pluginResult.raw || {}),
+      native_web_search_requested: true,
+    };
+
+    if (hasMiniMaxWebSearchToolCall(raw)) {
+      return {
+        ...pluginResult,
+        raw,
+      };
+    }
+
+    try {
+      const probeResult = await generateWithChatCompletions({
+        ...options,
+        tools: [{ type: "web_search" }],
+        toolChoice: "auto",
+      });
+      raw.native_web_search_probe = probeResult.raw;
+    } catch (error) {
+      raw.native_web_search_probe_error = error instanceof Error ? error.message : String(error || "");
+    }
+
+    return {
+      ...pluginResult,
+      raw,
     };
   }
 
@@ -1193,11 +1780,21 @@ export function createProvider(projectState, options = {}) {
       );
     }
 
-    if (
-      Array.isArray(options?.tools) &&
-      options.tools.length &&
-      !options?.disableToolProviderRouting
-    ) {
+    if (Array.isArray(options?.tools) && options.tools.length && !options?.disableToolProviderRouting) {
+      let nativeMiniMaxResult = null;
+      let nativeMiniMaxError = null;
+
+      if (hasOnlyWebSearchTools(options.tools) && providerSupportsNativeWebSearch(settings)) {
+        try {
+          nativeMiniMaxResult = await generateWithMiniMaxNativeWebSearch(options);
+          if (hasMiniMaxWebSearchToolCall(nativeMiniMaxResult.raw)) {
+            return nativeMiniMaxResult;
+          }
+        } catch (error) {
+          nativeMiniMaxError = error;
+        }
+      }
+
       const toolProvider = createProvider(projectState, {
         rootDir: outerOptions.rootDir,
         providerIdOverride: "OpenAI",
@@ -1205,7 +1802,13 @@ export function createProvider(projectState, options = {}) {
       });
 
       if (toolProvider.settings.effectiveMode !== "openai-responses") {
-        throw new Error("web_search 已固定走 OpenAI GPT，但当前 OpenAI Provider 不可用。请检查 novelex.codex.toml 里的 OpenAI 配置。");
+        if (nativeMiniMaxResult) {
+          return nativeMiniMaxResult;
+        }
+        if (nativeMiniMaxError) {
+          throw nativeMiniMaxError;
+        }
+        throw new Error("web_search 当前需要可用的 OpenAI responses provider，或可用的 MiniMax 原生搜索配置。请检查 novelex.codex.toml 里的 OpenAI / MiniMax 配置。");
       }
 
       return toolProvider.generateText({

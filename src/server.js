@@ -5,12 +5,14 @@ import path from "node:path";
 import { loadCodexApiConfig, normalizeCodexConfigData, saveCodexApiConfig } from "./config/codex-config.js";
 import { PLAN_STATUS } from "./core/defaults.js";
 import { buildStyleFingerprintSummary } from "./core/style-fingerprint.js";
+import { loadFactLedger } from "./core/facts.js";
 import { nowIso, safeJsonParse } from "./core/text.js";
 import { publicProviderSettings, resolveProviderSettings } from "./llm/provider.js";
+import { closeAllWorkspaceMcpManagers, getWorkspaceMcpManager } from "./mcp/index.js";
 import { runPlanDraft, reviewPlanDraft, reviewPlanFinal, runPlanFinalization } from "./orchestration/plan.js";
 import { generateStyleFingerprint } from "./orchestration/style-fingerprint.js";
 import { rebuildOpeningCollectionIndex } from "./opening/index.js";
-import { reviewChapter, runWriteChapter } from "./orchestration/write.js";
+import { deleteLatestLockedChapter, reviewChapter, runWriteChapter } from "./orchestration/write.js";
 import { rebuildRagCollectionIndex } from "./rag/index.js";
 import { createStore } from "./utils/store.js";
 import { createProjectWorkspace, deleteProjectWorkspace, ensureProjectId, listProjects } from "./utils/workspace.js";
@@ -19,6 +21,10 @@ const PORT = Number(process.env.PORT || 3000);
 const WORKSPACE_ROOT = process.cwd();
 const storeCache = new Map();
 let activeOperation = null;
+const workspaceMcpManager = getWorkspaceMcpManager({
+  rootDir: WORKSPACE_ROOT,
+  configRootDir: WORKSPACE_ROOT,
+});
 
 const CONTENT_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -262,6 +268,7 @@ async function buildSnapshot(store, projectId) {
       path.join(store.paths.novelStateDir, "foreshadowing_registry.json"),
       null,
     ),
+    factLedger: await loadFactLedger(store),
   };
 
   return {
@@ -861,12 +868,34 @@ const routes = {
         approved: Boolean(body.approved),
         feedback: String(body.feedback || ""),
         reviewAction: String(body.reviewAction || (body.approved ? "approve" : "rewrite")),
+        approvalOverrideAcknowledged: Boolean(body.approvalOverrideAcknowledged),
         selectedProposalId: String(body.selectedProposalId || ""),
         selectedSceneRefs: body.selectedSceneRefs || [],
         authorNotes: String(body.authorNotes || ""),
         outlineOptions: body.outlineOptions || null,
         sceneIds: body.sceneIds || [],
         sceneOrder: body.sceneOrder || [],
+        selection: body.selection || null,
+      });
+      return {
+        result,
+        projects: await listProjects(WORKSPACE_ROOT),
+        state: await buildSnapshot(context.store, context.projectId),
+        projectId: context.projectId,
+      };
+    });
+  }),
+
+  "POST /api/write/delete": withErrorHandling(async (request, response) => {
+    const body = await readBody(request);
+    const context = await resolveProjectContext(new URL(request.url || "/", `http://${request.headers.host || `localhost:${PORT}`}`), body);
+    if (!context.store) {
+      sendJson(response, 404, { error: "Project not found" });
+      return;
+    }
+    await sendLockedJson(response, "chapter_delete", async () => {
+      const result = await deleteLatestLockedChapter(context.store, {
+        chapterId: String(body.chapterId || ""),
       });
       return {
         result,
@@ -894,4 +923,19 @@ const server = http.createServer(async (request, response) => {
 server.listen(PORT, () => {
   // eslint-disable-next-line no-console
   console.log(`Novelex running at http://localhost:${PORT}`);
+});
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.once(signal, async () => {
+    try {
+      await workspaceMcpManager.closeAll();
+      await closeAllWorkspaceMcpManagers();
+    } finally {
+      process.exit(0);
+    }
+  });
+}
+
+process.once("exit", () => {
+  workspaceMcpManager.closeAll().catch(() => {});
 });

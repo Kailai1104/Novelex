@@ -84,6 +84,72 @@ function chapterMetrics(markdown = "") {
   };
 }
 
+function formatWordCountEvidence(actualWords = 0, targetWords = 0) {
+  if (targetWords <= 0) {
+    return `当前约 ${actualWords} 字`;
+  }
+  const ratio = actualWords / targetWords;
+  return `当前约 ${actualWords} 字，目标约 ${targetWords} 字，完成度约 ${Math.round(ratio * 100)}%`;
+}
+
+function detectChapterWordCount(project, markdown = "") {
+  const targetWords = Number(project?.targetWordsPerChapter || 0);
+  if (!Number.isFinite(targetWords) || targetWords <= 0) {
+    return [];
+  }
+
+  const { wordCount } = chapterMetrics(markdown);
+  if (wordCount <= 0) {
+    return [];
+  }
+
+  const ratio = wordCount / targetWords;
+  const criticalShortThreshold = Math.max(60, Math.min(120, Math.round(targetWords * 0.05)));
+
+  if (wordCount < criticalShortThreshold) {
+    return [createIssue(
+      "chapter_word_count",
+      "critical",
+      "章节字数",
+      "章节字数过短，正文承载量明显不足，容易导致关键事件、反应链和章末牵引无法真正落地。",
+      formatWordCountEvidence(wordCount, targetWords),
+      "补足至少一个关键事件的现场展开、人物反应与章末压力，让正文体量回到目标区间。",
+    )];
+  }
+  if (ratio > 2.2) {
+    return [createIssue(
+      "chapter_word_count",
+      "critical",
+      "章节字数",
+      "章节字数明显高于目标，单章体量失控，容易带来注水、重复推进或节奏拖沓。",
+      formatWordCountEvidence(wordCount, targetWords),
+      "合并重复推进的段落，把次要铺陈前移或后移，收紧到本章真正必须完成的事件链。",
+    )];
+  }
+  if (ratio < 0.45) {
+    return [createIssue(
+      "chapter_word_count",
+      "warning",
+      "章节字数",
+      "章节字数低于目标区间，可能会让本章推进显得偏薄。",
+      formatWordCountEvidence(wordCount, targetWords),
+      "适当补足现场动作、人物反应或章末牵引，让本章更饱满。",
+    )];
+  }
+  if (ratio > 1.5) {
+    return [createIssue(
+      "chapter_word_count",
+      "warning",
+      "章节字数",
+      "章节字数高于目标区间，需留意本章是否出现拖沓或重复推进。",
+      formatWordCountEvidence(wordCount, targetWords),
+      "检查是否有可压缩的概述段、重复试探或可并入下一章的铺陈。",
+    )];
+  }
+
+  return [];
+}
+
 function firstPersonNarrationEvidence(markdown = "") {
   const paragraphs = extractParagraphs(markdown);
   const evidence = [];
@@ -556,6 +622,7 @@ function detectSubplotStagnation(registry = null, currentChapterNumber = 0) {
 }
 
 export function runAuditHeuristics({
+  project,
   chapterPlan,
   chapterDraft,
   researchPacket,
@@ -632,6 +699,7 @@ export function runAuditHeuristics({
 
   issues.push(...detectResearchAccuracy(markdown, researchPacket));
   issues.push(...detectStyleDrift(recentChapters, markdown));
+  issues.push(...detectChapterWordCount(project, markdown));
 
   const sequenceSnapshot = buildSequenceSnapshot(recentChapters, {
     chapterId: chapterPlan?.chapterId || "current",

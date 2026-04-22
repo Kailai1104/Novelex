@@ -13,7 +13,42 @@ const DEFAULT_PROVIDER_CATALOG = {
     requires_openai_auth: true,
   },
 };
-const UNSUPPORTED_PROVIDER_IDS = new Set(["Kimi", "MiniMax"]);
+const DEFAULT_MCP_CONFIG = {
+  enabled: true,
+  servers: {
+    web_search: {
+      enabled: true,
+      transport: "stdio",
+      command: "npx",
+      args: ["-y", "minimax-coding-plan-mcp"],
+      startup_timeout_ms: 60000,
+      call_timeout_ms: 30000,
+      env: {
+        MINIMAX_API_HOST: "https://api.minimaxi.com",
+      },
+    },
+    local_rag: {
+      enabled: true,
+      transport: "stdio",
+      command: "node",
+      args: ["src/mcp/servers/local-rag.js"],
+      startup_timeout_ms: 10000,
+      call_timeout_ms: 30000,
+      env: {},
+    },
+  },
+};
+const OPTIONAL_PROVIDER_DEFAULTS = {
+  MiniMax: {
+    name: "MiniMax",
+    base_url: "https://api.minimaxi.com/v1",
+    wire_api: "chat_completions",
+    response_model: "MiniMax-M2.5-highspeed",
+    review_model: "MiniMax-M2.5-highspeed",
+    codex_model: "MiniMax-M2.5-highspeed",
+  },
+};
+const UNSUPPORTED_PROVIDER_IDS = new Set(["Kimi"]);
 
 function stripInlineComment(line) {
   let inString = false;
@@ -52,6 +87,52 @@ function stripInlineComment(line) {
 
 function parseValue(raw) {
   const value = raw.trim();
+  if (value.startsWith("[") && value.endsWith("]")) {
+    const body = value.slice(1, -1).trim();
+    if (!body) {
+      return [];
+    }
+
+    const items = [];
+    let current = "";
+    let inString = false;
+    let escaped = false;
+
+    for (let index = 0; index < body.length; index += 1) {
+      const char = body[index];
+      if (escaped) {
+        current += char;
+        escaped = false;
+        continue;
+      }
+
+      if (char === "\\") {
+        current += char;
+        escaped = true;
+        continue;
+      }
+
+      if (char === "\"") {
+        current += char;
+        inString = !inString;
+        continue;
+      }
+
+      if (!inString && char === ",") {
+        items.push(parseValue(current));
+        current = "";
+        continue;
+      }
+
+      current += char;
+    }
+
+    if (current.trim()) {
+      items.push(parseValue(current));
+    }
+
+    return items;
+  }
   if (value.startsWith("\"") && value.endsWith("\"")) {
     return value.slice(1, -1).replace(/\\"/g, "\"");
   }
@@ -125,6 +206,12 @@ function serializeValue(value) {
   if (typeof value === "string") {
     return `"${value.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
   }
+  if (Array.isArray(value)) {
+    const serializedItems = value
+      .map((item) => serializeValue(item))
+      .filter((item) => item !== null);
+    return `[${serializedItems.join(", ")}]`;
+  }
   if (typeof value === "boolean" || typeof value === "number") {
     return String(value);
   }
@@ -187,6 +274,59 @@ export function defaultProviderCatalog() {
   return cloneJson(DEFAULT_PROVIDER_CATALOG);
 }
 
+export function defaultMcpConfig() {
+  return cloneJson(DEFAULT_MCP_CONFIG);
+}
+
+function mergeConfigTree(defaults, overrides) {
+  if (Array.isArray(defaults)) {
+    return Array.isArray(overrides) ? cloneJson(overrides) : cloneJson(defaults);
+  }
+  if (!isPlainObject(defaults)) {
+    return overrides === undefined ? defaults : overrides;
+  }
+
+  const merged = {};
+  const keys = new Set([
+    ...Object.keys(defaults || {}),
+    ...Object.keys(isPlainObject(overrides) ? overrides : {}),
+  ]);
+
+  for (const key of keys) {
+    const defaultValue = defaults?.[key];
+    const overrideValue = isPlainObject(overrides) ? overrides[key] : undefined;
+
+    if (Array.isArray(defaultValue)) {
+      merged[key] = Array.isArray(overrideValue) ? cloneJson(overrideValue) : cloneJson(defaultValue);
+      continue;
+    }
+
+    if (isPlainObject(defaultValue)) {
+      merged[key] = mergeConfigTree(defaultValue, overrideValue);
+      continue;
+    }
+
+    if (overrideValue === undefined) {
+      merged[key] = defaultValue;
+      continue;
+    }
+
+    if (Array.isArray(overrideValue)) {
+      merged[key] = cloneJson(overrideValue);
+      continue;
+    }
+
+    if (isPlainObject(overrideValue)) {
+      merged[key] = mergeConfigTree({}, overrideValue);
+      continue;
+    }
+
+    merged[key] = overrideValue;
+  }
+
+  return merged;
+}
+
 function fallbackProviderId(modelProviders = {}) {
   if (modelProviders.OpenAI) {
     return "OpenAI";
@@ -213,6 +353,7 @@ export function normalizeProviderCatalog(rawProviders = {}) {
       continue;
     }
     normalized[providerId] = {
+      ...(OPTIONAL_PROVIDER_DEFAULTS[providerId] || {}),
       name: providerId,
       ...(config || {}),
     };
@@ -226,6 +367,7 @@ export function normalizeCodexConfigData(data = {}) {
     ...cloneJson(data || {}),
   };
   normalized.model_providers = normalizeProviderCatalog(normalized.model_providers || {});
+  normalized.mcp = mergeConfigTree(DEFAULT_MCP_CONFIG, normalized.mcp || {});
 
   const requestedProviderId = String(normalized.model_provider || "OpenAI").trim() || "OpenAI";
   const providerId = normalized.model_providers[requestedProviderId]

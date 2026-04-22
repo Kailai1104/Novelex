@@ -14,6 +14,7 @@ let serverPollTimer = null;
 let serverPollInFlight = false;
 const expandedSections = Object.create(null);
 const outlineWorkbenchState = Object.create(null);
+const partialRevisionWorkbenchState = Object.create(null);
 
 function escapeHtml(value) {
   return String(value || "")
@@ -386,6 +387,23 @@ function previewText(value, limit = 2400) {
   return `${text.slice(0, limit)}\n\n...`;
 }
 
+function countWordsApprox(value) {
+  if (!value) {
+    return 0;
+  }
+
+  return String(value).replace(/\s+/g, "").length;
+}
+
+function pendingChapterWordCount(pending = null) {
+  const explicitCount = Number(pending?.chapterMeta?.word_count);
+  if (Number.isFinite(explicitCount) && explicitCount > 0) {
+    return explicitCount;
+  }
+
+  return countWordsApprox(pending?.chapterMarkdown || "");
+}
+
 function summarizePlanCharacters(characters = []) {
   return (Array.isArray(characters) ? characters : [])
     .map(
@@ -472,6 +490,92 @@ function outlineWorkbenchFor(chapterId, pending = null) {
     };
   }
   return outlineWorkbenchState[key];
+}
+
+function splitChapterMarkdownForReview(markdown = "", fallbackTitle = "") {
+  const normalized = String(markdown || "").replace(/\r\n?/g, "\n");
+  const match = normalized.match(/^#\s+(.+)\n([\s\S]*)$/);
+  if (!match) {
+    return {
+      title: String(fallbackTitle || "").trim(),
+      body: normalized,
+    };
+  }
+
+  return {
+    title: String(match[1] || fallbackTitle || "").trim(),
+    body: String(match[2] || "").replace(/^\n+/, ""),
+  };
+}
+
+function partialRevisionWorkbenchFor(chapterId, pending = null) {
+  const key = String(chapterId || "");
+  if (!partialRevisionWorkbenchState[key]) {
+    partialRevisionWorkbenchState[key] = {
+      selectedText: String(pending?.reviewState?.selection?.selectedText || ""),
+      prefixContext: String(pending?.reviewState?.selection?.prefixContext || ""),
+      suffixContext: String(pending?.reviewState?.selection?.suffixContext || ""),
+      feedback: String(
+        pending?.reviewState?.mode === "partial_rewrite"
+          ? pending?.reviewState?.lastFeedback || ""
+          : "",
+      ),
+    };
+  }
+  return partialRevisionWorkbenchState[key];
+}
+
+function selectionPreviewText(workbench = null) {
+  const selectedText = String(workbench?.selectedText || "");
+  return selectedText ? previewText(selectedText, 240) : "";
+}
+
+function rangeOffsetWithin(root, container, offset) {
+  const range = document.createRange();
+  range.selectNodeContents(root);
+  range.setEnd(container, offset);
+  return range.toString().length;
+}
+
+function captureChapterSelection(container) {
+  const chapterId = container.getAttribute("data-chapter-id") || "";
+  if (!chapterId) {
+    return;
+  }
+
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+    return;
+  }
+
+  const range = selection.getRangeAt(0);
+  if (
+    !container.contains(range.startContainer) ||
+    !container.contains(range.endContainer)
+  ) {
+    showToast("请只在正文 body 内框选需要修改的片段。");
+    return;
+  }
+
+  const start = rangeOffsetWithin(container, range.startContainer, range.startOffset);
+  const end = rangeOffsetWithin(container, range.endContainer, range.endOffset);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    return;
+  }
+
+  const bodyText = container.textContent || "";
+  const selectedText = bodyText.slice(start, end);
+  if (!selectedText.trim()) {
+    showToast("请至少选中一句有效正文。");
+    return;
+  }
+
+  const workbench = partialRevisionWorkbenchFor(chapterId, snapshot?.staged?.pendingChapter || null);
+  workbench.selectedText = selectedText;
+  workbench.prefixContext = bodyText.slice(Math.max(0, start - 120), start);
+  workbench.suffixContext = bodyText.slice(end, end + 120);
+  render();
+  selection.removeAllRanges();
 }
 
 function candidateSceneMap(pending = null) {
@@ -1189,6 +1293,10 @@ function renderWritePanel() {
   const enabled = snapshot.project.phase.plan.status === "locked";
   const pending = snapshot.staged.pendingChapter;
   const outlineOptions = normalizedOutlineOptionsFromSnapshot(pending);
+  const pendingWordCount = pendingChapterWordCount(pending);
+  const pendingChapterParts = pending?.chapterMarkdown
+    ? splitChapterMarkdownForReview(pending.chapterMarkdown, pending?.chapterPlan?.title || "")
+    : null;
   return `
     <section class="panel span-12">
       <div class="panel-header">
@@ -1242,6 +1350,16 @@ function renderWritePanel() {
             titleHtml: "<h3>Writer Context</h3>",
             bodyHtml: `<pre>${escapeHtml(JSON.stringify(pending.writerContext || {}, null, 2))}</pre>`,
           })}
+          ${pending.factContext ? `
+          ${renderCollapsibleCard({
+            key: `write-${pending.chapterPlan?.chapterId || "pending"}-fact-context`,
+            className: "preview-box",
+            titleHtml: "<h3>Fact Context</h3>",
+            bodyHtml: `
+              <p><small>已定事实：${pending.factContext.establishedFacts?.length || 0} 条 ｜ 开放张力：${pending.factContext.openTensions?.length || 0} 条</small></p>
+              <pre>${escapeHtml(JSON.stringify(pending.factContext, null, 2))}</pre>
+            `,
+          })}` : ""}
           ${renderCollapsibleCard({
             key: `write-${pending.chapterPlan?.chapterId || "pending"}-history`,
             className: "preview-box",
@@ -1264,8 +1382,16 @@ function renderWritePanel() {
           ${renderCollapsibleCard({
             key: `write-${pending.chapterPlan?.chapterId || "pending"}-chapter`,
             className: "preview-box",
-            titleHtml: `<h3>${escapeHtml(pending.chapterPlan.title)}</h3>`,
-            bodyHtml: renderMarkdownBlock(pending.chapterMarkdown),
+            titleHtml: `<h3>${escapeHtml(pendingChapterParts?.title || pending.chapterPlan.title)}</h3>`,
+            bodyHtml: `
+              <p><small>${pendingWordCount ? `当前草稿字数：${escapeHtml(String(pendingWordCount))} 字｜` : ""}正文 body 支持直接框选，章节标题不会被纳入局部修订。</small></p>
+              <div
+                class="chapter-body-selectable"
+                data-chapter-body-selectable="true"
+                data-chapter-id="${escapeHtml(pending.chapterPlan?.chapterId || pending.chapterId || "")}"
+                tabindex="0"
+              >${escapeHtml(pendingChapterParts?.body || "")}</div>
+            `,
           })}` : ""}
           ${pending.sceneDrafts?.length ? `
           ${renderCollapsibleCard({
@@ -1404,16 +1530,71 @@ function renderChapterOutlineReviewBox(pending = null) {
 }
 
 function renderChapterReviewBox(pending = null) {
+  const validation = pending?.validation || {};
+  const reviewState = pending?.reviewState || {};
+  const wordCount = pendingChapterWordCount(pending);
+  const issueCounts = validation.issueCounts || { critical: 0, warning: 0, info: 0 };
+  const manualReviewRequired = Boolean(reviewState.manualReviewRequired);
+  const feedbackSupervisionPassed = reviewState.feedbackSupervisionPassed !== false;
+  const approvalOverrideRequired = manualReviewRequired || validation?.overallPassed === false || !feedbackSupervisionPassed;
+  const auditMode = manualReviewRequired
+    ? "人工复审中"
+    : (reviewState.auditDegraded || validation.auditDegraded || validation?.semanticAudit?.source === "heuristics_only")
+      ? "降级审查（heuristics only）"
+      : "正常审查";
+  const blockingFeedbackIssues = (reviewState.blockingFeedbackIssues || [])
+    .filter(Boolean)
+    .slice(0, 4);
+  const blockingIssues = (reviewState.blockingAuditIssues || [])
+    .filter(Boolean)
+    .slice(0, 4);
+  const feedbackSummary = String(reviewState.feedbackSupervisionSummary || "").trim();
+  const chapterId = pending?.chapterPlan?.chapterId || pending?.chapterId || "pending";
+  const workbench = partialRevisionWorkbenchFor(chapterId, pending);
+  const selectionPreview = selectionPreviewText(workbench);
+  const riskBlockHtml = approvalOverrideRequired
+    ? `
+      <div style="margin: 12px 0; padding: 12px; border: 1px solid #c26a3d; background: rgba(194,106,61,0.08); border-radius: 10px;">
+        <strong>当前章节尚未通过反馈监督或审计</strong>
+        <p style="margin-top: 8px;"><small>审查模式：${escapeHtml(auditMode)}｜feedback=${feedbackSupervisionPassed ? "passed" : "blocked"}｜critical ${issueCounts.critical || 0} / warning ${issueCounts.warning || 0} / info ${issueCounts.info || 0}｜manualReviewRequired=${manualReviewRequired ? "true" : "false"}</small></p>
+        ${feedbackSummary ? `<p style="margin-top: 8px;"><small>反馈监督：${escapeHtml(feedbackSummary)}</small></p>` : ""}
+        ${blockingFeedbackIssues.length ? `<p style="margin-top: 8px;"><small>未落实反馈：${escapeHtml(blockingFeedbackIssues.join("；"))}</small></p>` : ""}
+        ${blockingIssues.length ? `<p style="margin-top: 8px;"><small>未解决问题：${escapeHtml(blockingIssues.join("；"))}</small></p>` : ""}
+      </div>
+    `
+    : issueCounts.warning
+      ? `
+      <div style="margin: 12px 0; padding: 12px; border: 1px solid #8f7b2e; background: rgba(143,123,46,0.08); border-radius: 10px;">
+        <strong>当前章节可批准，但仍有 warning</strong>
+        <p style="margin-top: 8px;"><small>审查模式：${escapeHtml(auditMode)}｜critical ${issueCounts.critical || 0} / warning ${issueCounts.warning || 0} / info ${issueCounts.info || 0}</small></p>
+      </div>
+    `
+      : `
+      <p><small>审查模式：${escapeHtml(auditMode)}｜当前没有阻止通过的 critical 问题。</small></p>
+    `;
+  const approveLabel = approvalOverrideRequired ? "仍然锁章（未通过审计）" : "批准";
   return renderCollapsibleCard({
     key: "review-chapter",
     className: "review-box",
     titleHtml: "<h3>章节审查</h3>",
     bodyHtml: `
-      <p>批准会直接锁章；如果不满意，只需要写清楚修改意见，系统会根据反馈自动重写本章。</p>
+      <p>${approvalOverrideRequired ? "当前章节仍有未解决问题；你可以继续重写，也可以在显式确认风险后仍然锁章。" : "通过后会锁章；如果不满意，你既可以按反馈重写整章，也可以先在上面的正文 body 中框选一个连续片段，只改那一段。"}</p>
+      ${wordCount ? `<p><small>当前待审章节字数：${escapeHtml(String(wordCount))} 字</small></p>` : ""}
+      ${riskBlockHtml}
       <textarea id="feedback-chapter" placeholder="写下你的修改意见，比如要加强哪段冲突、调整节奏、补足人物动机或优化章末牵引。" ${disabledAttr(mutationBusy())}></textarea>
       <div class="actions">
-        <button class="button button-primary" data-review-target="chapter" data-review-action="approve" ${disabledAttr(mutationBusy())}>${mutationBusy("chapter_review") ? "提交中..." : "批准"}</button>
+        <button class="button button-primary" data-review-target="chapter" data-review-action="approve" ${disabledAttr(mutationBusy())}>${mutationBusy("chapter_review") ? "提交中..." : approveLabel}</button>
         <button class="button button-danger" data-review-target="chapter" data-review-action="rewrite" ${disabledAttr(mutationBusy())}>${mutationBusy("chapter_review") ? "提交中..." : "根据反馈重写"}</button>
+      </div>
+      <div class="chapter-selection-review" style="margin-top:16px;">
+        <strong>局部修订工作区</strong>
+        <p style="margin-top:6px;"><small>先在正文预览里直接框选一段连续文本，再写修改意见。系统会只替换这一段，其余正文保持不动。</small></p>
+        <div class="chapter-selection-preview">${selectionPreview ? escapeHtml(selectionPreview) : "当前还没有选中的正文片段。"}</div>
+        <textarea id="feedback-chapter-partial" placeholder="只描述这段该怎么改，比如压紧情绪、改顺动作逻辑、补一句更明确的人物反应。" ${disabledAttr(mutationBusy())}>${escapeHtml(workbench.feedback || "")}</textarea>
+        <div class="actions">
+          <button class="button button-secondary" type="button" data-chapter-selection-clear="${escapeHtml(chapterId)}" ${disabledAttr(mutationBusy())}>清除选区</button>
+          <button class="button button-secondary" data-review-target="chapter" data-review-action="partial_rewrite" ${disabledAttr(mutationBusy())}>${mutationBusy("chapter_review") ? "提交中..." : "只改选中部分"}</button>
+        </div>
       </div>
     `,
   });
@@ -1421,6 +1602,8 @@ function renderChapterReviewBox(pending = null) {
 
 function renderChapterPanel() {
   const chapters = snapshot.chapters || [];
+  const latestChapterId = chapters.at(-1)?.chapter_id || "";
+  const writePending = Boolean(snapshot.project?.phase?.write?.pendingReview?.chapterId);
   return `
     <section class="panel span-12">
       <div class="panel-header">
@@ -1437,7 +1620,22 @@ function renderChapterPanel() {
                   key: `chapter-${chapter.chapter_id}`,
                   className: "chapter-card",
                   titleHtml: `<strong>${escapeHtml(chapter.chapter_id)} · ${escapeHtml(chapter.title)}</strong>`,
-                  bodyHtml: `<p>${escapeHtml(chapter.summary_50)}</p>`,
+                  bodyHtml: `
+                    <p>${escapeHtml(chapter.summary_50)}</p>
+                    ${chapter.chapter_id === latestChapterId ? `
+                      <div class="actions" style="margin-top:12px;">
+                        <button
+                          class="button button-danger"
+                          type="button"
+                          data-delete-locked-chapter="${escapeHtml(chapter.chapter_id)}"
+                          ${disabledAttr(mutationBusy() || writePending)}
+                        >
+                          ${mutationBusy("chapter_delete") ? "删除中..." : "删除此章"}
+                        </button>
+                        <small>仅支持依次删除最新锁定章节。</small>
+                      </div>
+                    ` : ""}
+                  `,
                 }),
               )
               .join("")
@@ -1972,6 +2170,35 @@ function bindEvents() {
     });
   });
 
+  document.querySelectorAll("[data-delete-locked-chapter]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const chapterId = button.getAttribute("data-delete-locked-chapter");
+      if (!chapterId) {
+        return;
+      }
+
+      const confirmed = window.confirm(`确定删除已锁定章节 ${chapterId} 吗？当前只允许按倒序删除最新锁定章节。`);
+      if (!confirmed) {
+        return;
+      }
+
+      await runMutation("chapter_delete", async () => {
+        try {
+          const data = await api("/api/write/delete", {
+            method: "POST",
+            body: apiBody({ chapterId }),
+          });
+          applyServerState(data);
+          render();
+          showToast(`${chapterId} 已删除。`);
+        } catch (error) {
+          await syncStateAfterError();
+          showToast(error.message);
+        }
+      });
+    });
+  });
+
   document.querySelectorAll("[data-outline-add-scene]").forEach((button) => {
     button.addEventListener("click", () => {
       const chapterId = button.getAttribute("data-outline-chapter-id");
@@ -2024,24 +2251,71 @@ function bindEvents() {
     });
   });
 
+  document.querySelectorAll("[data-chapter-body-selectable]").forEach((container) => {
+    const capture = () => {
+      window.setTimeout(() => {
+        captureChapterSelection(container);
+      }, 0);
+    };
+    container.addEventListener("mouseup", capture);
+    container.addEventListener("keyup", capture);
+  });
+
+  document.querySelectorAll("[data-chapter-selection-clear]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const chapterId = button.getAttribute("data-chapter-selection-clear");
+      if (!chapterId) {
+        return;
+      }
+      const workbench = partialRevisionWorkbenchFor(chapterId, snapshot?.staged?.pendingChapter || null);
+      workbench.selectedText = "";
+      workbench.prefixContext = "";
+      workbench.suffixContext = "";
+      render();
+    });
+  });
+
+  const partialFeedbackInput = document.querySelector("#feedback-chapter-partial");
+  if (partialFeedbackInput) {
+    partialFeedbackInput.addEventListener("input", () => {
+      const pending = snapshot?.staged?.pendingChapter || null;
+      const chapterId = pending?.chapterPlan?.chapterId || pending?.chapterId || "";
+      if (!chapterId) {
+        return;
+      }
+      partialRevisionWorkbenchFor(chapterId, pending).feedback = partialFeedbackInput.value || "";
+    });
+  }
+
   document.querySelectorAll("[data-review-target]").forEach((button) => {
     button.addEventListener("click", async () => {
       const target = button.getAttribute("data-review-target");
       const reviewAction = button.getAttribute("data-review-action");
       const isWriteReview = target === "chapter";
       const isOutlineReview = target === "chapter_outline";
+      const isPartialRewrite = isWriteReview && reviewAction === "partial_rewrite";
       const approved = isOutlineReview
         ? reviewAction === "approve_single" || reviewAction === "approve_composed"
         : reviewAction === "approve" ? true : button.getAttribute("data-approved") === "true";
-      const textarea = document.querySelector(`#feedback-${target}`);
+      const textarea = isPartialRewrite
+        ? document.querySelector("#feedback-chapter-partial")
+        : document.querySelector(`#feedback-${target}`);
       const feedback = textarea?.value || "";
       const pending = snapshot?.staged?.pendingChapter || null;
       const chapterId = pending?.chapterPlan?.chapterId || pending?.chapterId || "";
+      const partialWorkbench = isWriteReview ? partialRevisionWorkbenchFor(chapterId, pending) : null;
       const outlineWorkbench = isOutlineReview ? outlineWorkbenchFor(chapterId, pending) : null;
       const selectedSceneRefs = isOutlineReview && reviewAction === "approve_composed"
         ? [...(outlineWorkbench?.sceneRefs || [])]
         : [];
       const selectedProposalId = isOutlineReview ? button.getAttribute("data-selected-proposal-id") || "" : "";
+      const approvalOverrideRequired = isWriteReview &&
+        approved &&
+        (
+          pending?.reviewState?.manualReviewRequired ||
+          pending?.validation?.overallPassed === false ||
+          pending?.reviewState?.feedbackSupervisionPassed === false
+        );
       const outlineOptions = {
         variantCount: Number(document.querySelector("#outline-variant-count")?.value || 3),
         diversityPreset: document.querySelector("#outline-diversity-preset")?.value || "wide",
@@ -2050,6 +2324,21 @@ function bindEvents() {
       if (isOutlineReview && reviewAction === "approve_composed" && !selectedSceneRefs.length) {
         showToast("先往最终细纲工作区加入至少一个 scene，再提交组合定稿。");
         return;
+      }
+      if (isPartialRewrite && !String(partialWorkbench?.selectedText || "").trim()) {
+        showToast("先在正文 body 中框选一段要修改的文本，再提交局部修订。");
+        return;
+      }
+      if (approvalOverrideRequired) {
+        const blockingIssues = (pending?.reviewState?.blockingAuditIssues || []).filter(Boolean).slice(0, 4);
+        const confirmationText = [
+          "当前章节审计尚未通过，确认仍要锁章吗？",
+          `critical ${pending?.validation?.issueCounts?.critical || 0} / warning ${pending?.validation?.issueCounts?.warning || 0} / info ${pending?.validation?.issueCounts?.info || 0}`,
+          ...(blockingIssues.length ? [`未解决问题：`, ...blockingIssues.map((item) => `- ${item}`)] : []),
+        ].join("\n");
+        if (!window.confirm(confirmationText)) {
+          return;
+        }
       }
 
       const endpoint = isWriteReview ? "/api/write/review" : "/api/plan/review";
@@ -2065,10 +2354,18 @@ function bindEvents() {
               approved,
               feedback,
               reviewAction,
+              approvalOverrideAcknowledged: approvalOverrideRequired,
               selectedProposalId,
               selectedSceneRefs,
               authorNotes: feedback,
               outlineOptions,
+              selection: isPartialRewrite
+                ? {
+                    selectedText: partialWorkbench?.selectedText || "",
+                    prefixContext: partialWorkbench?.prefixContext || "",
+                    suffixContext: partialWorkbench?.suffixContext || "",
+                  }
+                : null,
             }),
           });
           applyServerState(data);
@@ -2076,7 +2373,9 @@ function bindEvents() {
           showToast(
             isOutlineReview
               ? approved ? "细纲已确认，系统正在生成正文。" : "细纲反馈已提交，系统正在重生候选。"
-              : approved ? "审查结果已提交。" : "修改意见已提交，系统正在根据反馈重写。",
+              : approved
+                ? approvalOverrideRequired ? "未通过审计的章节已在显式确认后锁章。" : "审查结果已提交。"
+                : isPartialRewrite ? "局部修订意见已提交，系统正在只改选中片段。" : "修改意见已提交，系统正在根据反馈重写。",
           );
         } catch (error) {
           await syncStateAfterError();

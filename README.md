@@ -366,15 +366,21 @@ Novelex 的正文生成、计划生成、审查和风格抽取都依赖外部模
 - `ZHIPU_API_KEY`
 - 或 `novelex.codex.toml` 中的 `zhipu_api_key`
 
-### 4. OpenAI web search 说明
+### 4. Research web search 路由说明
 
-研究检索链路中的 `web_search` 工具会被固定路由到 OpenAI 的 `responses` provider。
+研究检索链路中的 `web_search` 工具现在统一走 MCP：
+
+- 应用进程会作为 MCP client 管理 `web_search` 与 `local_rag` 两台 stdio server。
+- `web_search` 默认使用 MiniMax 的 Coding Plan MCP：`npx -y minimax-coding-plan-mcp`
+- `local_rag` 默认使用仓库内置的 `src/mcp/servers/local-rag.js`
+- `web_search` MCP 不可用时，Research 链会降级为 `search_failed`，但章节写作仍继续。
+- 当前构建会为 `web_search` 自动准备项目内 `runtime/npm-cache`，并在旧配置仍写成 `uvx` 且本机没有 `uvx` 时自动回退到 `npx`。
+- 对于 `npx/uvx minimax-coding-plan-mcp` 的冷启动安装，运行时会把 `startup_timeout_ms` 自动抬到至少 60 秒，避免首次联网拉包时误判为启动失败。
 
 这意味着：
 
-- 即使你把主写作模型切到了别的兼容 provider，
-- 只要你想使用 `ResearchRetriever` 的 web search，
-- 仍然必须在 `novelex.codex.toml` 里配置一个可用的 OpenAI provider。
+- `ResearchRetriever` 不再依赖 provider 内置 tool routing。
+- 主写作模型可以继续使用 OpenAI / MiniMax / 兼容 provider；Research 的联网搜索由 MCP server 单独负责。
 
 ## 配置方式
 
@@ -391,13 +397,36 @@ cp novelex.codex.example.toml novelex.codex.toml
 一个最小可用模板如下：
 
 ```toml
-model_provider = "OpenAI"
-model = "gpt-5.4"
-review_model = "gpt-5.4"
-codex_model = "gpt-5.3-codex"
+model_provider = "MiniMax"
+model = "MiniMax-M2.5-highspeed"
+review_model = "MiniMax-M2.5-highspeed"
+codex_model = "MiniMax-M2.5-highspeed"
 model_reasoning_effort = "high"
 disable_response_storage = true
 zhipu_api_key = "YOUR_ZHIPU_API_KEY"
+force_stream = false
+
+[mcp]
+enabled = true
+
+[mcp.servers.web_search]
+enabled = true
+transport = "stdio"
+command = "npx"
+args = ["-y", "minimax-coding-plan-mcp"]
+startup_timeout_ms = 60000
+call_timeout_ms = 30000
+
+[mcp.servers.web_search.env]
+MINIMAX_API_HOST = "https://api.minimaxi.com"
+
+[mcp.servers.local_rag]
+enabled = true
+transport = "stdio"
+command = "node"
+args = ["src/mcp/servers/local-rag.js"]
+startup_timeout_ms = 10000
+call_timeout_ms = 30000
 
 [model_providers.OpenAI]
 name = "OpenAI"
@@ -408,6 +437,18 @@ review_model = "gpt-5.4"
 codex_model = "gpt-5.3-codex"
 requires_openai_auth = true
 api_key = "YOUR_OPENAI_API_KEY"
+
+[model_providers.MiniMax]
+name = "MiniMax"
+base_url = "https://api.minimaxi.com/v1"
+wire_api = "chat_completions"
+response_model = "MiniMax-M2.5-highspeed"
+review_model = "MiniMax-M2.5-highspeed"
+codex_model = "MiniMax-M2.5-highspeed"
+api_key = "YOUR_MINIMAX_API_KEY"
+max_concurrency = 1
+request_timeout_ms = 300000
+overload_retry_window_ms = 1800000
 ```
 
 ### 关键字段说明
@@ -425,6 +466,9 @@ api_key = "YOUR_OPENAI_API_KEY"
 | `wire_api` | `responses` 或 `chat_completions` |
 | `base_url` | provider 基础地址 |
 | `api_key` | provider API key |
+| `max_concurrency` | provider 级请求并发上限，MiniMax 建议从 `1` 开始 |
+| `request_timeout_ms` | 单次请求超时，MiniMax 可适当调大 |
+| `overload_retry_window_ms` | 遇到 429/529 等拥挤错误时的总等待窗口 |
 
 ### 环境变量替代
 
@@ -432,6 +476,8 @@ api_key = "YOUR_OPENAI_API_KEY"
 
 - `OPENAI_API_KEY`
 - `OPENAI_BASE_URL`
+- `MINIMAX_API_KEY`
+- `MINIMAX_BASE_URL`
 - `ZHIPU_API_KEY`
 
 如果你定义了自定义 provider，默认也会尝试读取：
@@ -531,7 +577,7 @@ curl http://localhost:3000/api/health
 
 - 至少一个可用的大模型 provider。
 - 如果要用范文库 / 黄金三章参考库，再准备好智谱 embedding key。
-- 如果要用研究检索，再确保 OpenAI provider 可用。
+- 如果要稳定使用研究检索，建议同时保留可用的 MiniMax 或 OpenAI 搜索 provider。
 
 ### 第二步：启动服务并打开控制台
 
@@ -885,9 +931,9 @@ projects/<project-id>/novel_state/chapters/
 - 这是一个本地工作台，不是多用户 SaaS，也没有鉴权体系。
 - 状态都直接写文件，适合本地开发、研究和小团队内部使用。
 - 项目核心设定一旦在大纲锁定后发生大改，目前没有完整的 UI 重置流程。
-- `web_search` 固定走 OpenAI provider；只配兼容 provider 而不配 OpenAI，会影响研究链。
+- `web_search` 现在依赖 MCP server；默认命令是 `npx -y minimax-coding-plan-mcp`。当前构建会自动为它使用项目内 npm cache，并兼容把旧 `uvx` 配置回退到 `npx`；对于 `npx/uvx minimax-coding-plan-mcp` 的冷启动安装，运行时会把 `startup_timeout_ms` 自动抬到至少 60 秒；如果 MiniMax MCP 仍不可用，Research 链会降级为 `search_failed`。
 - RAG / Opening 相关能力依赖 embedding；即使建立了索引，运行时检索 query 也仍要做 embedding。
-- 当前 provider 解析逻辑会忽略未支持的 `Kimi` / `MiniMax` 配置块。
+- 当前 provider 解析逻辑仍会忽略未支持的 `Kimi` 配置块。
 - 范文库与开篇库目前只接受 `.txt` / `.md` 文件。
 - 服务端使用原生 HTTP server，没有做用户级权限隔离或持久任务队列。
 

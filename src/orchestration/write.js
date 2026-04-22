@@ -1,6 +1,11 @@
 import path from "node:path";
 
-import { PLAN_STATUS, REVIEW_TARGETS, WRITE_STATUS } from "../core/defaults.js";
+import {
+  DEFAULT_STYLE_GUIDE_MARKDOWN,
+  PLAN_STATUS,
+  REVIEW_TARGETS,
+  WRITE_STATUS,
+} from "../core/defaults.js";
 import {
   buildChapterMeta,
   buildStyleGuide,
@@ -16,13 +21,21 @@ import {
   buildRuleStack,
 } from "../core/input-governance.js";
 import {
+  chapterNumberFromId,
   chapterIdFromNumber,
+  composeChapterMarkdown,
   createExcerpt,
   extractJsonObject,
+  locateSelectedText,
   nowIso,
+  replaceSelectionInChapterMarkdown,
   safeJsonParse,
+  sanitizeRevisionFragment,
+  splitChapterMarkdown,
 } from "../core/text.js";
 import { createProvider } from "../llm/provider.js";
+import { formatMcpErrorMessage } from "../mcp/error.js";
+import { getWorkspaceMcpManager, normalizeWebSearchToolResult } from "../mcp/index.js";
 import {
   buildOpeningReferencePacket,
   createEmptyOpeningReferencePacket,
@@ -34,6 +47,17 @@ import {
   createEmptyReferencePacket,
   mergeReferenceIntoWriterContext,
 } from "../rag/reference.js";
+import {
+  appendFactsToLedger,
+  buildFactContextPacket,
+  buildCanonFactRevisionNotes,
+  collectCanonFactContinuityIssues,
+  loadFactLedger,
+  rebuildFactLedger,
+  runChapterFactExtractionAgent,
+  runFactSelectorAgent,
+  saveChapterFacts,
+} from "../core/facts.js";
 import {
   collectAuditRepairNotes,
   needsAuditStyleRepair,
@@ -452,18 +476,51 @@ function normalizeResearchTextList(values, limit = 6) {
 }
 
 function normalizeResearchTerms(values, limit = 8) {
-  return (Array.isArray(values) ? values : [])
-    .map((item) => {
-      if (typeof item === "string") {
-        return item.trim();
+  const flattened = [];
+
+  function pushTerm(term, note = "") {
+    const normalizedTerm = String(term || "").trim();
+    const normalizedNote = String(note || "").trim();
+    if (!normalizedTerm && !normalizedNote) {
+      return;
+    }
+    flattened.push([normalizedTerm, normalizedNote].filter(Boolean).join("："));
+  }
+
+  function visit(node, sectionLabel = "") {
+    if (!node) {
+      return;
+    }
+    if (Array.isArray(node)) {
+      node.forEach((item) => visit(item, sectionLabel));
+      return;
+    }
+    if (typeof node === "string") {
+      pushTerm(node);
+      return;
+    }
+    if (typeof node !== "object") {
+      return;
+    }
+
+    const explicitTerm = String(node.term || node.name || "").trim();
+    if (explicitTerm) {
+      pushTerm(explicitTerm, node.note || node.definition || node.usage || "");
+      return;
+    }
+
+    for (const [key, value] of Object.entries(node)) {
+      if (value && typeof value === "object") {
+        visit(value, key);
+        continue;
       }
-      if (item && typeof item === "object") {
-        const term = String(item.term || item.name || "").trim();
-        const note = String(item.note || item.definition || item.usage || "").trim();
-        return [term, note].filter(Boolean).join("：");
-      }
-      return "";
-    })
+      pushTerm(key, sectionLabel ? `${sectionLabel}：${String(value || "").trim()}` : value);
+    }
+  }
+
+  visit(values);
+
+  return flattened
     .filter(Boolean)
     .slice(0, limit);
 }
@@ -486,110 +543,90 @@ function buildResearchMarkdown(packet) {
   ].join("\n");
 }
 
-function collectResearchSources(raw) {
+function collectResearchSources(searchPackets = []) {
   const seen = new Set();
   const sources = [];
-  const visited = new WeakSet();
 
-  function pushSource(candidate, fallbackType = "web") {
-    if (!candidate || typeof candidate !== "object") {
-      return;
-    }
-    const url = String(
-      candidate.url ||
-      candidate.link ||
-      candidate.source_url ||
-      candidate.sourceUrl ||
-      "",
-    ).trim();
-    if (!url || seen.has(url)) {
-      return;
-    }
-
-    seen.add(url);
-    sources.push({
-      title: String(candidate.title || candidate.name || url).trim(),
-      url,
-      snippet: String(candidate.snippet || candidate.excerpt || candidate.text || "").trim(),
-      type: String(candidate.type || fallbackType).trim() || fallbackType,
-    });
-  }
-
-  function visit(node) {
-    if (!node) {
-      return;
-    }
-    if (Array.isArray(node)) {
-      node.forEach(visit);
-      return;
-    }
-    if (typeof node !== "object") {
-      return;
-    }
-    if (visited.has(node)) {
-      return;
-    }
-    visited.add(node);
-
-    if (node.type === "url_citation" && node.url) {
-      pushSource(node, "citation");
-    }
-    if (node.url_citation && typeof node.url_citation === "object") {
-      pushSource(node.url_citation, "citation");
-    }
-    if (Array.isArray(node.sources)) {
-      node.sources.forEach((item) => pushSource(item, "web_search_source"));
-    }
-
-    for (const value of Object.values(node)) {
-      visit(value);
-    }
-  }
-
-  visit(raw);
-  return sources.slice(0, 10);
-}
-
-function hasWebSearchEvidence(raw) {
-  let used = false;
-  const visited = new WeakSet();
-
-  function visit(node) {
-    if (used || !node) {
-      return;
-    }
-    if (Array.isArray(node)) {
-      node.forEach(visit);
-      return;
-    }
-    if (typeof node !== "object") {
-      return;
-    }
-    if (visited.has(node)) {
-      return;
-    }
-    visited.add(node);
-
-    if (
-      node.type === "web_search_call" ||
-      node.type === "web_search_call_result" ||
-      Array.isArray(node.sources) ||
-      (node.action && Array.isArray(node.action.sources))
-    ) {
-      used = true;
-      return;
-    }
-
-    for (const value of Object.values(node)) {
-      visit(value);
-      if (used) {
-        return;
+  for (const packet of Array.isArray(searchPackets) ? searchPackets : []) {
+    const sourceType = String(packet?.sourceType || "mcp_web_search").trim() || "mcp_web_search";
+    for (const result of Array.isArray(packet?.results) ? packet.results : []) {
+      const url = String(result?.url || "").trim();
+      if (!url || seen.has(url)) {
+        continue;
+      }
+      seen.add(url);
+      sources.push({
+        title: String(result?.title || url).trim(),
+        url,
+        snippet: String(result?.snippet || "").trim(),
+        type: sourceType,
+      });
+      if (sources.length >= 10) {
+        return sources;
       }
     }
   }
 
-  visit(raw);
-  return used;
+  return sources;
+}
+
+function buildResearchSearchBrief(searchPackets = []) {
+  return (Array.isArray(searchPackets) ? searchPackets : [])
+    .map((packet) => [
+      `## 查询：${packet.query || "未命名查询"}`,
+      ...(Array.isArray(packet.results) && packet.results.length
+        ? packet.results.map((item, index) => `${index + 1}. ${item.title || item.url}\nURL: ${item.url}\n摘要: ${item.snippet || "无"}`)
+        : ["- 无结果"]),
+      ...(Array.isArray(packet.textFragments) && packet.textFragments.length
+        ? [`附加文本：${packet.textFragments.join(" | ")}`]
+        : []),
+    ].join("\n"))
+    .join("\n\n");
+}
+
+function buildResearchRetrieverJsonSchema() {
+  return `请输出 JSON：
+{
+  "summary": "本章研究摘要",
+  "factsToUse": ["可直接用于写作的事实1", "事实2"],
+  "factsToAvoid": ["需要避免的误写1", "误写2"],
+  "termBank": ["术语：解释"],
+  "uncertainPoints": ["仍不确定点1"],
+  "sourceNotes": ["来源1为什么可信", "来源2说明了什么"]
+}`;
+}
+
+function buildResearchRetrieverContext({
+  project,
+  chapterPlan,
+  plannerPacket,
+}) {
+  return [
+    `作品：${project.title}`,
+    `题材：${project.genre}`,
+    `设定：${project.setting}`,
+    `研究备注：${project.researchNotes || "无"}`,
+    `当前章节：${chapterPlan.chapterId} ${chapterPlan.title}`,
+    `章节地点：${chapterPlan.location}`,
+    `故事时间：${chapterPlan.timeInStory}`,
+    `检索问题：${plannerPacket.queries.join("；")}`,
+    `重点核对：${(plannerPacket.focusFacts || []).join("；") || "无"}`,
+  ];
+}
+
+function buildResearchRetrieverPacket(parsed, sources, extra = {}) {
+  return {
+    triggered: true,
+    mode: "retrieved",
+    summary: String(parsed.summary || "").trim(),
+    factsToUse: normalizeResearchTextList(parsed.factsToUse, 8),
+    factsToAvoid: normalizeResearchTextList(parsed.factsToAvoid, 6),
+    termBank: normalizeResearchTerms(parsed.termBank, 8),
+    uncertainPoints: normalizeResearchTextList(parsed.uncertainPoints, 5),
+    sourceNotes: normalizeResearchTextList(parsed.sourceNotes, 6),
+    sources: Array.isArray(sources) ? sources.slice(0, 10) : [],
+    ...extra,
+  };
 }
 
 async function runResearchPlannerAgent({
@@ -653,6 +690,7 @@ async function runResearchPlannerAgent({
 }
 
 async function runResearchRetriever({
+  mcpManager,
   provider,
   project,
   chapterPlan,
@@ -662,60 +700,100 @@ async function runResearchRetriever({
     return createEmptyResearchPacket();
   }
 
-  const result = await provider.generateText({
-    instructions:
-      "你是 Novelex 的 ResearchRetriever。你必须调用 web search 工具，为当前章节检索最相关的外部资料。检索完成后，只输出 JSON，总结当前章节真正该用的事实、该避开的误写、推荐术语、不确定点与来源备注。",
-    input: [
-      `作品：${project.title}`,
-      `题材：${project.genre}`,
-      `设定：${project.setting}`,
-      `研究备注：${project.researchNotes || "无"}`,
-      `当前章节：${chapterPlan.chapterId} ${chapterPlan.title}`,
-      `章节地点：${chapterPlan.location}`,
-      `故事时间：${chapterPlan.timeInStory}`,
-      `检索问题：${plannerPacket.queries.join("；")}`,
-      `重点核对：${(plannerPacket.focusFacts || []).join("；") || "无"}`,
-      `请输出 JSON：
-{
-  "summary": "本章研究摘要",
-  "factsToUse": ["可直接用于写作的事实1", "事实2"],
-  "factsToAvoid": ["需要避免的误写1", "误写2"],
-  "termBank": ["术语：解释"],
-  "uncertainPoints": ["仍不确定点1"],
-  "sourceNotes": ["来源1为什么可信", "来源2说明了什么"]
-}`,
-    ].join("\n\n"),
-    tools: [{ type: "web_search" }],
-    toolChoice: "auto",
-    include: ["web_search_call.action.sources"],
-    reasoningEffort: "low",
-    metadata: {
-      feature: "research_retriever",
-      chapterId: chapterPlan.chapterId,
-    },
-  });
+  try {
+    const searchPackets = [];
+    for (const query of plannerPacket.queries) {
+      const toolResult = await mcpManager.callTool("web_search", { query }, {
+        chapterId: chapterPlan.chapterId,
+        feature: "research_retriever",
+      });
+      searchPackets.push(normalizeWebSearchToolResult(toolResult, { query }));
+    }
 
-  const parsed = safeJsonParse(extractJsonObject(result.text), null);
-  if (!parsed || typeof parsed !== "object") {
-    throw new Error(`ResearchRetriever 返回了无法解析的结果：${createExcerpt(result.text, 160)}`);
+    const sources = collectResearchSources(searchPackets);
+    if (!sources.length) {
+      throw new Error("ResearchRetriever 没有从 MCP web_search 返回可用来源。");
+    }
+
+    const result = await provider.generateText({
+      instructions:
+        "你是 Novelex 的 ResearchRetriever。你会收到一组已经完成的外部搜索结果。请只基于这些结果输出 JSON，总结当前章节真正该用的事实、该避开的误写、推荐术语、不确定点与来源备注。",
+      input: [
+        ...buildResearchRetrieverContext({
+          project,
+          chapterPlan,
+          plannerPacket,
+        }),
+        `MCP web_search 结果：\n${buildResearchSearchBrief(searchPackets)}`,
+        buildResearchRetrieverJsonSchema(),
+      ].join("\n\n"),
+      reasoningEffort: "low",
+      metadata: {
+        feature: "research_retriever",
+        chapterId: chapterPlan.chapterId,
+      },
+    });
+
+    const parsed = safeJsonParse(extractJsonObject(result.text), null);
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error(`ResearchRetriever 返回了无法解析的结果：${createExcerpt(result.text, 160)}`);
+    }
+
+    return buildResearchRetrieverPacket(parsed, sources);
+  } catch (mcpError) {
+    try {
+      const result = await provider.generateText({
+        instructions:
+          "你是 Novelex 的 ResearchRetriever。请直接调用 web_search 工具检索给定问题，只基于检索结果输出 JSON，总结当前章节真正该用的事实、该避开的误写、推荐术语、不确定点与来源备注。",
+        input: [
+          ...buildResearchRetrieverContext({
+            project,
+            chapterPlan,
+            plannerPacket,
+          }),
+          `补充说明：MCP web_search 当前不可用，已改为 provider 级 web_search 回退。请在输出里保留必要的来源说明，并尽量给出可追溯线索。`,
+          buildResearchRetrieverJsonSchema(),
+        ].join("\n\n"),
+        tools: [{ type: "web_search" }],
+        toolChoice: "auto",
+        include: ["web_search_call.action.sources"],
+        reasoningEffort: "low",
+        metadata: {
+          feature: "research_retriever_provider_fallback",
+          chapterId: chapterPlan.chapterId,
+        },
+      });
+
+      const parsed = safeJsonParse(extractJsonObject(result.text), null);
+      if (!parsed || typeof parsed !== "object") {
+        throw new Error(`ResearchRetriever provider fallback 返回了无法解析的结果：${createExcerpt(result.text, 160)}`);
+      }
+
+      const fallbackSearchPacket = {
+        ...normalizeWebSearchToolResult(result.raw, {
+          query: plannerPacket.queries.join("；"),
+        }),
+        sourceType: "provider_web_search",
+      };
+      const sources = collectResearchSources([fallbackSearchPacket]);
+      const sourceNotes = normalizeResearchTextList(
+        [
+          ...normalizeResearchTextList(parsed.sourceNotes, 5),
+          "MCP web_search 不可用，已回退到 provider 级 web_search。",
+        ],
+        6,
+      );
+
+      return buildResearchRetrieverPacket(parsed, sources, {
+        mode: "provider_web_search",
+        sourceNotes,
+      });
+    } catch (fallbackError) {
+      throw new Error(
+        `${formatMcpErrorMessage("MCP web_search", mcpError)}；provider web_search 回退也失败：${fallbackError instanceof Error ? fallbackError.message : String(fallbackError || "")}`,
+      );
+    }
   }
-
-  const sources = collectResearchSources(result.raw);
-  if (!hasWebSearchEvidence(result.raw) && !sources.length) {
-    throw new Error("ResearchRetriever 没有实际调用 web search 工具。");
-  }
-
-  return {
-    triggered: true,
-    mode: "retrieved",
-    summary: String(parsed.summary || "").trim(),
-    factsToUse: normalizeResearchTextList(parsed.factsToUse, 8),
-    factsToAvoid: normalizeResearchTextList(parsed.factsToAvoid, 6),
-    termBank: normalizeResearchTerms(parsed.termBank, 8),
-    uncertainPoints: normalizeResearchTextList(parsed.uncertainPoints, 5),
-    sourceNotes: normalizeResearchTextList(parsed.sourceNotes, 6),
-    sources,
-  };
 }
 
 async function runResearchSynthesizerAgent({
@@ -761,7 +839,7 @@ async function runResearchSynthesizerAgent({
 
   const packet = {
     triggered: true,
-    mode: "search_tool",
+    mode: retrievalPacket.mode === "provider_web_search" ? "provider_web_search" : "search_tool",
     reason: plannerPacket.reason || "",
     queries: plannerPacket.queries || [],
     focusFacts: plannerPacket.focusFacts || [],
@@ -779,6 +857,7 @@ async function runResearchSynthesizerAgent({
 }
 
 async function buildResearchPacket({
+  mcpManager,
   provider,
   project,
   chapterPlan,
@@ -794,6 +873,7 @@ async function buildResearchPacket({
 
   try {
     const retrievalPacket = await runResearchRetriever({
+      mcpManager,
       provider,
       project,
       chapterPlan,
@@ -813,11 +893,11 @@ async function buildResearchPacket({
       reason: plannerPacket.reason || "",
       queries: plannerPacket.queries || [],
       focusFacts: plannerPacket.focusFacts || [],
-      summary: `ResearchRetriever 调用失败：${error instanceof Error ? error.message : String(error || "")}`,
+      summary: `ResearchRetriever 调用失败：${error instanceof Error ? formatMcpErrorMessage("ResearchRetriever", error) : String(error || "")}`,
       sourceNotes: ["模型搜索工具调用失败，本章仍继续写作，但请人工留意考据风险。"],
       briefingMarkdown: buildResearchMarkdown({
         triggered: true,
-        summary: `ResearchRetriever 调用失败：${error instanceof Error ? error.message : String(error || "")}`,
+        summary: `ResearchRetriever 调用失败：${error instanceof Error ? formatMcpErrorMessage("ResearchRetriever", error) : String(error || "")}`,
         queries: plannerPacket.queries || [],
         factsToUse: [],
         factsToAvoid: [],
@@ -941,6 +1021,7 @@ function buildGovernanceResources({
   openingReferencePacket,
   styleGuideText,
   styleGuideSourcePath,
+  factContext = null,
 }) {
   const chapterIntent = buildGovernedChapterIntent({
     chapterPlan,
@@ -949,6 +1030,7 @@ function buildGovernanceResources({
     foreshadowingAdvice,
     researchPacket,
     styleGuideText,
+    factContext,
   });
   const contextPackage = buildContextPackage({
     chapterPlan,
@@ -958,6 +1040,7 @@ function buildGovernanceResources({
     researchPacket,
     referencePacket,
     openingReferencePacket,
+    factContext,
   });
   const ruleStack = buildRuleStack({
     chapterPlan,
@@ -967,6 +1050,7 @@ function buildGovernanceResources({
     researchPacket,
     referencePacket,
     openingReferencePacket,
+    factContext,
   });
   const contextTrace = buildContextTrace({
     chapterPlan,
@@ -1003,11 +1087,913 @@ function validationSummary(validation) {
   return summarizeAuditResult(validation);
 }
 
+const MAX_AUDIT_AUTO_REPAIR_ATTEMPTS = 3;
+const PARTIAL_TARGET_REPAIR_IDS = new Set(["knowledge_boundary", "pov_consistency", "meta_leak"]);
+const CHAPTER_TARGET_REPAIR_IDS = new Set(["chapter_restart_replay", "chapter_word_count"]);
+const HIGH_VALUE_WARNING_IDS = new Set(["chapter_word_count", "pov_consistency", "meta_leak"]);
+
 function ensureChapterValidationPassed(chapterPlan, validation) {
   if (validation?.overallPassed) {
     return;
   }
   throw new Error(`${chapterPlan?.chapterId || "chapter"} 审计未通过：${validationSummary(validation)}`);
+}
+
+function collectCriticalCanonFactIssues(validation) {
+  return (validation?.issues || []).filter(
+    (issue) => issue.id === "canon_fact_continuity" && issue.severity === "critical",
+  );
+}
+
+function uniqueTextNotes(values = []) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map((item) => String(item || "").trim())
+    .filter(Boolean))];
+}
+
+function collectBlockingAuditIssues(validation) {
+  return (validation?.issues || []).filter((issue) => issue.severity === "critical");
+}
+
+function issueIdentity(issue) {
+  return `${issue?.id || ""}::${issue?.description || ""}`;
+}
+
+function unresolvedCriticalIssueKeys(validation) {
+  return collectBlockingAuditIssues(validation).map(issueIdentity).sort();
+}
+
+function unresolvedCriticalIssueSummaries(validation) {
+  return collectBlockingAuditIssues(validation).map((issue) => ({
+    id: issue.id,
+    category: issue.category,
+    description: issue.description,
+  }));
+}
+
+function compactIssueEvidence(evidence = "", limit = 220) {
+  return createExcerpt(
+    String(evidence || "")
+      .replace(/\s*\/\s*/g, " / ")
+      .replace(/\s+/g, " ")
+      .trim(),
+    limit,
+  );
+}
+
+function buildIssueRepairDirective(issue) {
+  const parts = [
+    `[${issue.severity}] ${issue.category} / ${issue.id}`,
+    `问题：${issue.description}`,
+  ];
+  if (issue.evidence) {
+    parts.push(`证据：${compactIssueEvidence(issue.evidence)}`);
+  }
+  if (issue.suggestion) {
+    parts.push(`目标效果：${issue.suggestion}`);
+  }
+  return parts.join("｜");
+}
+
+function collectStructuredAuditRepairNotes(validation, options = {}) {
+  const severityAllowList = Array.isArray(options?.severities) && options.severities.length
+    ? new Set(options.severities)
+    : new Set(["critical"]);
+  const idAllowList = Array.isArray(options?.issueIds) && options.issueIds.length
+    ? new Set(options.issueIds)
+    : null;
+
+  return uniqueTextNotes((validation?.issues || [])
+    .filter((issue) => severityAllowList.has(issue.severity))
+    .filter((issue) => !idAllowList || idAllowList.has(issue.id))
+    .map(buildIssueRepairDirective));
+}
+
+function buildAuditRevisionNotes(validation, factContext = null) {
+  const establishedAssertions = (factContext?.establishedFacts || []).map((fact) => fact.assertion);
+  const canonFactIssues = collectCriticalCanonFactIssues(validation).length
+    ? collectCanonFactContinuityIssues(validation, establishedAssertions)
+    : [];
+  const canonNotes = canonFactIssues.length
+    ? buildCanonFactRevisionNotes(factContext, canonFactIssues)
+    : [];
+
+  return uniqueTextNotes([
+    ...canonNotes,
+    ...collectStructuredAuditRepairNotes(validation, {
+      severities: ["critical", "warning"],
+    }),
+  ]);
+}
+
+function buildBlockingAuditReviewPayload(validation, factContext = null) {
+  const establishedAssertions = (factContext?.establishedFacts || []).map((fact) => fact.assertion);
+  const canonFactIssues = collectCriticalCanonFactIssues(validation).length
+    ? collectCanonFactContinuityIssues(validation, establishedAssertions)
+    : [];
+  const blockingAuditIssues = uniqueTextNotes([
+    ...collectBlockingAuditIssues(validation).flatMap((issue) => [issue.description, issue.suggestion]),
+    ...canonFactIssues,
+  ]);
+
+  return {
+    canonFactIssues,
+    blockingAuditIssues,
+  };
+}
+
+function manualReviewStrategyFromValidation(validation) {
+  return collectCriticalCanonFactIssues(validation).length
+    ? "canon_fact_manual_review"
+    : "audit_manual_review";
+}
+
+function createFeedbackSupervisionResult(overrides = {}) {
+  return {
+    enabled: false,
+    passed: true,
+    summary: "",
+    missingItems: [],
+    revisionNotes: [],
+    evidence: "",
+    scopeBlocked: false,
+    ...overrides,
+  };
+}
+
+function normalizeFeedbackTextList(values = [], limit = 8) {
+  return uniqueTextNotes(values).slice(0, limit);
+}
+
+function buildBlockingFeedbackIssues(feedbackResult = null) {
+  if (!feedbackResult?.enabled || feedbackResult.passed) {
+    return [];
+  }
+
+  return uniqueTextNotes([
+    ...normalizeFeedbackTextList(feedbackResult.missingItems, 6),
+    ...normalizeFeedbackTextList(feedbackResult.revisionNotes, 6),
+    feedbackResult.scopeBlocked
+      ? "当前选区无法在不改动选区外文本的前提下完整落实该反馈，需要人工扩大范围或改为整章重写。"
+      : "",
+  ]);
+}
+
+function feedbackIssueKeys(feedbackResult = null) {
+  return uniqueTextNotes([
+    ...(feedbackResult?.passed ? [] : feedbackResult?.missingItems || []),
+    ...(feedbackResult?.passed ? [] : feedbackResult?.revisionNotes || []),
+    feedbackResult?.scopeBlocked ? "scope_blocked" : "",
+  ]).sort();
+}
+
+function manualReviewStrategyFromOutcomes(validation, feedbackResult = null) {
+  if (feedbackResult?.enabled && !feedbackResult.passed) {
+    return "feedback_manual_review";
+  }
+  return manualReviewStrategyFromValidation(validation);
+}
+
+function manualReviewAgentLabel(strategy = "") {
+  if (strategy === "canon_fact_manual_review") {
+    return "CanonFactGuardrail";
+  }
+  if (strategy === "feedback_manual_review") {
+    return "FeedbackGuardrail";
+  }
+  return "AuditGuardrail";
+}
+
+function manualReviewSummary(strategy = "") {
+  if (strategy === "canon_fact_manual_review") {
+    return `章节级 canon facts 冲突在 ${MAX_AUDIT_AUTO_REPAIR_ATTEMPTS} 次自动修正后仍未解决，已转入人工审核。`;
+  }
+  if (strategy === "feedback_manual_review") {
+    return `人类反馈在 ${MAX_AUDIT_AUTO_REPAIR_ATTEMPTS} 轮自动修订后仍未完整落实，已转入人工复审。`;
+  }
+  return `章节审计在 ${MAX_AUDIT_AUTO_REPAIR_ATTEMPTS} 次自动修正后仍未通过，已转入人工审核。`;
+}
+
+function buildFeedbackSupervisionHistoryEntry(result = null) {
+  return {
+    at: nowIso(),
+    passed: Boolean(result?.passed),
+    summary: String(result?.summary || "").trim(),
+    missingItems: normalizeFeedbackTextList(result?.missingItems, 8),
+    revisionNotes: normalizeFeedbackTextList(result?.revisionNotes, 8),
+    evidence: String(result?.evidence || "").trim(),
+    scopeBlocked: Boolean(result?.scopeBlocked),
+  };
+}
+
+function feedbackSupervisorInput({
+  project,
+  chapterPlan,
+  feedback = "",
+  mode = "rewrite",
+  chapterDraft = null,
+  candidateText = "",
+  selection = null,
+  currentDraftMarkdown = "",
+}) {
+  const normalizedSelection = normalizeChapterSelection(selection);
+  const shared = [
+    `作品：${project.title}`,
+    `章节：${chapterPlan.chapterId} ${chapterPlan.title}`,
+    `监督模式：${mode === "partial_rewrite" ? "局部修订" : "整章重写"}`,
+    `作者反馈：${feedback || "无"}`,
+  ];
+
+  if (mode === "partial_rewrite") {
+    return [
+      ...shared,
+      `原文全文：\n${currentDraftMarkdown}`,
+      `原选中文本：\n${normalizedSelection.selectedText}`,
+      `选区前文锚点：\n${normalizedSelection.prefixContext || "无"}`,
+      `选区后文锚点：\n${normalizedSelection.suffixContext || "无"}`,
+      `当前候选替换片段：\n${candidateText || "无"}`,
+      "要求：只能基于当前候选替换片段判断它是否落实作者反馈；如果必须修改选区外内容才能完成反馈，请把 scopeBlocked 设为 true。",
+      `请输出 JSON：
+{
+  "passed": true,
+  "summary": "一句话结论",
+  "missingItems": ["仍未落实的反馈点"],
+  "revisionNotes": ["给 RevisionAgent 的直接修订指令"],
+  "evidence": "引用候选片段中的短证据",
+  "scopeBlocked": false
+}`,
+    ].join("\n\n");
+  }
+
+  return [
+    ...shared,
+    `当前整章正文：\n${chapterDraft?.markdown || candidateText || ""}`,
+    "要求：只判断这版整章是否真正落实了作者反馈；如果没有，请指出未完成项并给出可以直接用于二次 revision 的修订指令。",
+    `请输出 JSON：
+{
+  "passed": true,
+  "summary": "一句话结论",
+  "missingItems": ["仍未落实的反馈点"],
+  "revisionNotes": ["给 WriterAgent 的直接修订指令"],
+  "evidence": "引用正文中的短证据",
+  "scopeBlocked": false
+}`,
+  ].join("\n\n");
+}
+
+async function runFeedbackSupervisorAgent({
+  provider,
+  project,
+  chapterPlan,
+  feedback = "",
+  mode = "rewrite",
+  chapterDraft = null,
+  candidateText = "",
+  selection = null,
+  currentDraftMarkdown = "",
+}) {
+  const normalizedFeedback = String(feedback || "").trim();
+  if (!normalizedFeedback) {
+    return createFeedbackSupervisionResult();
+  }
+
+  const result = await provider.generateText({
+    instructions:
+      mode === "partial_rewrite"
+        ? "你是 Novelex 的 FeedbackSupervisorAgent。你只负责检查当前候选替换片段是否落实了作者反馈。若仍未落实，要指出缺口，并给出新的 revision notes。若必须改动选区外文本才能落实，请明确把 scopeBlocked 设为 true。只输出 JSON。"
+        : "你是 Novelex 的 FeedbackSupervisorAgent。你只负责检查当前整章重写是否落实了作者反馈。若仍未落实，要指出缺口，并给出新的 revision notes。整章模式下 scopeBlocked 必须为 false。只输出 JSON。",
+    input: feedbackSupervisorInput({
+      project,
+      chapterPlan,
+      feedback: normalizedFeedback,
+      mode,
+      chapterDraft,
+      candidateText,
+      selection,
+      currentDraftMarkdown,
+    }),
+    useReviewModel: true,
+    metadata: {
+      feature: mode === "partial_rewrite" ? "chapter_partial_feedback_supervisor" : "chapter_feedback_supervisor",
+      chapterId: chapterPlan.chapterId,
+    },
+  });
+
+  const parsed = safeJsonParse(extractJsonObject(result.text), null);
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error(`FeedbackSupervisorAgent 返回了无法解析的结果：${createExcerpt(result.text, 180)}`);
+  }
+
+  const missingItems = normalizeFeedbackTextList(parsed.missingItems, 6);
+  const revisionNotes = normalizeFeedbackTextList(parsed.revisionNotes?.length ? parsed.revisionNotes : parsed.missingItems, 8);
+  return createFeedbackSupervisionResult({
+    enabled: true,
+    passed: Boolean(parsed.passed),
+    summary: String(parsed.summary || "").trim(),
+    missingItems,
+    revisionNotes,
+    evidence: String(parsed.evidence || "").trim(),
+    scopeBlocked: mode === "partial_rewrite" ? Boolean(parsed.scopeBlocked) : false,
+  });
+}
+
+async function evaluateFeedbackSupervision(feedbackSupervisor = null, chapterDraft = null) {
+  if (!feedbackSupervisor?.enabled) {
+    return createFeedbackSupervisionResult();
+  }
+
+  return runFeedbackSupervisorAgent({
+    ...feedbackSupervisor,
+    chapterDraft,
+  });
+}
+
+async function rerunChapterAuditWithContext(auditContext, chapterDraft) {
+  return runChapterAudit({
+    ...auditContext,
+    chapterDraft,
+  });
+}
+
+async function rewriteChapterDraftWithContext(rewriteContext, chapterDraft, revisionNotes, mode = "validation_repair") {
+  return generateChapterDraftText({
+    ...rewriteContext,
+    revisionNotes,
+    mode,
+    currentDraft: chapterDraft,
+  });
+}
+
+function issueRepairCounts(validation) {
+  return {
+    critical: Number(validation?.issueCounts?.critical || 0),
+    warning: Number(validation?.issueCounts?.warning || 0),
+    info: Number(validation?.issueCounts?.info || 0),
+  };
+}
+
+function extractEvidenceCandidates(evidence = "") {
+  const raw = String(evidence || "").trim();
+  if (!raw) {
+    return [];
+  }
+
+  const quoted = [...raw.matchAll(/[“"'‘’](.{8,220}?)[”"'‘’]/g)].map((match) => match[1]);
+  const split = raw
+    .split(/\s*\/\s*|\n+/)
+    .map((item) => item.replace(/^[①②③④⑤⑥⑦⑧⑨⑩\d.\-、\s]+/u, "").trim())
+    .filter(Boolean);
+
+  return uniqueTextNotes([...quoted, ...split])
+    .filter((item) => item.length >= 8)
+    .sort((left, right) => right.length - left.length);
+}
+
+function buildSelectionFromEvidence(markdown = "", chapterTitle = "", issue = null) {
+  const body = splitChapterMarkdown(markdown, chapterTitle).body;
+  for (const candidate of extractEvidenceCandidates(issue?.evidence || "")) {
+    const index = body.indexOf(candidate);
+    if (index < 0) {
+      continue;
+    }
+    return {
+      selectedText: candidate,
+      prefixContext: body.slice(Math.max(0, index - 80), index),
+      suffixContext: body.slice(index + candidate.length, Math.min(body.length, index + candidate.length + 80)),
+    };
+  }
+  return null;
+}
+
+function selectTargetedCriticalIssues(validation) {
+  return collectBlockingAuditIssues(validation).filter((issue) =>
+    PARTIAL_TARGET_REPAIR_IDS.has(issue.id) || CHAPTER_TARGET_REPAIR_IDS.has(issue.id),
+  );
+}
+
+function selectWarningPolishIssues(validation) {
+  return (validation?.issues || []).filter((issue) =>
+    issue.severity === "warning" && HIGH_VALUE_WARNING_IDS.has(issue.id),
+  );
+}
+
+async function applyTargetedPartialRepair({
+  rewriteContext,
+  chapterDraft,
+  issue,
+}) {
+  const selection = buildSelectionFromEvidence(
+    chapterDraft?.markdown || "",
+    rewriteContext.chapterPlan?.title || "",
+    issue,
+  );
+  if (!selection?.selectedText) {
+    return {
+      chapterDraft,
+      changed: false,
+      applied: false,
+      note: "",
+    };
+  }
+
+  const replacementFragment = await generateChapterPartialRevisionText({
+    provider: rewriteContext.provider,
+    project: rewriteContext.project,
+    chapterPlan: rewriteContext.chapterPlan,
+    historyPacket: rewriteContext.historyPacket,
+    foreshadowingSummary: rewriteContext.foreshadowingSummary,
+    characterStateSummary: rewriteContext.characterStateSummary,
+    sceneBeatSummary: rewriteContext.sceneBeatSummary,
+    researchPacket: rewriteContext.researchPacket,
+    referencePacket: rewriteContext.referencePacket,
+    openingReferencePacket: rewriteContext.openingReferencePacket,
+    writerContextPacket: rewriteContext.writerContextPacket,
+    governance: rewriteContext.governance,
+    characterDossiers: rewriteContext.characterDossiers,
+    styleGuideText: rewriteContext.styleGuideText,
+    feedback: [
+      buildIssueRepairDirective(issue),
+      "只修这一段，优先把证据里暴露的问题改成符合信息边界/视角边界/正文质感的写法，不要扩写成整章重写。",
+    ].join("\n"),
+    selection,
+    currentDraftMarkdown: chapterDraft.markdown,
+    factContext: rewriteContext.factContext || null,
+  });
+  if (!replacementFragment || !fragmentChanged(selection.selectedText, replacementFragment)) {
+    return {
+      chapterDraft,
+      changed: false,
+      applied: true,
+      note: buildIssueRepairDirective(issue),
+    };
+  }
+
+  const replacedMarkdown = replaceSelectionInChapterMarkdown(
+    chapterDraft.markdown,
+    selection,
+    replacementFragment,
+    rewriteContext.chapterPlan.title,
+  );
+  const nextDraft = chapterDraftFromExactMarkdown(
+    rewriteContext.chapterPlan,
+    composeChapterMarkdown(replacedMarkdown.title, replacedMarkdown.body),
+  );
+
+  return {
+    chapterDraft: nextDraft,
+    changed: chapterBodyChanged(chapterDraft.markdown, nextDraft.markdown, rewriteContext.chapterPlan.title),
+    applied: true,
+    note: buildIssueRepairDirective(issue),
+  };
+}
+
+async function applyFocusedChapterRepair({
+  rewriteContext,
+  chapterDraft,
+  issues,
+  extraNotes = [],
+  mode = "targeted_repair",
+}) {
+  const revisionNotes = uniqueTextNotes([
+    ...(issues || []).map(buildIssueRepairDirective),
+    ...uniqueTextNotes(extraNotes || []),
+  ]);
+  if (!revisionNotes.length) {
+    return {
+      chapterDraft,
+      changed: false,
+      notes: [],
+    };
+  }
+
+  const nextDraft = await rewriteChapterDraftWithContext(
+    rewriteContext,
+    chapterDraft,
+    revisionNotes,
+    mode,
+  );
+
+  return {
+    chapterDraft: nextDraft,
+    changed: chapterBodyChanged(chapterDraft.markdown, nextDraft.markdown, rewriteContext.chapterPlan.title),
+    notes: revisionNotes,
+  };
+}
+
+function buildRepairHistoryEntry({
+  phase,
+  strategy,
+  notes,
+  beforeValidation,
+  afterValidation,
+  beforeFeedback = null,
+  afterFeedback = null,
+  bodyChanged,
+  stagnated = false,
+}) {
+  return {
+    at: nowIso(),
+    phase,
+    strategy,
+    notes: uniqueTextNotes(notes),
+    before: {
+      counts: issueRepairCounts(beforeValidation),
+      unresolvedCriticals: unresolvedCriticalIssueSummaries(beforeValidation),
+    },
+    after: {
+      counts: issueRepairCounts(afterValidation),
+      unresolvedCriticals: unresolvedCriticalIssueSummaries(afterValidation),
+    },
+    feedbackBefore: beforeFeedback?.enabled
+      ? {
+        passed: Boolean(beforeFeedback?.passed),
+        missingItems: normalizeFeedbackTextList(beforeFeedback?.missingItems, 6),
+        revisionNotes: normalizeFeedbackTextList(beforeFeedback?.revisionNotes, 6),
+        scopeBlocked: Boolean(beforeFeedback?.scopeBlocked),
+      }
+      : null,
+    feedbackAfter: afterFeedback?.enabled
+      ? {
+        passed: Boolean(afterFeedback?.passed),
+        missingItems: normalizeFeedbackTextList(afterFeedback?.missingItems, 6),
+        revisionNotes: normalizeFeedbackTextList(afterFeedback?.revisionNotes, 6),
+        scopeBlocked: Boolean(afterFeedback?.scopeBlocked),
+      }
+      : null,
+    bodyChanged,
+    stagnated,
+  };
+}
+
+async function runValidationRepairs({
+  chapterDraft,
+  validation,
+  auditContext,
+  rewriteContext,
+  stepPrefix = "writer_revision",
+  feedbackSupervisor = null,
+}) {
+  let currentDraft = chapterDraft;
+  let currentValidation = validation;
+  let auditAutoRepairAttempts = 0;
+  let canonFactAutoRepairAttempts = 0;
+  let feedbackSupervisionAttempts = 0;
+  const repairSteps = [];
+  const repairHistory = [];
+  const feedbackSupervisionHistory = [];
+  let stagnated = false;
+  let currentFeedback = await evaluateFeedbackSupervision(feedbackSupervisor, currentDraft);
+
+  if (currentFeedback.enabled) {
+    feedbackSupervisionAttempts += 1;
+    feedbackSupervisionHistory.push(buildFeedbackSupervisionHistoryEntry(currentFeedback));
+    repairSteps.push(
+      step(
+        `${stepPrefix}_feedback_${feedbackSupervisionAttempts}`,
+        "FeedbackSupervisorAgent",
+        "write",
+        currentFeedback.passed
+          ? "反馈监督通过：当前版本已落实作者反馈。"
+          : currentFeedback.scopeBlocked
+            ? "反馈监督认为当前反馈无法在既定修改范围内完成，已标记为人工复审候选。"
+            : "反馈监督发现仍有作者反馈未落实，已生成下一轮 revision notes。",
+        {
+          preview: createExcerpt(
+            currentFeedback.passed
+              ? currentFeedback.summary || "作者反馈已落实。"
+              : buildBlockingFeedbackIssues(currentFeedback).join("；") || currentFeedback.summary,
+            180,
+          ),
+        },
+      ),
+    );
+  }
+
+  const phases = [];
+  if (selectTargetedCriticalIssues(currentValidation).length) {
+    phases.push({
+      id: "targeted_critical_repair",
+      label: "定向修补",
+      strategy: "targeted_critical",
+    });
+  }
+  phases.push({
+    id: "validation_repair",
+    label: "整章修复",
+    strategy: "validation_repair",
+  });
+  phases.push({
+    id: "focused_repair",
+    label: "聚焦收尾修补",
+    strategy: "focused_repair",
+  });
+
+  for (const phase of phases) {
+    if (
+      auditAutoRepairAttempts >= MAX_AUDIT_AUTO_REPAIR_ATTEMPTS ||
+      stagnated ||
+      currentFeedback.scopeBlocked ||
+      (currentValidation?.overallPassed && currentFeedback.passed)
+    ) {
+      break;
+    }
+
+    const beforeValidation = currentValidation;
+    const beforeCriticalKeys = unresolvedCriticalIssueKeys(beforeValidation);
+    const beforeFeedback = currentFeedback;
+    const beforeFeedbackKeys = feedbackIssueKeys(beforeFeedback);
+    const draftBeforePhase = currentDraft;
+    let notes = [];
+    let changed = false;
+    let agentLabel = "WriterAgent";
+    let applied = false;
+
+    if (phase.id === "targeted_critical_repair") {
+      const targetedIssues = selectTargetedCriticalIssues(currentValidation);
+      const partialIssues = targetedIssues.filter((issue) => PARTIAL_TARGET_REPAIR_IDS.has(issue.id));
+      const chapterIssues = targetedIssues.filter((issue) => CHAPTER_TARGET_REPAIR_IDS.has(issue.id));
+      agentLabel = chapterIssues.length ? "WriterAgent" : "RevisionAgent";
+
+      for (const issue of partialIssues) {
+        const partialResult = await applyTargetedPartialRepair({
+          rewriteContext,
+          chapterDraft: currentDraft,
+          issue,
+        });
+        if (partialResult.applied) {
+          applied = true;
+          agentLabel = "RevisionAgent";
+          notes.push(partialResult.note);
+        }
+        if (partialResult.changed) {
+          currentDraft = partialResult.chapterDraft;
+          changed = true;
+        }
+      }
+
+      if (chapterIssues.length) {
+        const focusedResult = await applyFocusedChapterRepair({
+          rewriteContext,
+          chapterDraft: currentDraft,
+          issues: chapterIssues,
+          mode: "targeted_repair",
+        });
+        if (focusedResult.notes.length) {
+          applied = true;
+          notes.push(...focusedResult.notes);
+        }
+        if (focusedResult.changed) {
+          currentDraft = focusedResult.chapterDraft;
+          changed = true;
+        }
+      }
+    } else if (phase.id === "validation_repair") {
+      notes = buildAuditRevisionNotes(currentValidation, rewriteContext.factContext || null);
+      if (beforeFeedback.enabled && !beforeFeedback.passed) {
+        notes = uniqueTextNotes([...notes, ...beforeFeedback.revisionNotes]);
+      }
+      if (notes.length) {
+        applied = true;
+        currentDraft = await rewriteChapterDraftWithContext(
+          rewriteContext,
+          currentDraft,
+          notes,
+          "validation_repair",
+        );
+        changed = chapterBodyChanged(
+          draftBeforePhase.markdown,
+          currentDraft.markdown,
+          rewriteContext.chapterPlan.title,
+        ) || changed;
+      }
+    } else {
+      const remainingCriticalIssues = collectBlockingAuditIssues(currentValidation);
+      const polishIssues = remainingCriticalIssues.length
+        ? remainingCriticalIssues
+        : selectWarningPolishIssues(currentValidation);
+      const focusedResult = await applyFocusedChapterRepair({
+        rewriteContext,
+        chapterDraft: currentDraft,
+        issues: polishIssues,
+        extraNotes: beforeFeedback.enabled && !beforeFeedback.passed ? beforeFeedback.revisionNotes : [],
+        mode: "targeted_repair",
+      });
+      notes = focusedResult.notes;
+      applied = notes.length > 0;
+      if (focusedResult.changed) {
+        currentDraft = focusedResult.chapterDraft;
+        changed = true;
+      }
+      agentLabel = "WriterAgent";
+      if (!remainingCriticalIssues.length && !polishIssues.length) {
+        continue;
+      }
+    }
+
+    if (!applied) {
+      continue;
+    }
+
+    auditAutoRepairAttempts += 1;
+    if (collectCriticalCanonFactIssues(beforeValidation).length) {
+      canonFactAutoRepairAttempts += 1;
+    }
+
+    const afterValidation = changed
+      ? await rerunChapterAuditWithContext(auditContext, currentDraft)
+      : beforeValidation;
+    const afterCriticalKeys = unresolvedCriticalIssueKeys(afterValidation);
+    const afterFeedback = changed
+      ? await evaluateFeedbackSupervision(feedbackSupervisor, currentDraft)
+      : beforeFeedback;
+    const afterFeedbackKeys = feedbackIssueKeys(afterFeedback);
+    if (feedbackSupervisor?.enabled && changed) {
+      feedbackSupervisionAttempts += 1;
+      feedbackSupervisionHistory.push(buildFeedbackSupervisionHistoryEntry(afterFeedback));
+      repairSteps.push(
+        step(
+          `${stepPrefix}_feedback_${feedbackSupervisionAttempts}`,
+          "FeedbackSupervisorAgent",
+          "write",
+          afterFeedback.passed
+            ? "反馈监督通过：当前版本已落实作者反馈。"
+            : afterFeedback.scopeBlocked
+              ? "反馈监督判断当前反馈超出既定修改范围，已停止自动修订。"
+              : "反馈监督发现仍有作者反馈未落实，已更新下一轮 revision notes。",
+          {
+            preview: createExcerpt(
+              afterFeedback.passed
+                ? afterFeedback.summary || "作者反馈已落实。"
+                : buildBlockingFeedbackIssues(afterFeedback).join("；") || afterFeedback.summary,
+              180,
+            ),
+          },
+        ),
+      );
+    }
+    stagnated =
+      JSON.stringify(beforeCriticalKeys) === JSON.stringify(afterCriticalKeys) &&
+      JSON.stringify(beforeFeedbackKeys) === JSON.stringify(afterFeedbackKeys) &&
+      !changed;
+    currentValidation = afterValidation;
+    currentFeedback = afterFeedback;
+
+    repairHistory.push(buildRepairHistoryEntry({
+      phase: phase.label,
+      strategy: phase.strategy,
+      notes,
+      beforeValidation,
+      afterValidation,
+      beforeFeedback,
+      afterFeedback,
+      bodyChanged: changed,
+      stagnated,
+    }));
+
+    repairSteps.push(
+      step(
+        `${stepPrefix}_${auditAutoRepairAttempts}`,
+        agentLabel,
+        "write",
+        `第 ${auditAutoRepairAttempts} 次自动修正：${phase.label}。`,
+        {
+          preview: createExcerpt(notes.join("；"), 180),
+        },
+      ),
+    );
+  }
+
+  const feedbackSupervisionPassed = !currentFeedback.enabled || currentFeedback.passed;
+  const manualReviewRequired = !currentValidation?.overallPassed || !feedbackSupervisionPassed;
+  const reviewPayload = buildBlockingAuditReviewPayload(currentValidation, rewriteContext.factContext || null);
+  const blockingFeedbackIssues = buildBlockingFeedbackIssues(currentFeedback);
+
+  return {
+    chapterDraft: currentDraft,
+    validation: currentValidation,
+    auditAutoRepairAttempts,
+    canonFactAutoRepairAttempts,
+    feedbackSupervisionPassed,
+    feedbackSupervisionSummary: currentFeedback.summary || "",
+    feedbackSupervisionAttempts,
+    feedbackSupervisionHistory,
+    manualReviewRequired,
+    manualReviewStrategy: manualReviewRequired ? manualReviewStrategyFromOutcomes(currentValidation, currentFeedback) : "",
+    canonFactIssues: reviewPayload.canonFactIssues,
+    blockingAuditIssues: reviewPayload.blockingAuditIssues,
+    blockingFeedbackIssues,
+    repairHistory,
+    lastUnresolvedCriticals: unresolvedCriticalIssueSummaries(currentValidation),
+    stagnated,
+    repairSteps,
+    feedbackResult: currentFeedback,
+  };
+}
+
+async function runChapterPostProcessing({
+  chapterDraft,
+  validation = null,
+  auditContext,
+  rewriteContext,
+  stepPrefix = "writer_revision",
+  styleRepairStepId = "writer_style_repair",
+  feedbackSupervisor = null,
+}) {
+  let currentDraft = chapterDraft;
+  let currentValidation = validation || await rerunChapterAuditWithContext(auditContext, currentDraft);
+  const steps = [];
+
+  if (needsAuditStyleRepair(currentValidation)) {
+    currentDraft = await generateChapterDraftText({
+      ...rewriteContext,
+      revisionNotes: collectAuditRepairNotes(currentValidation, {
+        dimensionIds: ["pov_consistency", "meta_leak"],
+        severities: ["critical", "warning"],
+      }),
+      mode: "style_repair",
+      currentDraft,
+    });
+    currentValidation = await rerunChapterAuditWithContext(auditContext, currentDraft);
+    steps.push(
+      step(
+        styleRepairStepId,
+        "WriterAgent",
+        "write",
+        "根据风格校验结果强制重写为第三人称有限视角，并清除元信息污染。",
+        { preview: createExcerpt(currentDraft.markdown, 180) },
+      ),
+    );
+  }
+
+  const repairResult = await runValidationRepairs({
+    chapterDraft: currentDraft,
+    validation: currentValidation,
+    auditContext,
+    rewriteContext,
+    stepPrefix,
+    feedbackSupervisor,
+  });
+
+  return {
+    chapterDraft: repairResult.chapterDraft,
+    validation: repairResult.validation,
+    steps: [...steps, ...(repairResult.repairSteps || [])],
+    repairResult,
+  };
+}
+
+function formatFactPromptList(facts = []) {
+  return (Array.isArray(facts) ? facts : [])
+    .map((fact) => `[${fact.factId}] ${fact.subject}｜${fact.assertion}`)
+    .join("；");
+}
+
+function buildFactPromptSections(factContext = null) {
+  return {
+    establishedFactsLine: formatFactPromptList(factContext?.establishedFacts || []) || "无",
+    openTensionsLine: formatFactPromptList(factContext?.openTensions || []) || "无",
+    selectionRationale: String(factContext?.selectionRationale || "").trim() || "无",
+  };
+}
+
+async function selectFactContextForChapter({
+  store,
+  provider,
+  project,
+  chapterPlan,
+}) {
+  try {
+    const factLedger = await loadFactLedger(store);
+    if (!factLedger.length) {
+      return {
+        factContext: null,
+        warning: "",
+      };
+    }
+
+    const selection = await runFactSelectorAgent({
+      provider,
+      project,
+      chapterPlan,
+      factLedger,
+    });
+
+    return {
+      factContext: buildFactContextPacket({
+        chapterPlan,
+        establishedFacts: selection.establishedFacts,
+        openTensions: selection.openTensions,
+        selectionRationale: selection.selectionRationale,
+        catalogStats: selection.catalogStats,
+      }),
+      warning: "",
+    };
+  } catch (error) {
+    return {
+      factContext: null,
+      warning: `FactSelectorAgent 失败，已跳过章节级 canon facts：${error instanceof Error ? error.message : String(error || "")}`,
+    };
+  }
 }
 
 function buildDerivedChapterStateArtifacts({
@@ -1189,6 +2175,7 @@ function chapterPromptInput({
   styleGuideText = "",
   revisionNotes = [],
   mode = "draft",
+  factContext = null,
 }) {
   const povCharacter = chapterPlan.povCharacter || project.protagonistName || "主角";
   const governanceContract = buildGovernedInputContract({
@@ -1210,6 +2197,23 @@ function chapterPromptInput({
     ].join("｜"))
     .join("\n");
 
+  const establishedFactsLines = (factContext?.establishedFacts || []).length
+    ? [
+        "既定事实（Canon Facts）——这些是从已批准章节中提取的事实，你必须遵守，不能否认、重置或改写：",
+        ...(factContext.establishedFacts || []).map(
+          (f) => `- [${f.factId}] ${f.subject}｜${f.assertion}`,
+        ),
+      ].join("\n")
+    : "";
+  const openTensionsLines = (factContext?.openTensions || []).length
+    ? [
+        "开放张力（Open Tensions）——这些是有待继续发酵的悬念，你可以推进但不可改写底层结论：",
+        ...(factContext.openTensions || []).map(
+          (f) => `- [${f.factId}] ${f.subject}｜${f.assertion}`,
+        ),
+      ].join("\n")
+    : "";
+
   return [
     `作品：${project.title}`,
     `章节：${chapterPlan.chapterId} ${chapterPlan.title}`,
@@ -1220,6 +2224,7 @@ function chapterPromptInput({
     "语言要求：优先用动作、对白、现场反应推进；少写抽象判断、空泛感慨和整段概括性总结。",
     "结构要求：必须严格按 scene 顺序推进，覆盖每场的职责、结果与交棒，不得重复开场、重置时间线，不能把同一场危机重新从头演一遍。",
     governanceContract ? `治理输入合同：\n${governanceContract}` : "",
+    establishedFactsLines || openTensionsLines ? `事实上下文：\n${[establishedFactsLines, openTensionsLines].filter(Boolean).join("\n\n")}` : "",
     `本章主线：${chapterPlan.dominantThread || "无"}`,
     `本章线索结构：${chapterPlan.threadMode || "single_spine"}`,
     `章节入口承接：${chapterPlan.entryLink || historyPacket.lastEnding}`,
@@ -1257,6 +2262,134 @@ function chapterDraftFromMarkdown(chapterPlan, markdown = "") {
   };
 }
 
+function chapterDraftFromExactMarkdown(chapterPlan, markdown = "") {
+  const normalizedMarkdown = String(markdown || "").replace(/\r\n?/g, "\n");
+  return {
+    markdown: normalizedMarkdown,
+    sceneDrafts: [],
+    usedForeshadowings: chapterPlan.foreshadowingActions.map((item) => item.id),
+    dialogueCount: (normalizedMarkdown.match(/“/g) || []).length,
+  };
+}
+
+function normalizeRewriteComparableText(text = "") {
+  return String(text || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function fragmentChanged(originalText = "", nextText = "") {
+  return normalizeRewriteComparableText(originalText) !== normalizeRewriteComparableText(nextText);
+}
+
+function chapterBodyChanged(originalMarkdown = "", nextMarkdown = "", fallbackTitle = "") {
+  const originalBody = splitChapterMarkdown(originalMarkdown, fallbackTitle).body;
+  const nextBody = splitChapterMarkdown(nextMarkdown, fallbackTitle).body;
+  return fragmentChanged(originalBody, nextBody);
+}
+
+function partialRevisionPromptInput({
+  project,
+  chapterPlan,
+  historyPacket,
+  foreshadowingSummary = "",
+  characterStateSummary = "",
+  sceneBeatSummary = "",
+  researchPacket = null,
+  referencePacket = null,
+  openingReferencePacket = null,
+  writerContextPacket = null,
+  governance = null,
+  characterDossiers = [],
+  styleGuideText = "",
+  feedback = "",
+  selection = null,
+  currentDraftMarkdown = "",
+  factContext = null,
+}) {
+  const normalizedSelection = normalizeChapterSelection(selection);
+  return [
+    chapterPromptInput({
+      project,
+      chapterPlan,
+      historyPacket,
+      foreshadowingSummary,
+      characterStateSummary,
+      sceneBeatSummary,
+      researchPacket,
+      referencePacket,
+      openingReferencePacket,
+      writerContextPacket,
+      governance,
+      characterDossiers,
+      styleGuideText,
+      revisionNotes: [feedback].filter(Boolean),
+      mode: "partial_rewrite",
+      factContext,
+    }),
+    `原文全文：\n${currentDraftMarkdown}`,
+    `只允许改写的原文片段：\n${normalizedSelection.selectedText}`,
+    `选区前文锚点：\n${normalizedSelection.prefixContext || "无"}`,
+    `选区后文锚点：\n${normalizedSelection.suffixContext || "无"}`,
+    `作者修改要求：${feedback || "按用户选区做精修。"}`,
+    "输出要求：只输出替换片段本身，不要输出标题，不要重复未选中的正文，不要解释，不要写代码块围栏。",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+async function generateChapterPartialRevisionText({
+  provider,
+  project,
+  chapterPlan,
+  historyPacket,
+  foreshadowingSummary = "",
+  characterStateSummary = "",
+  sceneBeatSummary = "",
+  researchPacket = null,
+  referencePacket = null,
+  openingReferencePacket = null,
+  writerContextPacket = null,
+  governance = null,
+  characterDossiers = [],
+  styleGuideText = "",
+  feedback = "",
+  selection = null,
+  currentDraftMarkdown = "",
+  factContext = null,
+}) {
+  const result = await provider.generateText({
+    instructions: "你是 Novelex 的 RevisionAgent。你会看到整章写作上下文、原文全文、用户选中的原文片段和修改要求。你只能改写选中的片段，不能修改任何未选中部分。只输出最终替换片段，不要解释。",
+    input: partialRevisionPromptInput({
+      project,
+      chapterPlan,
+      historyPacket,
+      foreshadowingSummary,
+      characterStateSummary,
+      sceneBeatSummary,
+      researchPacket,
+      referencePacket,
+      openingReferencePacket,
+      writerContextPacket,
+      governance,
+      characterDossiers,
+      styleGuideText,
+      feedback,
+      selection,
+      currentDraftMarkdown,
+      factContext,
+    }),
+    metadata: {
+      feature: "chapter_partial_rewrite",
+      chapterId: chapterPlan.chapterId,
+    },
+  });
+
+  return sanitizeRevisionFragment(result.text);
+}
+
 async function generateChapterDraftText({
   provider,
   project,
@@ -1275,11 +2408,15 @@ async function generateChapterDraftText({
   revisionNotes = [],
   mode = "draft",
   currentDraft = null,
+  factContext = null,
 }) {
+  const targetedRepairMode = mode === "targeted_repair";
   const instructions = mode === "style_repair"
     ? "你是 Novelex 的 WriterAgent。下面会给你一整章已有草稿。请在不改变既定事件链、scene 顺序、角色关系和冲突走向的前提下，把它改写成真正可发布的网络小说正文。必须严格使用第三人称有限视角，禁止出现旁白第一人称；不要复述提纲，不要写说明文，不要加入场景标题、系统备注或总结性尾巴。"
     : mode === "validation_repair"
       ? "你是 Novelex 的 WriterAgent。下面会给你一整章已有草稿和验证反馈。请在保留既定剧情事实、scene 顺序、人物关系和冲突方向的前提下，重写整章，使缺失事件真正落地、人物反应更可信、伏笔更自然、文风更像可发布的网络小说正文。不要输出解释。"
+      : targetedRepairMode
+        ? "你是 Novelex 的 WriterAgent。下面会给你一整章已有草稿和少量聚焦修补目标。请只修这些目标，优先做最小必要改动；如果问题是重复开场、章节过长或节奏拖沓，就压缩重复链路，只保留一条完整事件线。不要输出解释。"
       : mode === "rewrite"
         ? "你是 Novelex 的 WriterAgent。请根据作者反馈重写整章。保持既定 chapter plan、scene 顺序、人物知识边界和章末牵引，同时把语言改得更像可发布的网络小说正文。不要输出解释。"
         : "你是 Novelex 的 WriterAgent。请把输入信息转成完整可发布的网络小说章节正文。保持 POV 稳定、人物声音清晰、段落节奏自然；不要复述提纲，不要写说明文，不要用总结句替代剧情推进。";
@@ -1303,11 +2440,14 @@ async function generateChapterDraftText({
           styleGuideText,
           revisionNotes,
           mode,
+          factContext,
         }),
         mode === "style_repair"
           ? "改写要求：保留章节事实、scene 顺序和场面关系，只修正叙述视角、语言质感与元信息污染。"
           : mode === "validation_repair"
             ? "改写要求：严格依据验证反馈补足真正缺失的事件或因果，让整章更像正文，而不是提纲说明。"
+            : targetedRepairMode
+              ? "改写要求：只处理当前点名的问题；优先定点修补。若命中重复开场、重复推进或单章节奏拖沓，主动压缩重复段落，收紧到本章必须完成的事件链。"
             : "改写要求：在不偏离既定章节结构的前提下，响应作者反馈，整章重写。",
       ].join("\n\n")
     : chapterPromptInput({
@@ -1326,6 +2466,7 @@ async function generateChapterDraftText({
         styleGuideText,
         revisionNotes,
         mode,
+        factContext,
       });
 
   const result = await provider.generateText({
@@ -1357,6 +2498,14 @@ function parseSceneIdList(rawValue) {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function normalizeChapterSelection(selection = null) {
+  return {
+    selectedText: String(selection?.selectedText || "").replace(/\r\n?/g, "\n"),
+    prefixContext: String(selection?.prefixContext || "").replace(/\r\n?/g, "\n"),
+    suffixContext: String(selection?.suffixContext || "").replace(/\r\n?/g, "\n"),
+  };
 }
 
 function emptyOutlinePlanningContext() {
@@ -1415,6 +2564,7 @@ function buildOutlineContextMarkdown({
   characterPlanning,
   historyPlanning,
   continuityPlanning,
+  factContext,
   outlineOptions,
   foreshadowingActions,
   legacyPlan,
@@ -1423,6 +2573,7 @@ function buildOutlineContextMarkdown({
     ...characterPlanning.mustAppear,
     ...characterPlanning.optionalCharacters,
   ], 8);
+  const factSections = buildFactPromptSections(factContext);
 
   return [
     `# ${chapterBase.chapterId} 细纲上下文包`,
@@ -1459,6 +2610,11 @@ function buildOutlineContextMarkdown({
     `- 应压低线程：${(historyPlanning.suppressedThreads || []).join("；") || "无"}`,
     `- 全书推进定位：${historyPlanning.globalTrajectory || "无"}`,
     `- 不可冲突点：${(historyPlanning.mustNotContradict || []).join("；") || "无"}`,
+    "",
+    "## 章节级 Canon Facts",
+    `- 必须继承的已定事实：${factSections.establishedFactsLine}`,
+    `- 可以继续发酵但不能改写底层结论的开放张力：${factSections.openTensionsLine}`,
+    `- 筛选理由：${factSections.selectionRationale}`,
     "",
     "## 章节衔接",
     `- 开场承接：${continuityPlanning.entryLink || "无"}`,
@@ -1872,10 +3028,12 @@ async function runChapterContinuityAgent({
   chapterBase,
   stagePlanning,
   historyPlanning,
+  factContext = null,
   previousOutline,
   nextLegacyPlan = null,
 }) {
   const previousPlan = previousOutline?.chapterPlan || null;
+  const factSections = buildFactPromptSections(factContext);
   const result = await provider.generateText({
     instructions:
       "你是 Novelex 的 ChapterContinuityAgent。你专门负责章节之间的细粒度衔接：上一章怎么接进来、当前章主承接哪条线、哪些副线只能轻触、以及本章结尾要把什么压力递交给下一章。不要做全书语义总结，不要生成细纲或正文，只输出 JSON。",
@@ -1885,6 +3043,8 @@ async function runChapterContinuityAgent({
       `本章使命：${stagePlanning.chapterMission || "无"}`,
       `本章必须推进：${(stagePlanning.requiredBeats || []).join("；") || "无"}`,
       `历史优先线程：${(historyPlanning.priorityThreads || []).join("；") || "无"}`,
+      `必须继承的已定事实：${factSections.establishedFactsLine}`,
+      `可以继续发酵但不能改写底层结论的开放张力：${factSections.openTensionsLine}`,
       `上一章定稿细纲：\n${previousPlan ? [
         `- 章节：${previousPlan.chapterId} ${previousPlan.title}`,
         `- 主线：${previousPlan.dominantThread || "无"}`,
@@ -1937,6 +3097,7 @@ async function generateChapterOutlineCandidates({
   characterPlanning,
   historyPlanning,
   continuityPlanning,
+  factContext = null,
   foreshadowingActions,
   styleGuideText,
   openingReferencePacket = null,
@@ -1944,6 +3105,7 @@ async function generateChapterOutlineCandidates({
   feedback = "",
   previousHistory = [],
 }) {
+  const factSections = buildFactPromptSections(factContext);
   const result = await provider.generateText({
     instructions:
       "你是 Novelex 的 ChapterOutlineAgent。请为当前章节一次性生成多个差异明显的细纲候选方案。每个方案都要先判断本章线索结构，再生成可直接进入后续正文生成的完整 chapter plan。方案之间要在冲突轴、主承接线程、人物焦点、章末压力上明显拉开。单线章节要形成连贯的情节链，多线章节要明确每个 scene 属于哪条线以及为何切换。只输出 JSON。",
@@ -1956,6 +3118,8 @@ async function generateChapterOutlineCandidates({
       `延后兑现：${(stagePlanning.deferRules || []).join("；") || "无"}`,
       `角色建议：推荐 POV=${characterPlanning.recommendedPov || chapterBase.povCharacter}｜必须登场=${(characterPlanning.mustAppear || []).join("、") || "无"}｜可选登场=${(characterPlanning.optionalCharacters || []).join("、") || "无"}`,
       `关系压力：${(characterPlanning.relationshipPressures || []).join("；") || "无"}`,
+      `必须继承的已定事实：${factSections.establishedFactsLine}`,
+      `可以继续发酵但不能改写底层结论的开放张力：${factSections.openTensionsLine}`,
       `历史承接：事实=${(historyPlanning.carryOverFacts || []).join("；") || "无"}｜优先线程=${(historyPlanning.priorityThreads || []).join("；") || "无"}｜背景线程=${(historyPlanning.backgroundThreads || []).join("；") || "无"}｜压低线程=${(historyPlanning.suppressedThreads || []).join("；") || "无"}｜余波=${historyPlanning.lastEnding || "无"}`,
       `章节衔接：开场承接=${continuityPlanning.entryLink || "无"}｜主承接线程=${continuityPlanning.dominantCarryoverThread || "无"}｜必须推进到=${continuityPlanning.mustAdvanceThisChapter || "无"}｜章末递交压力=${continuityPlanning.exitPressureToNextChapter || "无"}｜连贯性风险=${(continuityPlanning.continuityRisks || []).join("；") || "无"}`,
       `伏笔任务：${foreshadowingActions.length ? foreshadowingActions.map((item) => `${item.action}:${item.id}:${item.description}`).join("；") : "无"}`,
@@ -2138,6 +3302,16 @@ async function prepareChapterOutlineResources({
   let historyPlanning;
   let continuityPlanning;
   const warnings = [];
+  const { factContext, warning: factContextWarning } = await selectFactContextForChapter({
+    store,
+    provider,
+    project,
+    chapterPlan: chapterBase,
+  });
+
+  if (factContextWarning) {
+    warnings.push(factContextWarning);
+  }
 
   try {
     stagePlanning = await runStagePlanningContextAgent({
@@ -2192,6 +3366,7 @@ async function prepareChapterOutlineResources({
       chapterBase,
       stagePlanning,
       historyPlanning,
+      factContext,
       previousOutline: committedOutlines.at(-1)?.chapterPlan ? committedOutlines.at(-1) : null,
       nextLegacyPlan,
     });
@@ -2212,6 +3387,7 @@ async function prepareChapterOutlineResources({
     characterPlanning,
     historyPlanning,
     continuityPlanning,
+    factContext,
     outlineOptions: normalizedOutlineOptions,
     foreshadowingActions,
     legacyPlan,
@@ -2224,6 +3400,7 @@ async function prepareChapterOutlineResources({
     characterPlanning,
     historyPlanning,
     continuityPlanning,
+    factContext,
     warnings,
     briefingMarkdown,
     summaryText: createExcerpt(briefingMarkdown, 320),
@@ -2256,6 +3433,7 @@ async function prepareChapterOutlineResources({
     styleGuideSourcePath,
     openingReferencePacket,
     outlineOptions: normalizedOutlineOptions,
+    factContext,
     chapterOutlineContext,
   };
 }
@@ -2288,6 +3466,23 @@ function buildChapterOutlinePreparationSteps(resources, candidates = []) {
         ? "已提炼当前章节必须承接的历史余波与未完线程。"
         : "HistoryPlanningContextAgent 不可用，已回退到已定稿历史摘要。",
       { preview: createExcerpt((resources.chapterOutlineContext.historyPlanning.openThreads || []).join("；"), 180) },
+    ),
+    step(
+      "fact_selector_agent",
+      "FactSelectorAgent",
+      "write",
+      resources.factContext
+        ? resources.factContext.catalogStats?.selected
+          ? `已从 ${resources.factContext.catalogStats.totalFacts || 0} 条已批准章节事实中筛出 ${resources.factContext.catalogStats.selected} 条供细纲继承。`
+          : "事实账本已加载，但当前章节没有命中需要继承的 canon facts。"
+        : "当前没有可用的章节级 canon facts，细纲先依赖历史摘要链路。",
+      {
+        preview: createExcerpt(
+          formatFactPromptList(resources.factContext?.establishedFacts || []) ||
+            formatFactPromptList(resources.factContext?.openTensions || []),
+          180,
+        ),
+      },
     ),
     step(
       "chapter_continuity_agent",
@@ -2361,6 +3556,7 @@ async function finalizeComposedChapterOutline({
   selectedScenes,
   authorNotes = "",
 }) {
+  const factSections = buildFactPromptSections(resources.factContext);
   const result = await provider.generateText({
     instructions:
       "你是 Novelex 的 ChapterOutlineFinalizeAgent。作者已经从多个候选细纲里挑出一组 scenes。请把这些 scene 归一化成一个完整可执行的 chapter plan，补齐事件、弧光、钩子、角色名单和连续性锚点。只输出 JSON。",
@@ -2371,6 +3567,8 @@ async function finalizeComposedChapterOutline({
       `必须落地：${(resources.chapterOutlineContext.stagePlanning.requiredBeats || []).join("；") || "无"}`,
       `角色压力：${(resources.chapterOutlineContext.characterPlanning.relationshipPressures || []).join("；") || "无"}`,
       `历史余波：${resources.chapterOutlineContext.historyPlanning.lastEnding || "无"}`,
+      `必须继承的已定事实：${factSections.establishedFactsLine}`,
+      `可以继续发酵但不能改写底层结论的开放张力：${factSections.openTensionsLine}`,
       `章节衔接：开场承接=${resources.chapterOutlineContext.continuityPlanning.entryLink || "无"}｜主承接线程=${resources.chapterOutlineContext.continuityPlanning.dominantCarryoverThread || "无"}｜章末递交压力=${resources.chapterOutlineContext.continuityPlanning.exitPressureToNextChapter || "无"}`,
       `作者备注：${authorNotes || "无"}`,
       `已选 scenes：\n${selectedScenes.map((scene, index) => `${index + 1}. [${scene.sourceProposalId}] ${scene.label}｜${scene.location}｜${scene.focus}｜${scene.tension}｜${scene.characters.join("、")}｜线程:${scene.threadId || "main"}｜承接:${scene.inheritsFromPrevious || "无"}｜结果:${scene.outcome || "无"}｜交棒:${scene.handoffToNext || "无"}`).join("\n")}`,
@@ -2424,6 +3622,7 @@ async function finalizeComposedChapterOutline({
     characterPlanning: resources.chapterOutlineContext.characterPlanning,
     historyPlanning: resources.chapterOutlineContext.historyPlanning,
     continuityPlanning: resources.chapterOutlineContext.continuityPlanning,
+    factContext: resources.factContext,
     foreshadowingActions: resources.foreshadowingActions,
   });
   composed.chapterPlan.scenes = renumberComposedScenes(resources.chapterBase.chapterId, composed.chapterPlan.scenes);
@@ -2466,6 +3665,7 @@ function buildComposedOutlineFallback({
     characterPlanning: resources.chapterOutlineContext.characterPlanning,
     historyPlanning: resources.chapterOutlineContext.historyPlanning,
     continuityPlanning: resources.chapterOutlineContext.continuityPlanning,
+    factContext: resources.factContext,
     foreshadowingActions: resources.foreshadowingActions,
   });
 }
@@ -2473,6 +3673,7 @@ function buildComposedOutlineFallback({
 async function prepareChapterWriteResources({
   store,
   provider,
+  mcpManager,
   project,
   bundle,
   chapterPlan,
@@ -2486,6 +3687,7 @@ async function prepareChapterWriteResources({
   const foreshadowingAdvice = collectForeshadowingAdvice(bundle.foreshadowingRegistry, chapterPlan);
   const { styleGuideText, styleGuideSourcePath } = await resolveStyleBaseline(store, project, chapterPlan);
   const researchPacket = await buildResearchPacket({
+    mcpManager,
     provider,
     project,
     chapterPlan,
@@ -2494,6 +3696,7 @@ async function prepareChapterWriteResources({
     planContext,
     historyContext: historyPacket,
     writerContext: baseWriterContext,
+    factContext,
   } = await buildWriterContextBundle({
     store,
     provider,
@@ -2510,6 +3713,7 @@ async function prepareChapterWriteResources({
   const referencePacket = await buildReferencePacket({
     store,
     provider,
+    mcpManager,
     project,
     chapterPlan,
     planContext,
@@ -2543,6 +3747,7 @@ async function prepareChapterWriteResources({
     openingReferencePacket,
     styleGuideText,
     styleGuideSourcePath,
+    factContext,
   });
 
   const foreshadowingSummary = summarizeForeshadowingAdvice(foreshadowingAdvice, chapterPlan);
@@ -2563,6 +3768,7 @@ async function prepareChapterWriteResources({
     styleGuideSourcePath,
     planContext,
     historyPacket,
+    factContext,
     writerContext,
     governance,
     foreshadowingSummary,
@@ -2632,6 +3838,23 @@ function buildChapterPreparationSteps(resources) {
           ? "整理历史章节中的事实余波、未完线程与不可冲突点。"
           : "当前章节无需承接已完成正文的历史余波。",
       { preview: createExcerpt(resources.historyPacket.contextSummary || "", 180) },
+    ),
+    step(
+      "fact_selector_agent",
+      "FactSelectorAgent",
+      "write",
+      resources.factContext
+        ? resources.factContext.catalogStats?.selected
+          ? `已从 ${resources.factContext.catalogStats.totalFacts || 0} 条既定事实中筛出 ${resources.factContext.catalogStats.selected} 条写作护栏。`
+          : "事实账本已加载，但当前章节没有命中需要继承的 canon facts。"
+        : "当前没有可用的章节级 canon facts，Writer 仅依赖摘要与治理链路。",
+      {
+        preview: createExcerpt(
+          formatFactPromptList(resources.factContext?.establishedFacts || []) ||
+            formatFactPromptList(resources.factContext?.openTensions || []),
+          180,
+        ),
+      },
     ),
     step(
       "reference_query_planner_agent",
@@ -2743,6 +3966,7 @@ function buildChapterPreparationSteps(resources) {
 async function generateChapterDraft({
   store,
   provider,
+  mcpManager,
   projectState,
   bundle,
   chapterPlan,
@@ -2753,6 +3977,7 @@ async function generateChapterDraft({
   const resources = await prepareChapterWriteResources({
     store,
     provider,
+    mcpManager,
     project: projectState.project,
     bundle,
     chapterPlan,
@@ -2767,7 +3992,21 @@ async function generateChapterDraft({
     steps: buildChapterPreparationSteps(resources),
   };
 
-  let chapterDraft = await generateChapterDraftText({
+  const auditContext = {
+    store,
+    provider,
+    project: projectState.project,
+    chapterPlan,
+    historyPacket: resources.historyPacket,
+    foreshadowingAdvice: resources.foreshadowingAdvice,
+    researchPacket: resources.researchPacket,
+    styleGuideText: resources.styleGuideText,
+    characterStates: resources.currentCharacterStates,
+    foreshadowingRegistry: bundle.foreshadowingRegistry,
+    chapterMetas: resources.chapterMetas,
+    factContext: resources.factContext,
+  };
+  const rewriteContext = {
     provider,
     project: projectState.project,
     chapterPlan,
@@ -2782,23 +4021,15 @@ async function generateChapterDraft({
     governance: resources.governance,
     characterDossiers: resources.characterDossiers,
     styleGuideText: resources.styleGuideText,
+    factContext: resources.factContext,
+  };
+
+  let chapterDraft = await generateChapterDraftText({
+    ...rewriteContext,
     revisionNotes: [],
     mode: "draft",
   });
-  let validation = await runChapterAudit({
-    store,
-    provider,
-    project: projectState.project,
-    chapterPlan,
-    chapterDraft,
-    historyPacket: resources.historyPacket,
-    foreshadowingAdvice: resources.foreshadowingAdvice,
-    researchPacket: resources.researchPacket,
-    styleGuideText: resources.styleGuideText,
-    characterStates: resources.currentCharacterStates,
-    foreshadowingRegistry: bundle.foreshadowingRegistry,
-    chapterMetas: resources.chapterMetas,
-  });
+  let validation = await rerunChapterAuditWithContext(auditContext, chapterDraft);
 
   run.steps.push(
     step(
@@ -2810,100 +4041,37 @@ async function generateChapterDraft({
     ),
   );
 
-  if (needsAuditStyleRepair(validation)) {
-    chapterDraft = await generateChapterDraftText({
-      provider,
-      project: projectState.project,
-      chapterPlan,
-      historyPacket: resources.historyPacket,
-      foreshadowingSummary: resources.foreshadowingSummary,
-      characterStateSummary: resources.characterStateSummary,
-      sceneBeatSummary: resources.sceneBeatSummary,
-      researchPacket: resources.researchPacket,
-      referencePacket: resources.referencePacket,
-      openingReferencePacket: resources.openingReferencePacket,
-      writerContextPacket: resources.writerContext,
-      governance: resources.governance,
-      characterDossiers: resources.characterDossiers,
-      styleGuideText: resources.styleGuideText,
-      revisionNotes: collectAuditRepairNotes(validation, {
-        dimensionIds: ["pov_consistency", "meta_leak"],
-        severities: ["critical", "warning"],
-      }),
-      mode: "style_repair",
-      currentDraft: chapterDraft,
-    });
-    validation = await runChapterAudit({
-      store,
-      provider,
-      project: projectState.project,
-      chapterPlan,
-      chapterDraft,
-      historyPacket: resources.historyPacket,
-      foreshadowingAdvice: resources.foreshadowingAdvice,
-      researchPacket: resources.researchPacket,
-      styleGuideText: resources.styleGuideText,
-      characterStates: resources.currentCharacterStates,
-      foreshadowingRegistry: bundle.foreshadowingRegistry,
-      chapterMetas: resources.chapterMetas,
-    });
+  const postProcessResult = await runChapterPostProcessing({
+    chapterDraft,
+    validation,
+    auditContext,
+    rewriteContext,
+    stepPrefix: "writer_revision",
+    styleRepairStepId: "writer_style_repair",
+  });
+  chapterDraft = postProcessResult.chapterDraft;
+  validation = postProcessResult.validation;
+  const repairResult = postProcessResult.repairResult;
+  run.steps.push(...postProcessResult.steps);
+
+  const manualReviewRequired = repairResult.manualReviewRequired;
+  const manualReviewStrategy = repairResult.manualReviewStrategy;
+  const canonFactIssues = repairResult.canonFactIssues;
+  const blockingAuditIssues = repairResult.blockingAuditIssues;
+
+  if (manualReviewRequired) {
     run.steps.push(
       step(
-        "writer_style_repair",
-        "WriterAgent",
+        manualReviewStrategy,
+        manualReviewAgentLabel(manualReviewStrategy),
         "write",
-        "根据风格校验结果强制重写为第三人称有限视角，并清除元信息污染。",
-        { preview: createExcerpt(chapterDraft.markdown, 180) },
+        manualReviewSummary(manualReviewStrategy),
+        { preview: createExcerpt(blockingAuditIssues.join("；"), 180) },
       ),
     );
+  } else {
+    ensureChapterValidationPassed(chapterPlan, validation);
   }
-
-  if (!validation.overallPassed) {
-    chapterDraft = await generateChapterDraftText({
-      provider,
-      project: projectState.project,
-      chapterPlan,
-      historyPacket: resources.historyPacket,
-      foreshadowingSummary: resources.foreshadowingSummary,
-      characterStateSummary: resources.characterStateSummary,
-      sceneBeatSummary: resources.sceneBeatSummary,
-      researchPacket: resources.researchPacket,
-      referencePacket: resources.referencePacket,
-      openingReferencePacket: resources.openingReferencePacket,
-      writerContextPacket: resources.writerContext,
-      governance: resources.governance,
-      characterDossiers: resources.characterDossiers,
-      styleGuideText: resources.styleGuideText,
-      revisionNotes: collectAuditRepairNotes(validation),
-      mode: "validation_repair",
-      currentDraft: chapterDraft,
-    });
-    validation = await runChapterAudit({
-      store,
-      provider,
-      project: projectState.project,
-      chapterPlan,
-      chapterDraft,
-      historyPacket: resources.historyPacket,
-      foreshadowingAdvice: resources.foreshadowingAdvice,
-      researchPacket: resources.researchPacket,
-      styleGuideText: resources.styleGuideText,
-      characterStates: resources.currentCharacterStates,
-      foreshadowingRegistry: bundle.foreshadowingRegistry,
-      chapterMetas: resources.chapterMetas,
-    });
-    run.steps.push(
-      step(
-        "writer_revision",
-        "WriterAgent",
-        "write",
-        "根据维度审计反馈重写缺失场景并收紧风格。",
-        { preview: createExcerpt(chapterDraft.markdown, 180) },
-      ),
-    );
-  }
-
-  ensureChapterValidationPassed(chapterPlan, validation);
 
   const derivedState = buildDerivedChapterStateArtifacts({
     currentCharacterStates: resources.currentCharacterStates,
@@ -2926,7 +4094,7 @@ async function generateChapterDraft({
       "audit_orchestrator",
       "AuditOrchestrator",
       "write",
-      validation.semanticAudit?.source === "agent"
+      validation.semanticAudit?.source !== "heuristics_only"
         ? validation.summary
         : `AuditOrchestrator 不可用，当前仅依赖启发式审计。${validation.summary}`,
       validation.semanticAudit?.error
@@ -2973,10 +4141,28 @@ async function generateChapterDraft({
     contextPackage: resources.governance.contextPackage,
     ruleStack: resources.governance.ruleStack,
     contextTrace: resources.governance.contextTrace,
+    factContext: resources.factContext,
     providerSnapshot: provider.settings,
+    auditDegraded: Boolean(validation?.auditDegraded),
+    repairHistory: repairResult.repairHistory,
+    lastUnresolvedCriticals: repairResult.lastUnresolvedCriticals,
     reviewState: {
       mode: "initial",
-      strategy: "chapter_generation",
+      strategy: manualReviewRequired ? manualReviewStrategy : "chapter_generation",
+      manualReviewRequired,
+      auditDegraded: Boolean(validation?.auditDegraded),
+      auditAutoRepairAttempts: repairResult.auditAutoRepairAttempts,
+      canonFactAutoRepairAttempts: repairResult.canonFactAutoRepairAttempts,
+      feedbackSupervisionPassed: true,
+      feedbackSupervisionSummary: "",
+      feedbackSupervisionAttempts: 0,
+      feedbackSupervisionHistory: [],
+      blockingFeedbackIssues: [],
+      blockingAuditIssues,
+      canonFactIssues,
+      repairHistory: repairResult.repairHistory,
+      lastUnresolvedCriticals: repairResult.lastUnresolvedCriticals,
+      repairStagnated: repairResult.stagnated,
     },
     rewriteHistory: existingRewriteHistory,
   });
@@ -2992,12 +4178,18 @@ async function generateChapterDraft({
       runId: run.id,
     },
     lastRunId: run.id,
-    rejectionNotes: [],
+    rejectionNotes: manualReviewRequired ? blockingAuditIssues : [],
     rewriteHistory: existingRewriteHistory,
   };
 
   run.finishedAt = nowIso();
-  run.summary = `第 ${chapterNumber} 章正文草稿已生成，等待人类审查。`;
+  run.summary = manualReviewRequired
+    ? manualReviewStrategy === "canon_fact_manual_review"
+      ? `第 ${chapterNumber} 章正文草稿存在未解决的 canon facts 冲突，已停止自动修正并进入人工审核。`
+      : manualReviewStrategy === "feedback_manual_review"
+        ? `第 ${chapterNumber} 章正文草稿在人类反馈监督后仍有未落实项，已进入人工复审。`
+      : `第 ${chapterNumber} 章正文草稿在自动修正后仍未通过审计，已进入人工审核。`
+    : `第 ${chapterNumber} 章正文草稿已生成，等待人类审查。`;
   run.validation = validationSummary(validation);
 
   const savedProject = await store.saveProject(projectState);
@@ -3011,6 +4203,7 @@ async function generateChapterDraft({
 async function stageChapterOutlineReview({
   store,
   provider,
+  mcpManager,
   projectState,
   bundle,
   chapterNumber,
@@ -3092,6 +4285,7 @@ async function stageChapterOutlineReview({
     contextPackage: previousDraft?.contextPackage || {},
     ruleStack: previousDraft?.ruleStack || {},
     contextTrace: previousDraft?.contextTrace || previousDraft?.trace || {},
+    factContext: resources.factContext,
     providerSnapshot: provider.settings,
     reviewState: {
       mode: "outline_review",
@@ -3128,6 +4322,10 @@ async function stageChapterOutlineReview({
 export async function runWriteChapter(store, options = {}) {
   const projectState = await store.loadProject();
   const provider = createProvider(projectState, { rootDir: store.paths.configRootDir });
+  const mcpManager = getWorkspaceMcpManager({
+    rootDir: store.paths.workspaceRoot || store.paths.configRootDir,
+    configRootDir: store.paths.configRootDir,
+  });
   if (projectState.phase.plan.status !== PLAN_STATUS.LOCKED) {
     throw new Error("大纲尚未锁定，不能进入 Write 阶段。");
   }
@@ -3156,6 +4354,7 @@ export async function runWriteChapter(store, options = {}) {
     return generateChapterDraft({
       store,
       provider,
+      mcpManager,
       projectState,
       bundle,
       chapterPlan,
@@ -3170,6 +4369,7 @@ export async function runWriteChapter(store, options = {}) {
   return stageChapterOutlineReview({
     store,
     provider,
+    mcpManager,
     projectState,
     bundle,
     chapterNumber,
@@ -3186,12 +4386,14 @@ export async function reviewChapter(
     approved,
     feedback,
     reviewAction = approved ? "approve" : "rewrite",
+    approvalOverrideAcknowledged = false,
     selectedProposalId = "",
     selectedSceneRefs = [],
     authorNotes = "",
     outlineOptions = null,
     sceneIds = [],
     sceneOrder = [],
+    selection = null,
   },
 ) {
   const projectState = await store.loadProject();
@@ -3206,6 +4408,10 @@ export async function reviewChapter(
     throw new Error("找不到待审章节草稿。");
   }
   const provider = createProvider(projectState, { rootDir: store.paths.configRootDir });
+  const mcpManager = getWorkspaceMcpManager({
+    rootDir: store.paths.workspaceRoot || store.paths.configRootDir,
+    configRootDir: store.paths.configRootDir,
+  });
   const pendingTarget = String(pending.target || REVIEW_TARGETS.CHAPTER);
   const requestedTarget = String(target || pendingTarget);
   if (requestedTarget !== pendingTarget) {
@@ -3214,6 +4420,7 @@ export async function reviewChapter(
   const normalizedSelectedSceneRefs = Array.isArray(selectedSceneRefs) ? selectedSceneRefs : parseSceneIdList(selectedSceneRefs);
   const normalizedSceneIds = Array.isArray(sceneIds) ? sceneIds : parseSceneIdList(sceneIds);
   const normalizedSceneOrder = Array.isArray(sceneOrder) ? sceneOrder : parseSceneIdList(sceneOrder);
+  const normalizedSelection = normalizeChapterSelection(selection);
   const rawReviewAction = String(reviewAction || "").trim();
   if (
     pendingTarget === REVIEW_TARGETS.CHAPTER &&
@@ -3231,12 +4438,53 @@ export async function reviewChapter(
   const rewriteStrategy = approved
     ? null
     : pendingTarget === REVIEW_TARGETS.CHAPTER
-      ? "chapter_rewrite"
+      ? normalizedReviewAction === "partial_rewrite"
+        ? "selection_patch"
+        : "chapter_rewrite"
       : resolveRewriteStrategy(reviewAction, normalizedSceneIds, normalizedSceneOrder);
 
-  if (pendingTarget === REVIEW_TARGETS.CHAPTER && !approved && normalizedReviewAction !== "rewrite") {
+  if (
+    pendingTarget === REVIEW_TARGETS.CHAPTER &&
+    !approved &&
+    normalizedReviewAction !== "rewrite" &&
+    normalizedReviewAction !== "partial_rewrite"
+  ) {
     throw new Error(`未知的章节审查动作：${reviewAction}`);
   }
+  if (
+    pendingTarget === REVIEW_TARGETS.CHAPTER &&
+    !approved &&
+    normalizedReviewAction === "partial_rewrite" &&
+    !normalizedSelection.selectedText.trim()
+  ) {
+    throw new Error("局部修订需要先选中一段正文。");
+  }
+
+  const approvalOverrideRequired = pendingTarget === REVIEW_TARGETS.CHAPTER &&
+    approved &&
+    (
+      draftBundle?.reviewState?.manualReviewRequired ||
+      draftBundle?.validation?.overallPassed === false ||
+      draftBundle?.reviewState?.feedbackSupervisionPassed === false
+    );
+  if (approvalOverrideRequired && !approvalOverrideAcknowledged) {
+    throw new Error("当前章节审计尚未通过。若仍要锁章，请先在界面中显式确认 override 风险。");
+  }
+
+  const approvalOverrideReason = approvalOverrideRequired
+    ? String(feedback || "").trim() || "人工确认在未通过审计的情况下仍然锁章。"
+    : "";
+  const approvalValidationSnapshot = approvalOverrideRequired
+    ? {
+      overallPassed: Boolean(draftBundle?.validation?.overallPassed),
+      summary: validationSummary(draftBundle?.validation),
+      issueCounts: draftBundle?.validation?.issueCounts || { critical: 0, warning: 0, info: 0 },
+      manualReviewRequired: Boolean(draftBundle?.reviewState?.manualReviewRequired),
+      feedbackSupervisionPassed: draftBundle?.reviewState?.feedbackSupervisionPassed !== false,
+      feedbackSupervisionSummary: String(draftBundle?.reviewState?.feedbackSupervisionSummary || "").trim(),
+      blockingFeedbackIssues: normalizeFeedbackTextList(draftBundle?.reviewState?.blockingFeedbackIssues, 6),
+    }
+    : null;
 
   const review = {
     id: runId("review-chapter"),
@@ -3250,7 +4498,11 @@ export async function reviewChapter(
     authorNotes: authorNotes || "",
     sceneIds: normalizedSceneIds,
     sceneOrder: normalizedSceneOrder,
+    selection: normalizedSelection,
     rewriteStrategy,
+    approvalOverride: approvalOverrideRequired,
+    approvalOverrideReason,
+    approvalValidationSnapshot,
     createdAt: nowIso(),
   };
 
@@ -3265,6 +4517,7 @@ export async function reviewChapter(
       return stageChapterOutlineReview({
         store,
         provider,
+        mcpManager,
         projectState,
         bundle,
         chapterNumber: pending.chapterNumber,
@@ -3353,6 +4606,7 @@ export async function reviewChapter(
     return generateChapterDraft({
       store,
       provider,
+      mcpManager,
       projectState,
       bundle,
       chapterPlan: selectedOutline.chapterPlan,
@@ -3369,6 +4623,20 @@ export async function reviewChapter(
 
   if (approved) {
     await store.commitChapterDraft(pending.chapterId);
+
+    let factExtractionWarning = "";
+    try {
+      const facts = await runChapterFactExtractionAgent({
+        provider,
+        project: projectState.project,
+        chapterPlan: draftBundle.chapterPlan,
+        chapterDraft: { markdown: draftBundle.chapterMarkdown || "" },
+      });
+      await saveChapterFacts(store, pending.chapterId, facts);
+      await appendFactsToLedger(store, pending.chapterId, facts);
+    } catch (error) {
+      factExtractionWarning = ` Canon facts 提取失败：${createExcerpt(error instanceof Error ? error.message : String(error || ""), 180)}`;
+    }
 
     if (pending.chapterNumber === 1 && !String(projectState.project?.styleFingerprintId || "").trim()) {
       const styleGuide = buildStyleGuide(projectState.project, {
@@ -3403,7 +4671,7 @@ export async function reviewChapter(
     return {
       project: savedProject,
       run: null,
-      summary: `${pending.chapterId} 已锁定，可继续生成下一章。`,
+      summary: `${pending.chapterId} 已${approvalOverrideRequired ? "在显式 override 后" : ""}锁定，可继续生成下一章。${factExtractionWarning}`,
     };
   }
 
@@ -3428,7 +4696,11 @@ export async function reviewChapter(
     feedback: feedback || "",
     sceneIds: normalizedSceneIds,
     sceneOrder: normalizedSceneOrder,
+    selectionPreview: normalizedReviewAction === "partial_rewrite"
+      ? createExcerpt(normalizedSelection.selectedText, 120)
+      : "",
   }];
+  const currentRewriteHistoryEntry = rewriteHistory.at(-1);
   const historyPacket = historyContextFromDraft(draftBundle);
   const writerContext = writerContextFromDraft(draftBundle);
   const governance = governanceFromDraft(draftBundle, chapterPlanBase);
@@ -3436,6 +4708,301 @@ export async function reviewChapter(
   const characterStateSummary = summarizeCharacterStates(focusedCharacterStates);
   const sceneBeatSummary = summarizeSceneBeats(chapterPlanBase);
 
+  if (normalizedReviewAction === "partial_rewrite") {
+    const factContext = draftBundle?.factContext || null;
+    const originalMarkdown = String(draftBundle.chapterMarkdown || "");
+    const originalParts = splitChapterMarkdown(originalMarkdown, chapterPlanBase.title);
+    const anchoredRange = locateSelectedText(originalParts.body, normalizedSelection);
+    let feedbackSupervisionAttempts = 0;
+    const feedbackSupervisionHistory = [];
+    const partialRewriteSteps = [];
+    let latestChangedFragment = "";
+    let latestFeedbackResult = createFeedbackSupervisionResult();
+
+    for (let attempt = 1; attempt <= MAX_AUDIT_AUTO_REPAIR_ATTEMPTS; attempt += 1) {
+      const revisionFeedback = [
+        feedback || "",
+        ...(attempt > 1 ? normalizeFeedbackTextList(latestFeedbackResult.revisionNotes, 6) : []),
+      ];
+      const replacementFragment = await generateChapterPartialRevisionText({
+        provider,
+        project: projectState.project,
+        chapterPlan: chapterPlanBase,
+        historyPacket,
+        foreshadowingSummary,
+        characterStateSummary,
+        sceneBeatSummary,
+        researchPacket,
+        referencePacket,
+        openingReferencePacket,
+        writerContextPacket: writerContext,
+        governance,
+        characterDossiers,
+        styleGuideText,
+        feedback: revisionFeedback.filter(Boolean).join("\n"),
+        selection: normalizedSelection,
+        currentDraftMarkdown: originalMarkdown,
+        factContext,
+      });
+
+      if (!replacementFragment) {
+        throw new Error(attempt === 1 ? "RevisionAgent 未返回可用的替换片段。" : "RevisionAgent 重试后仍未返回可用的替换片段。");
+      }
+
+      const changedFragment = fragmentChanged(normalizedSelection.selectedText, replacementFragment);
+      if (changedFragment) {
+        latestChangedFragment = replacementFragment;
+      }
+
+      partialRewriteSteps.push(
+        step(
+          attempt === 1 ? "partial_rewrite" : attempt === 2 ? "partial_rewrite_retry" : `partial_rewrite_retry_${attempt - 1}`,
+          attempt === 1 ? "RevisionAgent" : `RevisionAgent Retry ${attempt - 1}`,
+          "write",
+          attempt === 1
+            ? "只针对用户选中的正文片段生成替换内容。"
+            : "上一轮片段仍未完全满足要求，已在同一选区内继续重写。",
+          {
+            preview: createExcerpt(replacementFragment, 120),
+          },
+        ),
+      );
+
+      latestFeedbackResult = await runFeedbackSupervisorAgent({
+        provider,
+        project: projectState.project,
+        chapterPlan: chapterPlanBase,
+        feedback: feedback || "",
+        mode: "partial_rewrite",
+        candidateText: replacementFragment,
+        selection: normalizedSelection,
+        currentDraftMarkdown: originalMarkdown,
+      });
+      if (!changedFragment) {
+        latestFeedbackResult = createFeedbackSupervisionResult({
+          ...latestFeedbackResult,
+          enabled: true,
+          passed: false,
+          summary: latestFeedbackResult.summary || "候选替换片段与原选区没有实质差异，仍未落实作者反馈。",
+          missingItems: uniqueTextNotes([
+            ...latestFeedbackResult.missingItems,
+            "当前候选片段没有对选区做出实质改写。",
+          ]),
+          revisionNotes: uniqueTextNotes([
+            ...latestFeedbackResult.revisionNotes,
+            "硬性要求：这次只能输出新的替换片段，不能原样重复选中的原文；即使保留原意，也必须实质改写句式、信息落点或节奏，并明确落实修改要求。",
+          ]),
+          evidence: latestFeedbackResult.evidence || normalizedSelection.selectedText,
+          scopeBlocked: false,
+        });
+      }
+
+      feedbackSupervisionAttempts += 1;
+      feedbackSupervisionHistory.push(buildFeedbackSupervisionHistoryEntry(latestFeedbackResult));
+      partialRewriteSteps.push(
+        step(
+          `partial_feedback_supervision_${attempt}`,
+          "FeedbackSupervisorAgent",
+          "write",
+          latestFeedbackResult.passed
+            ? "反馈监督通过：当前替换片段已落实作者反馈。"
+            : latestFeedbackResult.scopeBlocked
+              ? "反馈监督判断当前反馈无法在既定选区内完整完成，已停止自动修订。"
+              : "反馈监督发现当前替换片段仍未完整落实作者反馈，已生成下一轮 revision notes。",
+          {
+            preview: createExcerpt(
+              latestFeedbackResult.passed
+                ? latestFeedbackResult.summary || "作者反馈已落实。"
+                : buildBlockingFeedbackIssues(latestFeedbackResult).join("；") || latestFeedbackResult.summary,
+              160,
+            ),
+          },
+        ),
+      );
+
+      if (changedFragment && latestFeedbackResult.passed) {
+        break;
+      }
+      if (latestFeedbackResult.scopeBlocked) {
+        break;
+      }
+    }
+
+    const fragmentToApply = latestChangedFragment || normalizedSelection.selectedText;
+    const replacedMarkdown = replaceSelectionInChapterMarkdown(
+      originalMarkdown,
+      normalizedSelection,
+      fragmentToApply,
+      chapterPlanBase.title,
+    );
+    const revisedDraft = chapterDraftFromExactMarkdown(
+      chapterPlanBase,
+      composeChapterMarkdown(replacedMarkdown.title, replacedMarkdown.body),
+    );
+    const validation = await runChapterAudit({
+      store,
+      provider,
+      project: projectState.project,
+      chapterPlan: chapterPlanBase,
+      chapterDraft: revisedDraft,
+      historyPacket,
+      foreshadowingAdvice,
+      researchPacket,
+      styleGuideText,
+      characterStates: currentCharacterStates,
+      foreshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
+      chapterMetas,
+      factContext,
+    });
+
+    const rewrittenState = buildDerivedChapterStateArtifacts({
+      currentCharacterStates,
+      chapterPlan: chapterPlanBase,
+      project: projectState.project,
+      chapterDraft: revisedDraft,
+      worldStateBase: bundle.worldState,
+      structureData: bundle.structureData,
+      foreshadowingRegistryBase: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
+    });
+
+    const feedbackSupervisionPassed = !latestFeedbackResult.enabled || latestFeedbackResult.passed;
+    const blockingFeedbackIssues = buildBlockingFeedbackIssues(latestFeedbackResult);
+    const blockingAuditIssues = buildBlockingAuditReviewPayload(validation, factContext).blockingAuditIssues;
+    const manualReviewRequired = !validation?.overallPassed || !feedbackSupervisionPassed;
+    const manualReviewStrategy = manualReviewRequired
+      ? (feedbackSupervisionPassed ? manualReviewStrategyFromValidation(validation) : "feedback_manual_review")
+      : "selection_patch";
+
+    if (currentRewriteHistoryEntry) {
+      currentRewriteHistoryEntry.feedbackSupervisionPassed = feedbackSupervisionPassed;
+      currentRewriteHistoryEntry.feedbackSupervisionSummary = latestFeedbackResult.summary || "";
+      currentRewriteHistoryEntry.feedbackSupervisionAttempts = feedbackSupervisionAttempts;
+      currentRewriteHistoryEntry.blockingFeedbackIssues = blockingFeedbackIssues;
+    }
+
+    await store.stageChapterDraft({
+      ...draftBundle,
+      chapterPlan: chapterPlanBase,
+      chapterMarkdown: revisedDraft.markdown,
+      sceneDrafts: [],
+      researchPacket,
+      referencePacket,
+      openingReferencePacket,
+      validation,
+      auditDrift: validation.auditDrift,
+      chapterMeta: rewrittenState.chapterMeta,
+      characterStates: rewrittenState.characterStates,
+      worldState: rewrittenState.worldState,
+      foreshadowingRegistry: rewrittenState.foreshadowingRegistry,
+      retrieval: historyPacket,
+      historyContext: historyPacket,
+      planContext: draftBundle.planContext || {},
+      writerContext,
+      chapterIntent: governance.chapterIntent,
+      contextPackage: governance.contextPackage,
+      ruleStack: governance.ruleStack,
+      contextTrace: governance.contextTrace,
+      factContext,
+      auditDegraded: Boolean(validation?.auditDegraded),
+      repairHistory: draftBundle?.repairHistory || [],
+      lastUnresolvedCriticals: unresolvedCriticalIssueSummaries(validation),
+      reviewState: {
+        mode: "partial_rewrite",
+        strategy: manualReviewRequired ? manualReviewStrategy : "selection_patch",
+        lastFeedback: feedback || "",
+        selectionPreview: createExcerpt(normalizedSelection.selectedText, 120),
+        selection: normalizedSelection,
+        manualReviewRequired,
+        manualReviewStrategy: manualReviewRequired ? manualReviewStrategy : "",
+        auditDegraded: Boolean(validation?.auditDegraded),
+        feedbackSupervisionPassed,
+        feedbackSupervisionSummary: latestFeedbackResult.summary || "",
+        feedbackSupervisionAttempts,
+        feedbackSupervisionHistory,
+        blockingFeedbackIssues,
+        blockingAuditIssues,
+        lastUnresolvedCriticals: unresolvedCriticalIssueSummaries(validation),
+      },
+      rewriteHistory,
+    });
+
+    const rewriteRun = {
+      id: runId("write"),
+      phase: "write",
+      startedAt: nowIso(),
+      finishedAt: nowIso(),
+      target: REVIEW_TARGETS.CHAPTER,
+      chapterId: pending.chapterId,
+      summary: manualReviewRequired
+        ? manualReviewStrategy === "feedback_manual_review"
+          ? `${pending.chapterId} 局部修订后仍有未落实的人类反馈，已进入人工复审。`
+          : `${pending.chapterId} 局部修订后仍有未解决审计问题，已进入人工复审。`
+        : `${pending.chapterId} 已完成局部修订并回到待审状态。`,
+      steps: [
+        ...partialRewriteSteps,
+        ...(manualReviewRequired
+          ? [
+              step(
+                manualReviewStrategy,
+                manualReviewAgentLabel(manualReviewStrategy),
+                "write",
+                manualReviewSummary(manualReviewStrategy),
+                {
+                  preview: createExcerpt(
+                    (
+                      manualReviewStrategy === "feedback_manual_review"
+                        ? blockingFeedbackIssues
+                        : blockingAuditIssues
+                    ).join("；"),
+                    160,
+                  ),
+                },
+              ),
+            ]
+          : []),
+        step(
+          "partial_rewrite_validation",
+          "Validation",
+          "write",
+          validationSummary(validation),
+          {
+            preview: createExcerpt(feedback || "", 120),
+          },
+        ),
+      ],
+    };
+    await store.saveRun(rewriteRun);
+
+    projectState.phase.write = {
+      ...projectState.phase.write,
+      status: WRITE_STATUS.CHAPTER_PENDING_REVIEW,
+      pendingReview: {
+        ...pending,
+        requestedAt: nowIso(),
+        runId: rewriteRun.id,
+      },
+      rejectionNotes: manualReviewRequired
+        ? uniqueTextNotes([
+          ...(manualReviewStrategy === "feedback_manual_review" ? blockingFeedbackIssues : []),
+          ...(manualReviewStrategy === "feedback_manual_review" ? [] : blockingAuditIssues),
+        ])
+        : [feedback].filter(Boolean),
+      rewriteHistory,
+    };
+    const savedProject = await store.saveProject(projectState);
+    return {
+      project: savedProject,
+      run: rewriteRun,
+      summary: manualReviewRequired
+        ? manualReviewStrategy === "feedback_manual_review"
+          ? `${pending.chapterId} 已完成局部修订，但反馈仍未完整落实，需要人工确认。`
+          : `${pending.chapterId} 已完成局部修订，但审计仍未通过，需要人工确认。`
+        : `${pending.chapterId} 已完成局部修订，替换了正文中的选中片段 ${anchoredRange.occurrenceCount > 1 ? "（已通过锚点唯一定位）" : ""}，等待再次审查。`,
+    };
+  }
+
+  const originalMarkdown = String(draftBundle.chapterMarkdown || "");
+  let rewriteRetried = false;
   let rewrittenDraft = await generateChapterDraftText({
     provider,
     project: projectState.project,
@@ -3454,15 +5021,50 @@ export async function reviewChapter(
     revisionNotes: [feedback].filter(Boolean),
     mode: "rewrite",
     currentDraft: {
-      markdown: draftBundle.chapterMarkdown || "",
+      markdown: originalMarkdown,
     },
+    factContext: draftBundle?.factContext || null,
   });
-  let validation = await runChapterAudit({
+  const factContext = draftBundle?.factContext || null;
+
+  if (!chapterBodyChanged(originalMarkdown, rewrittenDraft.markdown, chapterPlanBase.title)) {
+    rewriteRetried = true;
+    rewrittenDraft = await generateChapterDraftText({
+      provider,
+      project: projectState.project,
+      chapterPlan: chapterPlanBase,
+      historyPacket,
+      foreshadowingSummary,
+      characterStateSummary,
+      sceneBeatSummary,
+      researchPacket,
+      referencePacket,
+      openingReferencePacket,
+      writerContextPacket: writerContext,
+      governance,
+      characterDossiers,
+      styleGuideText,
+      revisionNotes: [
+        feedback,
+        "硬性要求：这次必须输出与待修正文实质不同的新版本，不能原样复述现有草稿；至少要明显改写句式、段落节奏或表达，并落实作者反馈。",
+      ].filter(Boolean),
+      mode: "rewrite",
+      currentDraft: {
+        markdown: originalMarkdown,
+      },
+      factContext: draftBundle?.factContext || null,
+    });
+  }
+
+  if (!chapterBodyChanged(originalMarkdown, rewrittenDraft.markdown, chapterPlanBase.title)) {
+    throw new Error("整章重写未产生有效改动，请把反馈写得更具体一些后重试。");
+  }
+
+  const auditContext = {
     store,
     provider,
     project: projectState.project,
     chapterPlan: chapterPlanBase,
-    chapterDraft: rewrittenDraft,
     historyPacket,
     foreshadowingAdvice,
     researchPacket,
@@ -3470,84 +5072,63 @@ export async function reviewChapter(
     characterStates: currentCharacterStates,
     foreshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
     chapterMetas,
+    factContext,
+  };
+  const rewriteContext = {
+    provider,
+    project: projectState.project,
+    chapterPlan: chapterPlanBase,
+    historyPacket,
+    foreshadowingSummary,
+    characterStateSummary,
+    sceneBeatSummary,
+    researchPacket,
+    referencePacket,
+    openingReferencePacket,
+    writerContextPacket: writerContext,
+    governance,
+    characterDossiers,
+    styleGuideText,
+    factContext: draftBundle?.factContext || null,
+  };
+
+  let validation = await rerunChapterAuditWithContext(auditContext, rewrittenDraft);
+  const postProcessResult = await runChapterPostProcessing({
+    chapterDraft: rewrittenDraft,
+    validation,
+    auditContext,
+    rewriteContext,
+    stepPrefix: "rewrite_validation_repair",
+    styleRepairStepId: "rewrite_style_repair",
+    feedbackSupervisor: {
+      enabled: true,
+      provider,
+      project: projectState.project,
+      chapterPlan: chapterPlanBase,
+      feedback: feedback || "",
+      mode: "rewrite",
+    },
   });
+  rewrittenDraft = postProcessResult.chapterDraft;
+  validation = postProcessResult.validation;
+  const repairResult = postProcessResult.repairResult;
 
-  if (needsAuditStyleRepair(validation)) {
-    rewrittenDraft = await generateChapterDraftText({
-      provider,
-      project: projectState.project,
-      chapterPlan: chapterPlanBase,
-      historyPacket,
-      foreshadowingSummary,
-      characterStateSummary,
-      sceneBeatSummary,
-      researchPacket,
-      referencePacket,
-      openingReferencePacket,
-      writerContextPacket: writerContext,
-      governance,
-      characterDossiers,
-      styleGuideText,
-      revisionNotes: collectAuditRepairNotes(validation, {
-        dimensionIds: ["pov_consistency", "meta_leak"],
-        severities: ["critical", "warning"],
-      }),
-      mode: "style_repair",
-      currentDraft: rewrittenDraft,
-    });
-    validation = await runChapterAudit({
-      store,
-      provider,
-      project: projectState.project,
-      chapterPlan: chapterPlanBase,
-      chapterDraft: rewrittenDraft,
-      historyPacket,
-      foreshadowingAdvice,
-      researchPacket,
-      styleGuideText,
-      characterStates: currentCharacterStates,
-      foreshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
-      chapterMetas,
-    });
+  const manualReviewRequired = repairResult.manualReviewRequired;
+  const manualReviewStrategy = repairResult.manualReviewStrategy;
+  const canonFactIssues = repairResult.canonFactIssues;
+  const blockingAuditIssues = repairResult.blockingAuditIssues;
+  const blockingFeedbackIssues = repairResult.blockingFeedbackIssues;
+
+  if (currentRewriteHistoryEntry) {
+    currentRewriteHistoryEntry.feedbackSupervisionPassed = repairResult.feedbackSupervisionPassed;
+    currentRewriteHistoryEntry.feedbackSupervisionSummary = repairResult.feedbackSupervisionSummary;
+    currentRewriteHistoryEntry.feedbackSupervisionAttempts = repairResult.feedbackSupervisionAttempts;
+    currentRewriteHistoryEntry.blockingFeedbackIssues = blockingFeedbackIssues;
   }
 
-  if (!validation.overallPassed) {
-    rewrittenDraft = await generateChapterDraftText({
-      provider,
-      project: projectState.project,
-      chapterPlan: chapterPlanBase,
-      historyPacket,
-      foreshadowingSummary,
-      characterStateSummary,
-      sceneBeatSummary,
-      researchPacket,
-      referencePacket,
-      openingReferencePacket,
-      writerContextPacket: writerContext,
-      governance,
-      characterDossiers,
-      styleGuideText,
-      revisionNotes: collectAuditRepairNotes(validation),
-      mode: "validation_repair",
-      currentDraft: rewrittenDraft,
-    });
-    validation = await runChapterAudit({
-      store,
-      provider,
-      project: projectState.project,
-      chapterPlan: chapterPlanBase,
-      chapterDraft: rewrittenDraft,
-      historyPacket,
-      foreshadowingAdvice,
-      researchPacket,
-      styleGuideText,
-      characterStates: currentCharacterStates,
-      foreshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
-      chapterMetas,
-    });
+  if (!manualReviewRequired) {
+    ensureChapterValidationPassed(chapterPlanBase, validation);
   }
-
-  ensureChapterValidationPassed(chapterPlanBase, validation);
 
   const rewrittenState = buildDerivedChapterStateArtifacts({
     currentCharacterStates,
@@ -3581,10 +5162,29 @@ export async function reviewChapter(
     contextPackage: governance.contextPackage,
     ruleStack: governance.ruleStack,
     contextTrace: governance.contextTrace,
+    factContext,
+    auditDegraded: Boolean(validation?.auditDegraded),
+    repairHistory: repairResult.repairHistory,
+    lastUnresolvedCriticals: repairResult.lastUnresolvedCriticals,
     reviewState: {
       mode: "rewrite",
-      strategy: rewriteStrategy,
+      strategy: manualReviewRequired ? manualReviewStrategy : rewriteStrategy,
       lastFeedback: feedback || "",
+      manualReviewRequired,
+      manualReviewStrategy: manualReviewRequired ? manualReviewStrategy : "",
+      auditDegraded: Boolean(validation?.auditDegraded),
+      auditAutoRepairAttempts: repairResult.auditAutoRepairAttempts,
+      canonFactAutoRepairAttempts: repairResult.canonFactAutoRepairAttempts,
+      feedbackSupervisionPassed: repairResult.feedbackSupervisionPassed,
+      feedbackSupervisionSummary: repairResult.feedbackSupervisionSummary,
+      feedbackSupervisionAttempts: repairResult.feedbackSupervisionAttempts,
+      feedbackSupervisionHistory: repairResult.feedbackSupervisionHistory,
+      blockingFeedbackIssues,
+      blockingAuditIssues,
+      canonFactIssues,
+      repairHistory: repairResult.repairHistory,
+      lastUnresolvedCriticals: repairResult.lastUnresolvedCriticals,
+      repairStagnated: repairResult.stagnated,
     },
     rewriteHistory,
   });
@@ -3596,15 +5196,55 @@ export async function reviewChapter(
     finishedAt: nowIso(),
     target: REVIEW_TARGETS.CHAPTER,
     chapterId: pending.chapterId,
-    summary: `${pending.chapterId} 已根据人类反馈重写并回到待审状态。`,
-    steps: [
-      step(
+      summary: manualReviewRequired
+        ? manualReviewStrategy === "canon_fact_manual_review"
+          ? `${pending.chapterId} 重写后仍存在未解决的 canon facts 冲突，已停止自动修正并进入人工审核。`
+          : manualReviewStrategy === "feedback_manual_review"
+            ? `${pending.chapterId} 重写后仍有未落实的人类反馈，已进入人工复审。`
+          : `${pending.chapterId} 重写后在自动修正后仍未通过审计，已进入人工审核。`
+        : `${pending.chapterId} 已根据人类反馈重写并回到待审状态。`,
+      steps: [
+        step(
         "rewrite",
         "WriterAgent",
         "write",
         "根据人类反馈重写整章。",
         { preview: createExcerpt(feedback || "", 160) },
       ),
+      ...(rewriteRetried
+        ? [
+            step(
+              "rewrite_retry",
+              "WriterAgent Retry",
+              "write",
+              "首次返回与原稿无实质差异，已自动追加强约束后重写一次。",
+              {
+                preview: createExcerpt(feedback || "", 160),
+              },
+            ),
+          ]
+        : []),
+      ...(postProcessResult.steps || []),
+      ...(manualReviewRequired
+        ? [
+            step(
+              manualReviewStrategy,
+              manualReviewAgentLabel(manualReviewStrategy),
+              "write",
+              manualReviewSummary(manualReviewStrategy),
+              {
+                preview: createExcerpt(
+                  (
+                    manualReviewStrategy === "feedback_manual_review"
+                      ? blockingFeedbackIssues
+                      : blockingAuditIssues
+                  ).join("；"),
+                  160,
+                ),
+              },
+            ),
+          ]
+        : []),
       step("validation_after_rewrite", "Validation", "write", validationSummary(validation)),
     ],
   };
@@ -3613,18 +5253,147 @@ export async function reviewChapter(
   projectState.phase.write = {
     ...projectState.phase.write,
     status: WRITE_STATUS.CHAPTER_PENDING_REVIEW,
-    pendingReview: {
-      ...pending,
-      requestedAt: nowIso(),
-      runId: rewriteRun.id,
-    },
-    rejectionNotes: [feedback].filter(Boolean),
-    rewriteHistory,
-  };
+      pendingReview: {
+        ...pending,
+        requestedAt: nowIso(),
+        runId: rewriteRun.id,
+      },
+      rejectionNotes: manualReviewRequired
+        ? uniqueTextNotes([
+          ...(manualReviewStrategy === "feedback_manual_review" ? blockingFeedbackIssues : []),
+          ...(manualReviewStrategy === "feedback_manual_review" ? [] : blockingAuditIssues),
+        ])
+        : [feedback].filter(Boolean),
+      rewriteHistory,
+    };
   const savedProject = await store.saveProject(projectState);
   return {
     project: savedProject,
     run: rewriteRun,
-    summary: `${pending.chapterId} 已完成重写，等待再次审查。`,
+    summary: manualReviewRequired
+      ? manualReviewStrategy === "canon_fact_manual_review"
+        ? `${pending.chapterId} 已完成重写，但仍有 canon facts 冲突需要人工确认。`
+        : manualReviewStrategy === "feedback_manual_review"
+          ? `${pending.chapterId} 已完成重写，但反馈仍未完整落实，需要人工确认。`
+        : `${pending.chapterId} 已完成重写，但审计仍未通过，需要人工确认。`
+      : `${pending.chapterId} 已完成重写，等待再次审查。`,
+  };
+}
+
+export async function deleteLatestLockedChapter(store, { chapterId = "" } = {}) {
+  const projectState = await store.loadProject();
+  if (projectState.phase.plan.status !== PLAN_STATUS.LOCKED) {
+    throw new Error("大纲尚未锁定，不能删除已锁定章节。");
+  }
+  if (projectState.phase.write.pendingReview?.chapterId) {
+    throw new Error("当前有待审写作节点，请先完成审查后再删除已锁定章节。");
+  }
+
+  const chapterMetas = await store.listChapterMeta();
+  if (!chapterMetas.length) {
+    throw new Error("当前还没有已锁定章节。");
+  }
+
+  const latestMeta = chapterMetas.at(-1);
+  const latestChapterId = String(latestMeta?.chapter_id || "").trim();
+  const requestedChapterId = String(chapterId || "").trim();
+  if (requestedChapterId && requestedChapterId !== latestChapterId) {
+    throw new Error(`只能删除最新锁定章节 ${latestChapterId}，不能删除 ${requestedChapterId}。`);
+  }
+
+  const committedBundle = await loadCommittedPlanBundle(store);
+  if (!committedBundle) {
+    throw new Error("缺少已锁定的大纲 bundle.json。");
+  }
+
+  const planFinalBundle = await store.loadPlanFinal();
+  const remainingMetas = chapterMetas.slice(0, -1);
+  const previousMeta = remainingMetas.at(-1) || null;
+  const previousDraft = previousMeta
+    ? await store.loadChapterDraft(previousMeta.chapter_id)
+    : null;
+  if (previousMeta && !previousDraft) {
+    throw new Error(`缺少 ${previousMeta.chapter_id} 的章节快照，无法安全回退。`);
+  }
+
+  const restoredWorldState =
+    previousDraft?.worldState ||
+    planFinalBundle?.worldState ||
+    committedBundle.worldState;
+  const restoredForeshadowingRegistry =
+    previousDraft?.foreshadowingRegistry ||
+    planFinalBundle?.foreshadowingRegistry ||
+    committedBundle.foreshadowingRegistry;
+  const restoredCharacterStates = Array.isArray(previousDraft?.characterStates)
+    ? previousDraft.characterStates
+    : (planFinalBundle?.characters || committedBundle.characters || [])
+      .map((character) => character?.state)
+      .filter(Boolean);
+  const restoredLatestChapterPlan =
+    (planFinalBundle?.structureData?.chapters || [])
+      .find((chapter) => chapter?.chapterId === latestChapterId) ||
+    (committedBundle?.structureData?.chapters || [])
+      .find((chapter) => chapter?.chapterId === latestChapterId) ||
+    null;
+  const restoredStructureChapters = (committedBundle?.structureData?.chapters || []).map((chapter) =>
+    chapter?.chapterId === latestChapterId && restoredLatestChapterPlan
+      ? restoredLatestChapterPlan
+      : chapter,
+  );
+
+  await store.removeCommittedChapter(latestChapterId);
+  await store.removeChapterDraft(latestChapterId);
+  await store.writeJson(path.join(store.paths.novelStateDir, "bundle.json"), {
+    ...committedBundle,
+    structureData: {
+      ...(committedBundle.structureData || {}),
+      chapters: restoredStructureChapters,
+    },
+    worldState: restoredWorldState,
+    foreshadowingRegistry: restoredForeshadowingRegistry,
+  });
+  await store.writeJson(
+    path.join(store.paths.novelStateDir, "world_state.json"),
+    restoredWorldState || null,
+  );
+  await store.writeJson(
+    path.join(store.paths.novelStateDir, "foreshadowing_registry.json"),
+    restoredForeshadowingRegistry || null,
+  );
+  await store.replaceCharacterStates(restoredCharacterStates);
+
+  if (remainingMetas.length === 0) {
+    await store.writeText(path.join(store.paths.novelStateDir, "style_guide.md"), DEFAULT_STYLE_GUIDE_MARKDOWN);
+    await store.removeRunsByPhase("write");
+    await store.removeReviewsByTargets([
+      REVIEW_TARGETS.CHAPTER_OUTLINE,
+      REVIEW_TARGETS.CHAPTER,
+    ]);
+  }
+
+  await rebuildFactLedger(store);
+
+  const nextReviewHistory = remainingMetas.length === 0
+    ? (projectState.history.reviews || []).filter((review) =>
+      review?.target !== REVIEW_TARGETS.CHAPTER_OUTLINE && review?.target !== REVIEW_TARGETS.CHAPTER,
+    )
+    : (projectState.history.reviews || []);
+
+  projectState.phase.write = {
+    ...projectState.phase.write,
+    status: WRITE_STATUS.IDLE,
+    lastRunId: remainingMetas.length === 0 ? null : projectState.phase.write.lastRunId,
+    pendingReview: null,
+    currentChapterNumber: previousMeta ? chapterNumberFromId(previousMeta.chapter_id) : 0,
+    rejectionNotes: [],
+    rewriteHistory: [],
+  };
+  projectState.history.reviews = nextReviewHistory;
+
+  const savedProject = await store.saveProject(projectState);
+  return {
+    project: savedProject,
+    run: null,
+    summary: `${latestChapterId} 已删除，当前回退到 ${previousMeta?.chapter_id || "未锁章"} 状态。`,
   };
 }

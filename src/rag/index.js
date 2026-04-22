@@ -8,6 +8,36 @@ const SUPPORTED_ENCODINGS = ["utf-8", "utf-16le", "gb18030"];
 const TARGET_CHUNK_LENGTH = 700;
 const CHUNK_OVERLAP_LENGTH = 120;
 
+async function readJson(filePath, fallback = null) {
+  try {
+    const value = await fs.readFile(filePath, "utf8");
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+async function readJsonLines(filePath, fallback = []) {
+  try {
+    const text = await fs.readFile(filePath, "utf8");
+    const rows = text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+    return rows.length ? rows : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 async function listSourceFiles(dirPath) {
   const entries = await fs.readdir(dirPath, { withFileTypes: true });
   const files = [];
@@ -259,14 +289,39 @@ export async function rebuildRagCollectionIndex({ store, collectionId }) {
 }
 
 export async function loadCollectionChunks(store, collectionIds = []) {
+  return loadCollectionChunksFromWorkspace(store?.paths?.workspaceRoot || store?.paths?.configRootDir, collectionIds);
+}
+
+export async function loadRagCollectionFromWorkspace(rootDir = process.cwd(), collectionId) {
+  const id = String(collectionId || "").trim();
+  if (!id) {
+    return null;
+  }
+
+  const dir = path.join(rootDir, "runtime", "rag_collections", id);
+  const metadata = await readJson(path.join(dir, "metadata.json"), null);
+  if (!metadata) {
+    return null;
+  }
+  const index = await readJson(path.join(dir, "index.json"), {});
+  return {
+    ...metadata,
+    ...index,
+    sourceDir: path.join(dir, "sources"),
+    sourceDirRelative: path.relative(rootDir, path.join(dir, "sources")),
+    chunksPath: path.join(dir, "chunks.jsonl"),
+  };
+}
+
+export async function loadCollectionChunksFromWorkspace(rootDir = process.cwd(), collectionIds = []) {
   const collections = [];
 
   for (const collectionId of collectionIds) {
-    const collection = await store.loadRagCollection(collectionId);
+    const collection = await loadRagCollectionFromWorkspace(rootDir, collectionId);
     if (!collection) {
       continue;
     }
-    const chunks = await store.readRagCollectionChunks(collection.id, []);
+    const chunks = await readJsonLines(collection.chunksPath, []);
     collections.push({
       collection,
       chunks: chunks.map((item) => ({

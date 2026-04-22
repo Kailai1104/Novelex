@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { DEFAULT_PROJECT_STATE } from "../core/defaults.js";
+import { DEFAULT_PROJECT_STATE, DEFAULT_STYLE_GUIDE_MARKDOWN } from "../core/defaults.js";
 import { nowIso } from "../core/text.js";
 import { createPaths } from "./paths.js";
 
@@ -246,6 +246,41 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
     return filePath;
   }
 
+  async function removeRunsByPhase(phase) {
+    const files = await listFilesRecursive(paths.runsDir);
+    for (const filePath of files) {
+      if (!filePath.endsWith(".json")) {
+        continue;
+      }
+      const run = await readJson(filePath, null);
+      if (run?.phase === phase) {
+        await removeIfExists(filePath);
+      }
+    }
+  }
+
+  async function removeReviewsByTargets(targets = []) {
+    const targetSet = new Set(
+      (Array.isArray(targets) ? targets : [])
+        .map((item) => String(item || "").trim())
+        .filter(Boolean),
+    );
+    if (!targetSet.size) {
+      return;
+    }
+
+    const files = await listFilesRecursive(paths.reviewsDir);
+    for (const filePath of files) {
+      if (!filePath.endsWith(".json")) {
+        continue;
+      }
+      const review = await readJson(filePath, null);
+      if (targetSet.has(String(review?.target || "").trim())) {
+        await removeIfExists(filePath);
+      }
+    }
+  }
+
   async function stagePlanDraft(payload) {
     await writeJson(path.join(paths.planStagingDir, "draft.json"), payload);
     await writeText(path.join(paths.planStagingDir, "outline_draft.md"), payload.outlineMarkdown);
@@ -281,10 +316,7 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
       path.join(finalDir, "foreshadowing_registry.json"),
       payload.foreshadowingRegistry,
     );
-    await writeText(
-      path.join(finalDir, "style_guide.md"),
-      "# 风格指南（待第1章通过后生成）\n\n- 当前尚未锁定首章风格，待首章通过后由系统自动生成。\n",
-    );
+    await writeText(path.join(finalDir, "style_guide.md"), DEFAULT_STYLE_GUIDE_MARKDOWN);
 
     for (const character of payload.characters) {
       await writeText(
@@ -339,6 +371,7 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
     const ruleStack = payload.ruleStack || {};
     const contextTrace = payload.contextTrace || payload.trace || {};
     const auditDrift = payload.auditDrift || {};
+    const factContext = payload.factContext || {};
     await ensureDir(chapterDir);
     await writeJson(path.join(chapterDir, "bundle.json"), payload);
     await writeText(path.join(chapterDir, `${payload.chapterId}.md`), payload.chapterMarkdown || "");
@@ -373,6 +406,8 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
     await writeJson(path.join(chapterDir, "selected_chapter_outline.json"), payload.selectedChapterOutline || null);
     await writeJson(path.join(chapterDir, "audit_drift.json"), auditDrift);
     await writeText(path.join(chapterDir, "audit_drift.md"), auditDrift.markdown || "");
+    await writeJson(path.join(chapterDir, "fact_context.json"), factContext);
+    await writeText(path.join(chapterDir, "fact_context.md"), factContext.briefingMarkdown || "");
     await writeJson(
       path.join(chapterDir, "foreshadowing_registry.json"),
       payload.foreshadowingRegistry || null,
@@ -435,6 +470,36 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
     }
 
     return true;
+  }
+
+  async function removeCommittedChapter(chapterId) {
+    const chapterFiles = [
+      path.join(paths.chaptersDir, `${chapterId}.md`),
+      path.join(paths.chaptersDir, `${chapterId}_meta.json`),
+      path.join(paths.chaptersDir, `${chapterId}_outline.json`),
+      path.join(paths.chaptersDir, `${chapterId}_audit_drift.json`),
+      path.join(paths.chaptersDir, `${chapterId}_audit_drift.md`),
+      path.join(paths.chaptersDir, `${chapterId}_facts.json`),
+    ];
+
+    await Promise.all(chapterFiles.map((filePath) => removeIfExists(filePath)));
+  }
+
+  async function removeChapterDraft(chapterId) {
+    await removeDirIfExists(path.join(paths.writeStagingDir, chapterId));
+  }
+
+  async function replaceCharacterStates(states = []) {
+    await removeDirIfExists(paths.charactersDir);
+    await ensureDir(paths.charactersDir);
+
+    for (const state of Array.isArray(states) ? states : []) {
+      const name = String(state?.name || "").trim();
+      if (!name) {
+        continue;
+      }
+      await writeJson(path.join(paths.charactersDir, `${name}_state.json`), state);
+    }
   }
 
   async function listChapterMeta() {
@@ -948,6 +1013,8 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
     saveRun,
     listRuns,
     saveReview,
+    removeRunsByPhase,
+    removeReviewsByTargets,
     stagePlanDraft,
     loadPlanDraft,
     stagePlanFinalCacheEntry,
@@ -960,6 +1027,9 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
     stageChapterDraft,
     loadChapterDraft,
     commitChapterDraft,
+    removeCommittedChapter,
+    removeChapterDraft,
+    replaceCharacterStates,
     listChapterMeta,
     listCommittedChapterOutlines,
     saveStyleFingerprint,

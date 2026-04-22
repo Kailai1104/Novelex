@@ -1,8 +1,9 @@
 import path from "node:path";
 
+import { normalizeLocalRagToolResult } from "../mcp/index.js";
 import { createContextSource, mergeContextSources } from "../core/input-governance.js";
 import { createExcerpt, extractJsonObject, safeJsonParse, unique } from "../core/text.js";
-import { loadCollectionChunks, runHybridRetrieval } from "./index.js";
+import { loadCollectionChunks } from "./index.js";
 
 function normalizeList(values, limit = 8) {
   return unique((Array.isArray(values) ? values : [])
@@ -248,6 +249,7 @@ export function mergeReferenceIntoWriterContext(writerContext, referencePacket) 
 export async function buildReferencePacket({
   store,
   provider,
+  mcpManager,
   project,
   chapterPlan,
   planContext,
@@ -286,12 +288,14 @@ export async function buildReferencePacket({
   }
 
   try {
-    const matches = await runHybridRetrieval({
+    const ragResult = normalizeLocalRagToolResult(await mcpManager.callTool("local_rag", {
+      collectionType: "reference",
+      collectionIds,
       queries: planner.queries,
-      chunks,
       limit: 8,
-      rootDir: store.paths.configRootDir,
-    });
+    }));
+    const matches = Array.isArray(ragResult.matches) ? ragResult.matches : [];
+    warnings.push(...(ragResult.warnings || []));
 
     if (!matches.length) {
       const emptyPacket = createEmptyReferencePacket({
@@ -301,7 +305,7 @@ export async function buildReferencePacket({
         queries: planner.queries,
         focusAspects: planner.focusAspects,
         mustAvoid: planner.mustAvoid,
-        summary: "已执行范文检索，但没有命中高相关片段。",
+        summary: ragResult.summary || "已执行范文检索，但没有命中高相关片段。",
         warnings,
       });
       emptyPacket.briefingMarkdown = buildReferenceMarkdown(emptyPacket);
@@ -346,7 +350,7 @@ export async function buildReferencePacket({
         ...synthesis.avoidPatterns,
         ...planner.mustAvoid,
       ], 8),
-      summary: synthesis.summary,
+      summary: synthesis.summary || ragResult.summary,
       warnings,
     };
     packet.briefingMarkdown = buildReferenceMarkdown(packet);

@@ -70,3 +70,6 @@ export const REVIEW_TARGETS = {
   CHAPTER_OUTLINE: "chapter_outline",
   CHAPTER: "chapter",
 };
+
+export const DEFAULT_STYLE_GUIDE_MARKDOWN =
+  "# 风格指南（待第1章通过后生成）\n\n- 当前尚未锁定首章风格，待首章通过后由系统自动生成。\n";

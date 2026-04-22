@@ -104,6 +104,7 @@ export function buildGovernedChapterIntent({
   foreshadowingAdvice = [],
   researchPacket,
   styleGuideText,
+  factContext = null,
 }) {
   const hookAgenda = buildHookAgenda({
     chapterPlan,
@@ -133,7 +134,8 @@ export function buildGovernedChapterIntent({
       ...(planContext?.outline?.mustPreserve || []),
       ...(planContext?.world?.continuityAnchors || []),
       ...(historyPacket?.mustNotContradict || []),
-    ], 10),
+      ...(factContext?.establishedFacts || []).map((f) => `已定事实[${f.factId}]：${f.subject}｜${f.assertion}`),
+    ], 14),
     mustAvoid: normalizeList([
       ...(planContext?.characters?.forbiddenLeaks || []),
       ...(planContext?.outline?.deferUntilLater || []).map((item) => `不要提前兑现：${item}`),
@@ -141,7 +143,8 @@ export function buildGovernedChapterIntent({
       ...(researchPacket?.factsToAvoid || []).map((item) => `不要写成：${item}`),
       ...(researchPacket?.uncertainPoints || []).map((item) => `未核实时不要写死：${item}`),
       ...hookAgenda.avoidNewHookFamilies.map((item) => `存在旧债压力时，不要新增${item}`),
-    ], 10),
+      ...(factContext?.establishedFacts || []).map((f) => `禁止否认/重置已定事实[${f.factId}]：${f.assertion}`),
+    ], 14),
     styleEmphasis: normalizeList([
       ...extractStyleGuideSignals(styleGuideText),
       ...(planContext?.world?.styleRules || []),
@@ -160,6 +163,7 @@ export function buildContextPackage({
   researchPacket,
   referencePacket,
   openingReferencePacket,
+  factContext = null,
 }) {
   const researchSource = researchPacket?.triggered
     ? createContextSource({
@@ -182,6 +186,13 @@ export function buildContextPackage({
       excerpt: item.excerpt || item.text || "",
     }))
     .filter(Boolean);
+  const factSources = (factContext?.establishedFacts || [])
+    .map((item) => createContextSource({
+      source: `novel_state/fact_ledger.json`,
+      reason: `已定事实[${item.factId}]，来自${item.chapterId}，后文不能否认或重置。`,
+      excerpt: item.assertion,
+    }))
+    .filter(Boolean);
 
   return {
     chapter: Number(chapterPlan?.chapterNumber || 0),
@@ -193,6 +204,7 @@ export function buildContextPackage({
       researchSource ? [researchSource] : [],
       referenceSources,
       openingReferenceSources,
+      factSources,
     ], 16),
   };
 }
@@ -205,7 +217,20 @@ export function buildRuleStack({
   researchPacket,
   referencePacket,
   openingReferencePacket,
+  factContext = null,
 }) {
+  const factHardFacts = [];
+  const factSoftGoals = [];
+
+  if (factContext) {
+    for (const fact of factContext.establishedFacts || []) {
+      factHardFacts.push(`已定事实[${fact.factId}]：${fact.subject}｜${fact.assertion}`);
+    }
+    for (const fact of factContext.openTensions || []) {
+      factSoftGoals.push(`开放张力[${fact.factId}]：${fact.subject}｜${fact.assertion}（可继续发酵，不可改写底层结论）`);
+    }
+  }
+
   return {
     chapter: Number(chapterPlan?.chapterNumber || chapterIntent?.chapter || 0),
     chapterId: String(chapterPlan?.chapterId || chapterIntent?.chapterId || "").trim(),
@@ -216,7 +241,8 @@ export function buildRuleStack({
       ...(chapterPlan?.continuityAnchors || []),
       ...(planContext?.world?.worldConstraints || []),
       ...(researchPacket?.factsToUse || []).map((item) => `考据事实：${item}`),
-    ], 14),
+      ...factHardFacts,
+    ], 18),
     softGoals: normalizeList([
       chapterIntent?.goal || "",
       ...(chapterPlan?.keyEvents || []),
@@ -232,7 +258,8 @@ export function buildRuleStack({
       ...(openingReferencePacket?.structuralBeats || []).map((item) => `黄金三章结构拍点：${item}`),
       ...(chapterIntent?.hookAgenda?.mustAdvance || []).map((item) => `本章必须推进伏笔 ${item}`),
       ...(chapterIntent?.hookAgenda?.eligibleResolve || []).map((item) => `本章允许兑现伏笔 ${item}`),
-    ], 14),
+      ...factSoftGoals,
+    ], 18),
     deferRules: normalizeList([
       ...(planContext?.outline?.deferUntilLater || []),
       ...(chapterIntent?.mustAvoid || []),

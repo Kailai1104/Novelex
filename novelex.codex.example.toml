@@ -1,10 +1,33 @@
-model_provider = "OpenAI"
-model = "gpt-5.4"
-review_model = "gpt-5.4"
-codex_model = "gpt-5.3-codex"
+model_provider = "MiniMax"
+model = "MiniMax-M2.5-highspeed"
+review_model = "MiniMax-M2.5-highspeed"
+codex_model = "MiniMax-M2.5-highspeed"
 model_reasoning_effort = "xhigh"
 disable_response_storage = true
 zhipu_api_key = "YOUR_ZHIPU_API_KEY"
+force_stream = false
+
+[mcp]
+enabled = true
+
+[mcp.servers.web_search]
+enabled = true
+transport = "stdio"
+command = "npx"
+args = ["-y", "minimax-coding-plan-mcp"]
+startup_timeout_ms = 60000
+call_timeout_ms = 30000
+
+[mcp.servers.web_search.env]
+MINIMAX_API_HOST = "https://api.minimaxi.com"
+
+[mcp.servers.local_rag]
+enabled = true
+transport = "stdio"
+command = "node"
+args = ["src/mcp/servers/local-rag.js"]
+startup_timeout_ms = 10000
+call_timeout_ms = 30000
 
 [model_providers.OpenAI]
 name = "OpenAI"
@@ -15,3 +38,15 @@ review_model = "gpt-5.4"
 codex_model = "gpt-5.3-codex"
 requires_openai_auth = true
 api_key = "YOUR_OPENAI_API_KEY"
+
+[model_providers.MiniMax]
+name = "MiniMax"
+base_url = "https://api.minimaxi.com/v1"
+wire_api = "chat_completions"
+response_model = "MiniMax-M2.5-highspeed"
+review_model = "MiniMax-M2.5-highspeed"
+codex_model = "MiniMax-M2.5-highspeed"
+api_key = "YOUR_MINIMAX_API_KEY"
+max_concurrency = 1
+request_timeout_ms = 300000
+overload_retry_window_ms = 1800000

@@ -131,6 +131,147 @@ export function createExcerpt(text, maxLength = 160) {
   return `${normalized.slice(0, maxLength)}...`;
 }
 
+export function splitChapterMarkdown(markdown = "", fallbackTitle = "") {
+  const normalized = String(markdown || "").replace(/\r\n?/g, "\n");
+  const lines = normalized.split("\n");
+  const headingMatch = lines[0]?.match(/^#\s+(.+)$/);
+
+  if (!headingMatch) {
+    return {
+      title: String(fallbackTitle || "").trim(),
+      titleLine: String(fallbackTitle || "").trim() ? `# ${String(fallbackTitle || "").trim()}` : "",
+      body: normalized,
+    };
+  }
+
+  return {
+    title: String(headingMatch[1] || fallbackTitle || "").trim(),
+    titleLine: lines[0],
+    body: lines.slice(1).join("\n").replace(/^\n+/, ""),
+  };
+}
+
+export function composeChapterMarkdown(title = "", body = "") {
+  const normalizedBody = String(body || "").replace(/\r\n?/g, "\n");
+  const normalizedTitle = String(title || "").trim();
+
+  if (!normalizedTitle) {
+    return normalizedBody.trim();
+  }
+
+  return normalizedBody ? `# ${normalizedTitle}\n\n${normalizedBody}` : `# ${normalizedTitle}`;
+}
+
+export function sanitizeRevisionFragment(text = "") {
+  let source = String(text || "").replace(/\r\n?/g, "\n").trim();
+  if (!source) {
+    return "";
+  }
+
+  const fencedMatch = source.match(/^```(?:[\w-]+)?\s*\n?([\s\S]*?)\n?```$/);
+  if (fencedMatch) {
+    source = String(fencedMatch[1] || "").trim();
+  }
+
+  const lines = source.split("\n");
+  while (lines.length) {
+    const line = String(lines[0] || "").trim();
+    if (!line) {
+      lines.shift();
+      continue;
+    }
+
+    const labelWithContent = line.match(/^(?:替换片段|修订后|修改后|输出|正文片段|新的内容)[:：]\s*(.+)$/);
+    if (labelWithContent) {
+      lines[0] = labelWithContent[1];
+      break;
+    }
+
+    if (
+      /^#{1,6}\s+/.test(line) ||
+      /^(?:替换片段|修订后|修改后|输出|正文片段|新的内容)[:：]?$/.test(line)
+    ) {
+      lines.shift();
+      continue;
+    }
+
+    break;
+  }
+
+  return lines.join("\n").trim();
+}
+
+export function locateSelectedText(text = "", selection = {}) {
+  const source = String(text || "").replace(/\r\n?/g, "\n");
+  const selectedText = String(selection?.selectedText || "").replace(/\r\n?/g, "\n");
+  const prefixContext = String(selection?.prefixContext || "").replace(/\r\n?/g, "\n");
+  const suffixContext = String(selection?.suffixContext || "").replace(/\r\n?/g, "\n");
+
+  if (!selectedText) {
+    throw new Error("未提供可替换的选中文本。");
+  }
+
+  const candidates = [];
+  let cursor = source.indexOf(selectedText);
+  while (cursor !== -1) {
+    candidates.push({
+      start: cursor,
+      end: cursor + selectedText.length,
+    });
+    cursor = source.indexOf(selectedText, cursor + 1);
+  }
+
+  if (!candidates.length) {
+    throw new Error("选中的原文片段无法在当前正文中定位，请重新选择。");
+  }
+
+  if (candidates.length === 1) {
+    return {
+      ...candidates[0],
+      occurrenceCount: 1,
+    };
+  }
+
+  const prefixMatches = prefixContext
+    ? candidates.filter((candidate) =>
+        source.slice(Math.max(0, candidate.start - prefixContext.length), candidate.start) === prefixContext)
+    : candidates;
+  const suffixMatches = suffixContext
+    ? candidates.filter((candidate) =>
+        source.slice(candidate.end, candidate.end + suffixContext.length) === suffixContext)
+    : candidates;
+  const anchoredMatches = candidates.filter((candidate) => {
+    const prefixPassed = !prefixContext ||
+      source.slice(Math.max(0, candidate.start - prefixContext.length), candidate.start) === prefixContext;
+    const suffixPassed = !suffixContext ||
+      source.slice(candidate.end, candidate.end + suffixContext.length) === suffixContext;
+    return prefixPassed && suffixPassed;
+  });
+
+  const resolved = [anchoredMatches, prefixMatches, suffixMatches].find((items) => items.length === 1);
+  if (resolved) {
+    return {
+      ...resolved[0],
+      occurrenceCount: candidates.length,
+    };
+  }
+
+  throw new Error("选中的原文片段出现多处匹配，当前锚点仍不够唯一，请缩小范围后重试。");
+}
+
+export function replaceSelectionInChapterMarkdown(markdown = "", selection = {}, replacement = "", fallbackTitle = "") {
+  const parts = splitChapterMarkdown(markdown, fallbackTitle);
+  const range = locateSelectedText(parts.body, selection);
+  const nextBody = `${parts.body.slice(0, range.start)}${replacement}${parts.body.slice(range.end)}`;
+
+  return {
+    title: parts.title,
+    body: nextBody,
+    selectionRange: range,
+    markdown: composeChapterMarkdown(parts.title || fallbackTitle, nextBody),
+  };
+}
+
 export function unique(values) {
   return [...new Set(values.filter(Boolean))];
 }

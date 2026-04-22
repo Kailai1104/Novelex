@@ -72,6 +72,13 @@ export const AUDIT_DIMENSIONS = [
     promptFocus: "检查单章内部是否空转、概述过多、重复推进、段落拼接痕迹重或节奏失衡。",
   },
   {
+    id: "chapter_word_count",
+    label: "Chapter Word Count",
+    category: "章节字数",
+    legacyBucket: "plausibility",
+    promptFocus: "检查章节字数是否与项目目标字数显著偏离，避免正文过短导致事件落地不足，或过长导致单章失控、注水与节奏拖沓。",
+  },
+  {
     id: "sequence_monotony",
     label: "Sequence Monotony",
     category: "节奏单调",
@@ -95,6 +102,13 @@ export const AUDIT_DIMENSIONS = [
     promptFocus: "检查本章在段落节奏、对白密度、叙述质感上是否与既有风格指纹偏离过大。",
     window: 3,
   },
+  {
+    id: "canon_fact_continuity",
+    label: "Canon Fact Continuity",
+    category: "既定事实连续性",
+    legacyBucket: "consistency",
+    promptFocus: "检查正文是否否认、重置、重发明已确立事实；是否把已执行过的命令写成首次提出；是否把可继续争执的执行细节误写成底层结论重新未定。",
+  },
 ];
 
 export function getAuditDimension(id) {
@@ -114,6 +128,7 @@ export function resolveAuditDimensions({
   chapterMetas = [],
   foreshadowingRegistry = null,
   historyPacket = null,
+  factContext = null,
 }) {
   const unresolved = unresolvedForeshadowings(foreshadowingRegistry);
   const enabled = [];
@@ -152,6 +167,16 @@ export function resolveAuditDimensions({
       reason = active
         ? "存在风格指南或既有章节，可做风格指纹对照。"
         : "缺少风格基准，暂不启用。";
+    } else if (dimension.id === "chapter_word_count") {
+      active = Number(project?.targetWordsPerChapter || 0) > 0;
+      reason = active
+        ? `项目设置了目标单章字数 ${Number(project.targetWordsPerChapter)}。`
+        : "项目未设置目标单章字数，暂不启用。";
+    } else if (dimension.id === "canon_fact_continuity") {
+      active = Array.isArray(factContext?.establishedFacts) && factContext.establishedFacts.length > 0;
+      reason = active
+        ? `存在 ${factContext.establishedFacts.length} 条已定事实需要检查连续性。`
+        : "当前没有已定事实需要检查连续性，暂不启用。";
     }
 
     if (!active) {

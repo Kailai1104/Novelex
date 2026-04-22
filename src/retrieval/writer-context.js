@@ -1,6 +1,12 @@
 import path from "node:path";
 
 import { createContextSource, mergeContextSources } from "../core/input-governance.js";
+import {
+  buildFactContextMarkdown,
+  buildFactContextPacket,
+  loadFactLedger,
+  runFactSelectorAgent,
+} from "../core/facts.js";
 import { createExcerpt, extractJsonObject, nowIso, safeJsonParse, unique } from "../core/text.js";
 
 const OUTLINE_EXCERPT_LIMIT = 4200;
@@ -483,7 +489,7 @@ function buildHistoryContextMarkdown(chapterPlan, historyContext) {
   ].join("\n");
 }
 
-function buildWriterContextPacket(chapterPlan, planContext, historyContext) {
+function buildWriterContextPacket(chapterPlan, planContext, historyContext, factContext = null) {
   const priorities = normalizeStringArray([
     ...(planContext?.outline?.chapterObligations || []),
     ...(planContext?.world?.foreshadowingTasks || []),
@@ -491,13 +497,15 @@ function buildWriterContextPacket(chapterPlan, planContext, historyContext) {
     ...(historyContext?.carryOverFacts || []),
     ...(historyContext?.openThreads || []),
     ...(historyContext?.auditDriftWarnings || []),
-  ], 10);
+    ...(factContext?.establishedFacts || []).map((f) => `已定事实[${f.factId}]：${f.subject}｜${f.assertion}`),
+  ], 12);
   const risks = normalizeStringArray([
     ...(planContext?.outline?.continuityRisks || []),
     ...(planContext?.characters?.forbiddenLeaks || []),
     ...(historyContext?.mustNotContradict || []),
     ...(historyContext?.auditDriftWarnings || []),
-  ], 10);
+    ...(factContext?.establishedFacts || []).map((f) => `禁止否认[${f.factId}]：${f.assertion}`),
+  ], 12);
   const generationNotes = normalizeStringArray([
     ...(planContext?.warnings || []),
     ...(historyContext?.warnings || []),
@@ -509,6 +517,9 @@ function buildWriterContextPacket(chapterPlan, planContext, historyContext) {
   const sourceLines = selectedSources
     .map((item) => `- ${item.source}｜${item.reason}｜${item.excerpt || "无摘录"}`)
     .join("\n");
+  const factBlock = factContext?.briefingMarkdown
+    ? ["## 既定事实与开放张力", factContext.briefingMarkdown]
+    : [];
   const markdown = [
     `# ${chapterPlan.chapterId} Writer 上下文包`,
     "",
@@ -517,6 +528,7 @@ function buildWriterContextPacket(chapterPlan, planContext, historyContext) {
     "",
     "## 连续性风险",
     `- ${risks.join("\n- ") || "无"}`,
+    ...factBlock,
     "",
     "## 计划侧摘要",
     planContext?.briefingMarkdown || "无",
@@ -1162,10 +1174,33 @@ export async function buildWriterContextBundle({
     }),
   ]);
 
-  const writerContext = buildWriterContextPacket(chapterPlan, planContext, historyContext);
+  let factContext = null;
+  try {
+    const factLedger = await loadFactLedger(store);
+    if (factLedger.length > 0) {
+      const selection = await runFactSelectorAgent({
+        provider,
+        project,
+        chapterPlan,
+        factLedger,
+      });
+      factContext = buildFactContextPacket({
+        chapterPlan,
+        establishedFacts: selection.establishedFacts,
+        openTensions: selection.openTensions,
+        selectionRationale: selection.selectionRationale,
+        catalogStats: selection.catalogStats,
+      });
+    }
+  } catch {
+    factContext = null;
+  }
+
+  const writerContext = buildWriterContextPacket(chapterPlan, planContext, historyContext, factContext);
   return {
     planContext,
     historyContext,
     writerContext,
+    factContext,
   };
 }

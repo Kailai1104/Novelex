@@ -554,6 +554,7 @@ export async function runChapterAudit({
   foreshadowingRegistry = null,
   chapterMetas = null,
   factContext = null,
+  semanticMode = "full",
 }) {
   const metas = Array.isArray(chapterMetas) ? chapterMetas : await store.listChapterMeta();
   const recentChapters = await loadRecentChapters(
@@ -582,30 +583,30 @@ export async function runChapterAudit({
     recentChapters,
   });
 
-  let semantic = {
-    summary: "",
-    issues: [],
-    dimensionSummaries: {},
-    source: "agent",
-    error: null,
-    attempts: 0,
-  };
-
-  semantic = await runSemanticAuditWithRetry({
-    provider,
-    project,
-    chapterPlan,
-    chapterDraft,
-    historyPacket,
-    foreshadowingAdvice,
-    researchPacket,
-    styleGuideText,
-    activeDimensions,
-    heuristics,
-    recentChapters,
-    characterStates,
-    factContext,
-  });
+  const semantic = semanticMode === "heuristics_only"
+    ? {
+      summary: "",
+      issues: [],
+      dimensionSummaries: {},
+      source: "heuristics_only",
+      error: "Semantic audit skipped by caller.",
+      attempts: 0,
+    }
+    : await runSemanticAuditWithRetry({
+      provider,
+      project,
+      chapterPlan,
+      chapterDraft,
+      historyPacket,
+      foreshadowingAdvice,
+      researchPacket,
+      styleGuideText,
+      activeDimensions,
+      heuristics,
+      recentChapters,
+      characterStates,
+      factContext,
+    });
 
   const issues = dedupeIssues([
     ...heuristics.issues,

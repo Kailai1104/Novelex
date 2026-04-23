@@ -13,7 +13,7 @@ import { closeAllWorkspaceMcpManagers } from "../src/mcp/index.js";
 import { buildOpeningReferencePacket } from "../src/opening/reference.js";
 import { generateStyleFingerprint } from "../src/orchestration/style-fingerprint.js";
 import { reviewPlanDraft, reviewPlanFinal, runPlanDraft } from "../src/orchestration/plan.js";
-import { deleteLatestLockedChapter, reviewChapter, runWriteChapter } from "../src/orchestration/write.js";
+import { deleteLatestLockedChapter, reviewChapter, runWriteChapter, saveManualChapterEdit } from "../src/orchestration/write.js";
 import { rebuildOpeningCollectionIndex } from "../src/opening/index.js";
 import { rebuildRagCollectionIndex } from "../src/rag/index.js";
 import { createZhipuEmbeddingClient } from "../src/rag/zhipu.js";
@@ -1261,6 +1261,63 @@ async function withStubbedOpenAI(callback) {
       });
     }
 
+    if (instructions.includes("ChapterOutlineSyncAgent")) {
+      const chapterMatch = inputText.match(/当前章节：(ch\d+)/);
+      const chapterId = chapterMatch?.[1] || "ch001";
+      const chapterNumber = Number(chapterId.replace(/[^\d]/g, "") || 1);
+      const selectedForeshadowingIds = [...new Set(
+        [...inputText.matchAll(/fsh_\d+/g)].map((match) => match[0]).filter(Boolean),
+      )].slice(0, 1);
+      return jsonResponse({
+        output_text: JSON.stringify({
+          proposalId: "proposal_lock_sync",
+          summary: "按最终正文重建的锁章细纲会把已落地压力重新压实。",
+          rationale: "最终正文已经把命令、执行和后续压力写得比原细纲更具体，需要回写给后续章节继承。",
+          diffSummary: "从原候选的泛化试探，改成以最终正文中已经落地的命令与后续压力为主。",
+          timeInStory: `故事第${chapterNumber}日·锁章定稿`,
+          povCharacter: "李凡",
+          location: "赤屿内港·锁章定稿版",
+          keyEvents: ["李凡把最终命令压实到执行层", "宋应星把方案直接钉到现场", "章末留下锁章后的下一步硬压力"],
+          arcContribution: ["李凡的控制力开始转成具体代价", "合作关系被压进执行层面"],
+          nextHook: "锁章后的下一步压力已经钉死。",
+          emotionalTone: "冷硬压迫",
+          threadMode: "single_spine",
+          dominantThread: "锁章正文确认李凡把局势压实，并把更高压力递给下一章。",
+          entryLink: "承接锁章正文里已经落地的直接命令与现场余波。",
+          exitPressure: "锁章后的下一步压力已经钉死。",
+          charactersPresent: ["李凡", "宋应星", "郑芝龙"],
+          continuityAnchors: ["必须以最终正文为准", "不能回退到旧章纲"],
+          foreshadowingActionIds: selectedForeshadowingIds,
+          scenes: [
+            {
+              label: "锁章压实",
+              location: "赤屿内港·议事棚",
+              focus: "把最终正文里的直接命令压成现场共识",
+              tension: "所有人都知道这次不能再留余地",
+              characters: ["李凡", "宋应星"],
+              threadId: "main",
+              scenePurpose: "让锁章后的事实成为下章必须继承的起点",
+              inheritsFromPrevious: "承接最终正文里已经落地的命令与安排",
+              outcome: "现场执行链被彻底钉死",
+              handoffToNext: "把更高一级的压力推到郑芝龙面前",
+            },
+            {
+              label: "锁章递压",
+              location: "赤屿内港·码头",
+              focus: "把更高压力直接递给下一章",
+              tension: "合作与代价一起压上桌面",
+              characters: ["李凡", "郑芝龙"],
+              threadId: "main",
+              scenePurpose: "把锁章正文的结果递交给下一章",
+              inheritsFromPrevious: "承接执行链被钉死后的外部回应",
+              outcome: "下一步硬压力已经摆到所有人面前",
+              handoffToNext: "把锁章后的下一步压力交给下一章",
+            },
+          ],
+        }),
+      });
+    }
+
     if (instructions.includes("HistoryContextAgent")) {
       return jsonResponse({
         output_text: JSON.stringify({
@@ -1598,6 +1655,7 @@ test("Novelex workflows can complete a full draft-and-approve cycle", async () =
     approved: true,
     feedback: "",
   });
+  const lockedStagedChapterDraft = await store.loadChapterDraft("ch001");
 
   assert.equal(chapterLocked.project.phase.write.currentChapterNumber, 1);
 
@@ -1645,8 +1703,68 @@ test("Novelex workflows can complete a full draft-and-approve cycle", async () =
   assert.ok(outlineCandidatesExists[0].chapterPlan.scenes[0].inheritsFromPrevious);
   assert.equal(selectedOutlineExists.mode, "single");
   assert.equal(selectedOutlineExists.selectedProposalId, outlineDraft.chapterOutlineCandidates[0].proposalId);
+  assert.equal(selectedOutlineExists.source, "post_lock_sync");
+  assert.equal(selectedOutlineExists.syncedFrom.source, "manual_selection");
+  assert.match(selectedOutlineExists.chapterPlan.dominantThread, /锁章正文确认/);
   assert.equal(committedOutlineExists.chapterPlan.threadMode, "single_spine");
   assert.ok(committedOutlineExists.chapterPlan.entryLink);
+  assert.equal(committedOutlineExists.source, "post_lock_sync");
+  assert.match(committedOutlineExists.chapterPlan.dominantThread, /锁章正文确认/);
+  assert.deepEqual(lockedStagedChapterDraft.chapterMeta.key_events, committedOutlineExists.chapterPlan.keyEvents);
+  assert.equal(lockedStagedChapterDraft.chapterMeta.next_hook, committedOutlineExists.chapterPlan.nextHook);
+  assert.deepEqual(
+    lockedStagedChapterDraft.foreshadowingRegistry.foreshadowings
+      .filter((item) => item.last_touched_chapter === "ch001")
+      .map((item) => item.id),
+    committedOutlineExists.chapterPlan.foreshadowingActions.map((item) => item.id),
+  );
+})));
+
+test("chapter approval blocks locking when post-lock outline sync fails", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-lock-sync-fail-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+  await runWriteChapterThroughOutline(store);
+
+  const bundlePath = path.join(tempRoot, "novel_state", "bundle.json");
+  const bundleBefore = await fs.readFile(bundlePath, "utf8");
+  const previousFetch = globalThis.fetch;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    if (instructions.includes("ChapterOutlineSyncAgent")) {
+      return jsonResponse({
+        output_text: "not valid json",
+      });
+    }
+    return previousFetch(url, options);
+  };
+
+  try {
+    await assert.rejects(
+      reviewChapter(store, {
+        target: "chapter",
+        approved: true,
+        feedback: "",
+      }),
+      /锁章前细纲同步失败/u,
+    );
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const projectState = await store.loadProject();
+  const bundleAfter = await fs.readFile(bundlePath, "utf8");
+  assert.equal(projectState.phase.write.currentChapterNumber, 0);
+  assert.equal(projectState.phase.write.status, "chapter_pending_review");
+  assert.equal(projectState.phase.write.pendingReview?.chapterId, "ch001");
+  assert.equal(bundleAfter, bundleBefore);
+  await assert.rejects(fs.access(path.join(tempRoot, "novel_state", "chapters", "ch001.md")));
+  await assert.rejects(fs.access(path.join(tempRoot, "novel_state", "chapters", "ch001_outline.json")));
 })));
 
 test("deleteLatestLockedChapter removes the latest committed chapter and restores prior write state", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
@@ -1875,14 +1993,15 @@ test("chapter outline planning reads committed outline history and continuity pr
       sawHistoryPlanningPrompt = true;
       assert.match(inputText, /全历史总览：/);
       assert.match(inputText, /ch001/);
-      assert.match(inputText, /场景链：/);
+      assert.match(inputText, /锁章正文确认李凡把局势压实/);
     }
 
     if (!sawContinuityPrompt && instructions.includes("ChapterContinuityAgent")) {
       sawContinuityPrompt = true;
       assert.match(inputText, /上一章定稿细纲：/);
       assert.match(inputText, /章节：ch001/);
-      assert.match(inputText, /章末压力：/);
+      assert.match(inputText, /锁章正文确认李凡把局势压实/);
+      assert.match(inputText, /锁章后的下一步压力已经钉死/);
     }
 
     return previousFetch(url, options);
@@ -2141,6 +2260,48 @@ test("chapter review supports partial rewrite with revision agent context and se
   assert.equal(rewrittenDraft.rewriteHistory[0].feedbackSupervisionPassed, true);
   assert.match(rewrittenLines[1], /李凡把话压得更低/);
   assert.doesNotMatch(rewrittenLines[1], new RegExp(selectedText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+})));
+
+test("chapter review supports saving direct human edits to the staged chapter body", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-manual-edit-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+  await runWriteChapterThroughOutline(store);
+
+  const originalDraft = await store.loadChapterDraft("ch001");
+  const originalTitle = originalDraft.chapterMarkdown.split("\n\n")[0];
+  const originalBody = originalDraft.chapterMarkdown.replace(/^#.+\n\n/u, "");
+  const editedBody = `${originalBody}\n\n李凡把最后一句压得更稳，先把试探藏进了呼吸里。`;
+  const previousFetch = globalThis.fetch;
+  let manualEditFetchCalls = 0;
+
+  globalThis.fetch = async (...args) => {
+    manualEditFetchCalls += 1;
+    return previousFetch(...args);
+  };
+
+  try {
+    const saveRun = await saveManualChapterEdit(store, {
+      chapterBody: editedBody,
+    });
+
+    assert.equal(saveRun.project.phase.write.status, "chapter_pending_review");
+    assert.ok(saveRun.run?.steps?.some((item) => item.id === "manual_edit_save"));
+    assert.equal(manualEditFetchCalls, 0);
+
+    const savedDraft = await store.loadChapterDraft("ch001");
+    assert.equal(savedDraft.chapterMarkdown.split("\n\n")[0], originalTitle);
+    assert.match(savedDraft.chapterMarkdown, /李凡把最后一句压得更稳/);
+    assert.equal(savedDraft.reviewState.mode, "manual_edit");
+    assert.equal(savedDraft.reviewState.feedbackSupervisionPassed, true);
+    assert.equal(savedDraft.validation.semanticAudit.source, "heuristics_only");
+    assert.equal(savedDraft.rewriteHistory.at(-1)?.mode, "manual_edit");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
 })));
 
 test("partial rewrite retries when the first revision is a no-op", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {

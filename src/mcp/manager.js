@@ -57,6 +57,16 @@ function ensureTextFile(filePath, content = "") {
   }
 }
 
+function readExplicitEnvValue(envBlock = {}, keys = []) {
+  for (const key of keys) {
+    const value = String(envBlock?.[key] || "").trim();
+    if (value) {
+      return value;
+    }
+  }
+  return "";
+}
+
 function resolveMiniMaxHost(fileData = {}) {
   const explicit = String(
     fileData?.mcp?.servers?.web_search?.env?.MINIMAX_API_HOST ||
@@ -101,11 +111,8 @@ function buildServerEnv(serverId, serverConfig, rootDir, fileData) {
     }
     merged.MINIMAX_API_HOST = resolveMiniMaxHost(fileData);
     const npmHomeDir = path.join(rootDir, "runtime", "npm-home");
-    const npmCacheDir = String(
-      merged.npm_config_cache ||
-      merged.NPM_CONFIG_CACHE ||
-      path.join(rootDir, "runtime", "npm-cache"),
-    ).trim();
+    const npmCacheDir = readExplicitEnvValue(serverConfig.env, ["npm_config_cache", "NPM_CONFIG_CACHE"]) ||
+      path.join(rootDir, "runtime", "npm-cache");
     const npmUserConfigPath = path.join(npmHomeDir, ".npmrc");
     const xdgCacheDir = path.join(rootDir, "runtime", "xdg-cache");
     if (npmCacheDir) {

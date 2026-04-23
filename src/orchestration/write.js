@@ -2842,6 +2842,271 @@ function normalizeOutlineProposal(rawProposal, index, {
   };
 }
 
+function selectedOutlineSourceFromMode(mode = "") {
+  return String(mode || "").trim() === "composed" ? "manual_composed" : "manual_selection";
+}
+
+function inferSelectedOutlineSource(selectedChapterOutline = null) {
+  const explicitSource = String(selectedChapterOutline?.source || "").trim();
+  if (explicitSource) {
+    return explicitSource;
+  }
+  return selectedOutlineSourceFromMode(selectedChapterOutline?.mode);
+}
+
+function normalizeLockSyncedForeshadowingActions(baseActions = [], parsed = null) {
+  const normalizedBase = Array.isArray(baseActions) ? baseActions : [];
+  const rawEntries = Array.isArray(parsed?.foreshadowingActions) ? parsed.foreshadowingActions : [];
+  const actionKeys = new Set(
+    rawEntries
+      .map((item) => {
+        if (!item || typeof item !== "object") {
+          return "";
+        }
+        const id = String(item.id || "").trim();
+        const action = String(item.action || "").trim();
+        return id && action ? `${id}:${action}` : "";
+      })
+      .filter(Boolean),
+  );
+  const actionIds = new Set([
+    ...(Array.isArray(parsed?.foreshadowingActionIds) ? parsed.foreshadowingActionIds : []),
+    ...rawEntries.map((item) => (typeof item === "string" ? item : item?.id)),
+  ]
+    .map((item) => String(item || "").trim())
+    .filter(Boolean));
+
+  if (!actionKeys.size && !actionIds.size) {
+    return normalizedBase;
+  }
+
+  const filtered = normalizedBase.filter((item) => {
+    const actionKey = `${String(item?.id || "").trim()}:${String(item?.action || "").trim()}`;
+    return actionKeys.size ? actionKeys.has(actionKey) : actionIds.has(String(item?.id || "").trim());
+  });
+
+  return filtered.length ? filtered : normalizedBase;
+}
+
+function buildLockedOutlineSyncHistoryEntry(selectedChapterOutline = null, syncedOutline = null) {
+  return {
+    at: nowIso(),
+    action: "post_lock_sync",
+    source: inferSelectedOutlineSource(selectedChapterOutline),
+    sourceMode: String(selectedChapterOutline?.mode || "").trim() || "single",
+    selectedProposalId: selectedChapterOutline?.selectedProposalId ?? null,
+    selectedSceneRefs: Array.isArray(selectedChapterOutline?.selectedSceneRefs)
+      ? selectedChapterOutline.selectedSceneRefs
+      : [],
+    authorNotes: String(selectedChapterOutline?.authorNotes || "").trim(),
+    synchronizedSummary: String(syncedOutline?.summary || "").trim(),
+  };
+}
+
+async function runLockedChapterOutlineSyncAgent({
+  provider,
+  project,
+  bundle,
+  draftBundle,
+}) {
+  const baseChapterPlan = draftBundle?.chapterPlan || null;
+  if (!baseChapterPlan?.chapterId) {
+    throw new Error("锁章前缺少当前章节的 chapterPlan，无法同步细纲。");
+  }
+
+  const chapterOutlineContext = draftBundle?.chapterOutlineContext || {};
+  const selectedChapterOutline = draftBundle?.selectedChapterOutline || null;
+  const factSections = buildFactPromptSections(draftBundle?.factContext || null);
+  const originalOutlineSummary = selectedChapterOutline
+    ? [
+      `模式：${selectedChapterOutline.mode || "single"}`,
+      `来源：${inferSelectedOutlineSource(selectedChapterOutline)}`,
+      `摘要：${selectedChapterOutline.summary || "无"}`,
+      `理由：${selectedChapterOutline.rationale || "无"}`,
+      `差异说明：${selectedChapterOutline.diffSummary || "无"}`,
+      `原 selectedProposalId：${selectedChapterOutline.selectedProposalId || "无"}`,
+      `原 selectedSceneRefs：${(selectedChapterOutline.selectedSceneRefs || []).join("；") || "无"}`,
+    ].join("\n")
+    : "无";
+  const currentPlanSummary = [
+    `章节：${baseChapterPlan.chapterId} ${baseChapterPlan.title}`,
+    `阶段：${baseChapterPlan.stage || "无"}`,
+    `POV：${baseChapterPlan.povCharacter || "无"}`,
+    `地点：${baseChapterPlan.location || "无"}`,
+    `当前关键事件：${(baseChapterPlan.keyEvents || []).join("；") || "无"}`,
+    `当前主线：${baseChapterPlan.dominantThread || "无"}`,
+    `当前入口承接：${baseChapterPlan.entryLink || "无"}`,
+    `当前出口压力：${baseChapterPlan.exitPressure || baseChapterPlan.nextHook || "无"}`,
+    `当前场景链：${(baseChapterPlan.scenes || []).map(sceneChainDigest).join(" || ") || "无"}`,
+  ].join("\n");
+  const outlineContextSummary = [
+    `阶段任务：${chapterOutlineContext?.stagePlanning?.chapterMission || "无"}`,
+    `必须落地：${(chapterOutlineContext?.stagePlanning?.requiredBeats || []).join("；") || "无"}`,
+    `角色压力：${(chapterOutlineContext?.characterPlanning?.relationshipPressures || []).join("；") || "无"}`,
+    `历史余波：${chapterOutlineContext?.historyPlanning?.lastEnding || "无"}`,
+    `章节衔接：开场承接=${chapterOutlineContext?.continuityPlanning?.entryLink || "无"}｜主承接线程=${chapterOutlineContext?.continuityPlanning?.dominantCarryoverThread || "无"}｜章末递交压力=${chapterOutlineContext?.continuityPlanning?.exitPressureToNextChapter || "无"}`,
+  ].join("\n");
+  const foreshadowingSummary = (baseChapterPlan.foreshadowingActions || []).length
+    ? baseChapterPlan.foreshadowingActions.map((item) => `${item.id}:${item.action}:${item.description || ""}`).join("；")
+    : "无";
+
+  const result = await provider.generateText({
+    instructions:
+      "你是 Novelex 的 ChapterOutlineSyncAgent。当前章节正文已经通过人工批准，即将锁章。你的任务是以最终正文为唯一事实源，重建一个供后续章节继承的 chapter plan，并覆盖旧细纲。不要改 chapterId、chapterNumber、title、stage，不要把正文里没有落地的情节塞回去，不要生成新的伏笔 ID 或 action。只输出 JSON。",
+    input: [
+      projectSummary(project),
+      `当前章节：${baseChapterPlan.chapterId}（第 ${baseChapterPlan.chapterNumber} 章）`,
+      `锁定字段：chapterId=${baseChapterPlan.chapterId}｜chapterNumber=${baseChapterPlan.chapterNumber}｜title=${baseChapterPlan.title}｜stage=${baseChapterPlan.stage}`,
+      `原始已选细纲：\n${originalOutlineSummary}`,
+      `当前 chapter plan 摘要：\n${currentPlanSummary}`,
+      `写作上下文摘要：\n${outlineContextSummary}`,
+      `必须继承的已定事实：${factSections.establishedFactsLine}`,
+      `可以继续发酵但不能改写底层结论的开放张力：${factSections.openTensionsLine}`,
+      `允许沿用或收缩的伏笔动作：${foreshadowingSummary}`,
+      `最终批准正文全文：\n${draftBundle?.chapterMarkdown || ""}`,
+      `请输出 JSON：
+{
+  "proposalId": "proposal_lock_sync",
+  "summary": "一句话概括按最终正文同步后的章纲",
+  "rationale": "为何这样回写",
+  "diffSummary": "与原细纲相比最关键的校正点",
+  "timeInStory": "故事时间",
+  "povCharacter": "角色名",
+  "location": "章节主地点",
+  "keyEvents": ["事件1", "事件2", "事件3"],
+  "arcContribution": ["弧光1", "弧光2"],
+  "nextHook": "章末钩子",
+  "emotionalTone": "情绪基调",
+  "threadMode": "single_spine",
+  "dominantThread": "本章主线一句话",
+  "entryLink": "本章开场承接点",
+  "exitPressure": "本章末尾递交给下一章的直接压力",
+  "charactersPresent": ["角色A", "角色B"],
+  "continuityAnchors": ["连续性锚点1", "连续性锚点2"],
+  "foreshadowingActionIds": ["fsh_001"],
+  "scenes": [
+    {
+      "label": "场景标签",
+      "location": "地点",
+      "focus": "场景任务",
+      "tension": "张力",
+      "characters": ["角色A", "角色B"],
+      "threadId": "main",
+      "scenePurpose": "这个 scene 在整章中的作用",
+      "inheritsFromPrevious": "这一场承接了什么",
+      "outcome": "这一场产出了什么结果",
+      "handoffToNext": "把什么问题交给下一场"
+    }
+  ]
+}`,
+    ].join("\n\n"),
+    useReviewModel: true,
+    metadata: {
+      feature: "chapter_outline_lock_sync",
+      chapterId: baseChapterPlan.chapterId,
+    },
+  });
+
+  const parsed = safeJsonParse(extractJsonObject(result.text), null);
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error(`ChapterOutlineSyncAgent 返回了无法解析的 JSON：${createExcerpt(result.text || "", 220)}`);
+  }
+
+  const syncedOutline = normalizeOutlineProposal({
+    ...parsed,
+    title: baseChapterPlan.title,
+  }, 0, {
+    chapterBase: {
+      ...baseChapterPlan,
+      title: baseChapterPlan.title,
+      stage: baseChapterPlan.stage,
+    },
+    bundle,
+    stagePlanning: chapterOutlineContext?.stagePlanning || { chapterMission: "", requiredBeats: [], mustPreserve: [], suggestedConflictAxis: [], nextPressure: "" },
+    characterPlanning: chapterOutlineContext?.characterPlanning || { recommendedPov: baseChapterPlan.povCharacter, mustAppear: baseChapterPlan.charactersPresent || [], relationshipPressures: [] },
+    historyPlanning: chapterOutlineContext?.historyPlanning || { mustNotContradict: [], lastEnding: "" },
+    continuityPlanning: chapterOutlineContext?.continuityPlanning || { entryLink: "", dominantCarryoverThread: "", exitPressureToNextChapter: "", continuityRisks: [] },
+    foreshadowingActions: normalizeLockSyncedForeshadowingActions(baseChapterPlan.foreshadowingActions || [], parsed),
+  });
+
+  return syncedOutline;
+}
+
+async function synchronizeLockedChapterOutline({
+  store,
+  provider,
+  project,
+  bundle,
+  draftBundle,
+}) {
+  const syncedOutline = await runLockedChapterOutlineSyncAgent({
+    provider,
+    project,
+    bundle,
+    draftBundle,
+  });
+  const selectedChapterOutline = draftBundle?.selectedChapterOutline || null;
+  const synchronizedSelectedChapterOutline = {
+    ...(selectedChapterOutline || {}),
+    mode: String(selectedChapterOutline?.mode || "").trim() || "single",
+    selectedProposalId: selectedChapterOutline?.selectedProposalId ?? null,
+    selectedSceneRefs: Array.isArray(selectedChapterOutline?.selectedSceneRefs)
+      ? selectedChapterOutline.selectedSceneRefs
+      : [],
+    authorNotes: String(selectedChapterOutline?.authorNotes || "").trim(),
+    summary: syncedOutline.summary,
+    rationale: syncedOutline.rationale,
+    diffSummary: syncedOutline.diffSummary,
+    chapterPlan: syncedOutline.chapterPlan,
+    source: "post_lock_sync",
+    syncedFrom: {
+      source: inferSelectedOutlineSource(selectedChapterOutline),
+      mode: String(selectedChapterOutline?.mode || "").trim() || "single",
+      selectedProposalId: selectedChapterOutline?.selectedProposalId ?? null,
+      selectedSceneRefs: Array.isArray(selectedChapterOutline?.selectedSceneRefs)
+        ? selectedChapterOutline.selectedSceneRefs
+        : [],
+      authorNotes: String(selectedChapterOutline?.authorNotes || "").trim(),
+      summary: String(selectedChapterOutline?.summary || "").trim(),
+      rationale: String(selectedChapterOutline?.rationale || "").trim(),
+      diffSummary: String(selectedChapterOutline?.diffSummary || "").trim(),
+      syncedAt: nowIso(),
+    },
+  };
+  const currentCharacterStates = await loadCurrentCharacterStates(store, bundle);
+  const derivedState = buildDerivedChapterStateArtifacts({
+    currentCharacterStates,
+    chapterPlan: syncedOutline.chapterPlan,
+    project,
+    chapterDraft: { markdown: draftBundle?.chapterMarkdown || "" },
+    worldStateBase: bundle.worldState,
+    structureData: bundle.structureData,
+    foreshadowingRegistryBase: bundle.foreshadowingRegistry,
+  });
+  const chapterOutlineHistory = [
+    ...(draftBundle?.chapterOutlineHistory || []),
+    buildLockedOutlineSyncHistoryEntry(selectedChapterOutline, syncedOutline),
+  ];
+
+  await store.stageChapterDraft({
+    ...draftBundle,
+    chapterPlan: syncedOutline.chapterPlan,
+    selectedChapterOutline: synchronizedSelectedChapterOutline,
+    chapterOutlineHistory,
+    chapterMeta: derivedState.chapterMeta,
+    characterStates: derivedState.characterStates,
+    worldState: derivedState.worldState,
+    foreshadowingRegistry: derivedState.foreshadowingRegistry,
+  });
+
+  return {
+    chapterPlan: syncedOutline.chapterPlan,
+    selectedChapterOutline: synchronizedSelectedChapterOutline,
+    chapterOutlineHistory,
+    derivedState,
+  };
+}
+
 async function runStagePlanningContextAgent({
   provider,
   project,
@@ -4379,6 +4644,214 @@ export async function runWriteChapter(store, options = {}) {
   });
 }
 
+export async function saveManualChapterEdit(
+  store,
+  {
+    chapterBody = "",
+  } = {},
+) {
+  const projectState = await store.loadProject();
+  const pending = projectState.phase.write.pendingReview;
+  if (!pending?.chapterId) {
+    throw new Error("当前没有待审章节。");
+  }
+  if (String(pending.target || REVIEW_TARGETS.CHAPTER) !== REVIEW_TARGETS.CHAPTER) {
+    throw new Error("当前待审节点不是章节正文，不能直接修改正文内容。");
+  }
+
+  const bundle = await loadCommittedPlanBundle(store);
+  const draftBundle = await store.loadChapterDraft(pending.chapterId);
+  if (!draftBundle) {
+    throw new Error("找不到待审章节草稿。");
+  }
+
+  const chapterPlanBase =
+    draftBundle.chapterPlan ||
+    bundle.structureData.chapters.find((item) => item.chapterId === pending.chapterId);
+  if (!chapterPlanBase) {
+    throw new Error(`找不到 ${pending.chapterId} 对应的章纲。`);
+  }
+
+  const normalizedBody = String(chapterBody || "").replace(/\r\n?/g, "\n");
+  if (!normalizedBody.trim()) {
+    throw new Error("章节正文不能为空。");
+  }
+
+  const originalMarkdown = String(draftBundle.chapterMarkdown || "");
+  const originalParts = splitChapterMarkdown(originalMarkdown, chapterPlanBase.title);
+  if (!fragmentChanged(originalParts.body, normalizedBody)) {
+    return {
+      project: projectState,
+      run: null,
+      summary: `${pending.chapterId} 的正文没有变化。`,
+    };
+  }
+
+  const rewrittenDraft = chapterDraftFromExactMarkdown(
+    chapterPlanBase,
+    composeChapterMarkdown(originalParts.title || chapterPlanBase.title, normalizedBody),
+  );
+  const currentCharacterStates = await loadCurrentCharacterStates(store, bundle);
+  const historyPacket = historyContextFromDraft(draftBundle);
+  const writerContext = writerContextFromDraft(draftBundle);
+  const governance = governanceFromDraft(draftBundle, chapterPlanBase);
+  const foreshadowingAdvice = collectForeshadowingAdvice(bundle.foreshadowingRegistry, chapterPlanBase);
+  const researchPacket = researchPacketFromDraft(draftBundle);
+  const referencePacket = referencePacketFromDraft(draftBundle);
+  const openingReferencePacket = openingReferencePacketFromDraft(draftBundle);
+  const { styleGuideText } = await resolveStyleBaseline(store, projectState.project, chapterPlanBase);
+  const chapterMetas = await store.listChapterMeta();
+  const factContext = draftBundle?.factContext || null;
+  const validation = await runChapterAudit({
+    store,
+    provider: null,
+    project: projectState.project,
+    chapterPlan: chapterPlanBase,
+    chapterDraft: rewrittenDraft,
+    historyPacket,
+    foreshadowingAdvice,
+    researchPacket,
+    styleGuideText,
+    characterStates: currentCharacterStates,
+    foreshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
+    chapterMetas,
+    factContext,
+    semanticMode: "heuristics_only",
+  });
+  const rewrittenState = buildDerivedChapterStateArtifacts({
+    currentCharacterStates,
+    chapterPlan: chapterPlanBase,
+    project: projectState.project,
+    chapterDraft: rewrittenDraft,
+    worldStateBase: bundle.worldState,
+    structureData: bundle.structureData,
+    foreshadowingRegistryBase: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
+  });
+  const { canonFactIssues, blockingAuditIssues } = buildBlockingAuditReviewPayload(validation, factContext);
+  const manualReviewRequired = !validation?.overallPassed;
+  const manualReviewStrategy = manualReviewRequired ? manualReviewStrategyFromValidation(validation) : "";
+  const rewriteHistory = [
+    ...(draftBundle.rewriteHistory || []),
+    {
+      at: nowIso(),
+      mode: "manual_edit",
+      strategy: "human_direct_edit",
+      feedback: "",
+      sceneIds: [],
+      sceneOrder: [],
+      selectionPreview: "",
+      feedbackSupervisionPassed: true,
+      feedbackSupervisionSummary: "人工直接修改正文后已完成本地审查，未额外调用模型 API。",
+      feedbackSupervisionAttempts: 0,
+      blockingFeedbackIssues: [],
+    },
+  ];
+
+  await store.stageChapterDraft({
+    ...draftBundle,
+    chapterPlan: chapterPlanBase,
+    chapterMarkdown: rewrittenDraft.markdown,
+    sceneDrafts: [],
+    researchPacket,
+    referencePacket,
+    openingReferencePacket,
+    validation,
+    auditDrift: validation.auditDrift,
+    chapterMeta: rewrittenState.chapterMeta,
+    characterStates: rewrittenState.characterStates,
+    worldState: rewrittenState.worldState,
+    foreshadowingRegistry: rewrittenState.foreshadowingRegistry,
+    retrieval: historyPacket,
+    historyContext: historyPacket,
+    planContext: draftBundle.planContext || {},
+    writerContext,
+    chapterIntent: governance.chapterIntent,
+    contextPackage: governance.contextPackage,
+    ruleStack: governance.ruleStack,
+    contextTrace: governance.contextTrace,
+    factContext,
+    auditDegraded: Boolean(validation?.auditDegraded),
+    repairHistory: draftBundle?.repairHistory || [],
+    lastUnresolvedCriticals: unresolvedCriticalIssueSummaries(validation),
+    reviewState: {
+      mode: "manual_edit",
+      strategy: manualReviewRequired ? manualReviewStrategy : "human_direct_edit",
+      lastFeedback: "",
+      manualReviewRequired,
+      manualReviewStrategy,
+      auditDegraded: Boolean(validation?.auditDegraded),
+      feedbackSupervisionPassed: true,
+      feedbackSupervisionSummary: "人工直接修改正文后已完成本地审查，未额外调用模型 API。",
+      feedbackSupervisionAttempts: 0,
+      feedbackSupervisionHistory: [],
+      blockingFeedbackIssues: [],
+      blockingAuditIssues,
+      canonFactIssues,
+      repairHistory: draftBundle?.repairHistory || [],
+      lastUnresolvedCriticals: unresolvedCriticalIssueSummaries(validation),
+      repairStagnated: false,
+    },
+    rewriteHistory,
+  });
+
+  const saveRun = {
+    id: runId("write"),
+    phase: "write",
+    startedAt: nowIso(),
+    finishedAt: nowIso(),
+    target: REVIEW_TARGETS.CHAPTER,
+    chapterId: pending.chapterId,
+    summary: manualReviewRequired
+      ? `${pending.chapterId} 的人工正文修改已保存，并已完成本地审查；当前仍有问题需要继续人工复审。`
+      : `${pending.chapterId} 的人工正文修改已保存，并已完成本地审查，章节保持待审状态。`,
+    steps: [
+      step(
+        "manual_edit_save",
+        "Human Direct Edit",
+        "write",
+        "已保存人工直接修改后的章节正文，并回写待审草稿。",
+        {
+          preview: createExcerpt(normalizedBody, 120),
+        },
+      ),
+      step(
+        "manual_edit_validation",
+        "Validation (Heuristics Only)",
+        "write",
+        validationSummary(validation),
+        {
+          preview: createExcerpt(
+            blockingAuditIssues.join("；") || "人工修改后的章节已完成本地审查。",
+            160,
+          ),
+        },
+      ),
+    ],
+  };
+  await store.saveRun(saveRun);
+
+  projectState.phase.write = {
+    ...projectState.phase.write,
+    status: WRITE_STATUS.CHAPTER_PENDING_REVIEW,
+    pendingReview: {
+      ...pending,
+      requestedAt: nowIso(),
+      runId: saveRun.id,
+    },
+    rejectionNotes: manualReviewRequired ? blockingAuditIssues : [],
+    rewriteHistory,
+  };
+  const savedProject = await store.saveProject(projectState);
+
+  return {
+    project: savedProject,
+    run: saveRun,
+    summary: manualReviewRequired
+      ? `${pending.chapterId} 的人工修改已保存，并已完成本地审查；当前仍有问题需要继续人工复审。`
+      : `${pending.chapterId} 的人工修改已保存，未额外调用模型 API，并已退出直接编辑状态。`,
+  };
+}
+
 export async function reviewChapter(
   store,
   {
@@ -4601,6 +5074,8 @@ export async function reviewChapter(
       summary: selectedOutline.summary,
       rationale: selectedOutline.rationale,
       diffSummary: selectedOutline.diffSummary,
+      source: reviewAction === "approve_composed" ? "manual_composed" : "manual_selection",
+      syncedFrom: null,
     };
 
     return generateChapterDraft({
@@ -4622,6 +5097,24 @@ export async function reviewChapter(
   }
 
   if (approved) {
+    let lockedChapterPlan;
+    let lockedWorldState;
+    let lockedForeshadowingRegistry;
+    try {
+      const synchronizedOutline = await synchronizeLockedChapterOutline({
+        store,
+        provider,
+        project: projectState.project,
+        bundle,
+        draftBundle,
+      });
+      lockedChapterPlan = synchronizedOutline.chapterPlan;
+      lockedWorldState = synchronizedOutline.derivedState.worldState;
+      lockedForeshadowingRegistry = synchronizedOutline.derivedState.foreshadowingRegistry;
+    } catch (error) {
+      throw new Error(`锁章前细纲同步失败：${error instanceof Error ? error.message : String(error || "")}`);
+    }
+
     await store.commitChapterDraft(pending.chapterId);
 
     let factExtractionWarning = "";
@@ -4629,7 +5122,7 @@ export async function reviewChapter(
       const facts = await runChapterFactExtractionAgent({
         provider,
         project: projectState.project,
-        chapterPlan: draftBundle.chapterPlan,
+        chapterPlan: lockedChapterPlan,
         chapterDraft: { markdown: draftBundle.chapterMarkdown || "" },
       });
       await saveChapterFacts(store, pending.chapterId, facts);
@@ -4650,11 +5143,11 @@ export async function reviewChapter(
       structureData: {
         ...bundle.structureData,
         chapters: bundle.structureData.chapters.map((chapter) =>
-          chapter.chapterId === draftBundle.chapterPlan?.chapterId ? draftBundle.chapterPlan : chapter,
+          chapter.chapterId === lockedChapterPlan?.chapterId ? lockedChapterPlan : chapter,
         ),
       },
-      worldState: draftBundle.worldState,
-      foreshadowingRegistry: draftBundle.foreshadowingRegistry,
+      worldState: lockedWorldState,
+      foreshadowingRegistry: lockedForeshadowingRegistry,
     };
     await store.writeJson(path.join(store.paths.novelStateDir, "bundle.json"), committedBundle);
 
@@ -4671,7 +5164,7 @@ export async function reviewChapter(
     return {
       project: savedProject,
       run: null,
-      summary: `${pending.chapterId} 已${approvalOverrideRequired ? "在显式 override 后" : ""}锁定，可继续生成下一章。${factExtractionWarning}`,
+      summary: `${pending.chapterId} 已${approvalOverrideRequired ? "在显式 override 后" : ""}锁定，并已按最终正文回写章节细纲，可继续生成下一章。${factExtractionWarning}`,
     };
   }
 

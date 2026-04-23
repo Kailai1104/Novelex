@@ -15,6 +15,7 @@ let serverPollInFlight = false;
 const expandedSections = Object.create(null);
 const outlineWorkbenchState = Object.create(null);
 const partialRevisionWorkbenchState = Object.create(null);
+const directEditWorkbenchState = Object.create(null);
 
 function escapeHtml(value) {
   return String(value || "")
@@ -506,6 +507,34 @@ function splitChapterMarkdownForReview(markdown = "", fallbackTitle = "") {
     title: String(match[1] || fallbackTitle || "").trim(),
     body: String(match[2] || "").replace(/^\n+/, ""),
   };
+}
+
+function chapterBodyFromPending(pending = null) {
+  if (!pending?.chapterMarkdown) {
+    return "";
+  }
+  return splitChapterMarkdownForReview(
+    pending.chapterMarkdown,
+    pending?.chapterPlan?.title || "",
+  ).body;
+}
+
+function directEditWorkbenchFor(chapterId, pending = null) {
+  const key = String(chapterId || "");
+  const sourceBody = chapterBodyFromPending(pending);
+  if (!directEditWorkbenchState[key]) {
+    directEditWorkbenchState[key] = {
+      isEditing: false,
+      sourceBody,
+      draftBody: sourceBody,
+    };
+  }
+  const workbench = directEditWorkbenchState[key];
+  if (workbench.sourceBody !== sourceBody && !workbench.isEditing) {
+    workbench.sourceBody = sourceBody;
+    workbench.draftBody = sourceBody;
+  }
+  return workbench;
 }
 
 function partialRevisionWorkbenchFor(chapterId, pending = null) {
@@ -1294,9 +1323,12 @@ function renderWritePanel() {
   const pending = snapshot.staged.pendingChapter;
   const outlineOptions = normalizedOutlineOptionsFromSnapshot(pending);
   const pendingWordCount = pendingChapterWordCount(pending);
+  const pendingChapterId = pending?.chapterPlan?.chapterId || pending?.chapterId || "";
   const pendingChapterParts = pending?.chapterMarkdown
     ? splitChapterMarkdownForReview(pending.chapterMarkdown, pending?.chapterPlan?.title || "")
     : null;
+  const directEditWorkbench = pendingChapterId ? directEditWorkbenchFor(pendingChapterId, pending) : null;
+  const directEditMode = Boolean(directEditWorkbench?.isEditing);
   return `
     <section class="panel span-12">
       <div class="panel-header">
@@ -1384,13 +1416,22 @@ function renderWritePanel() {
             className: "preview-box",
             titleHtml: `<h3>${escapeHtml(pendingChapterParts?.title || pending.chapterPlan.title)}</h3>`,
             bodyHtml: `
-              <p><small>${pendingWordCount ? `当前草稿字数：${escapeHtml(String(pendingWordCount))} 字｜` : ""}正文 body 支持直接框选，章节标题不会被纳入局部修订。</small></p>
+              <p><small>${pendingWordCount ? `当前草稿字数：${escapeHtml(String(pendingWordCount))} 字｜` : ""}${directEditMode ? "当前处于人工直接编辑态，保存后会重新校验章节，并退出可修改状态。" : "正文 body 支持直接框选，也支持进入直接编辑；章节标题不会被纳入修改范围。"}</small></p>
+              <div class="actions" style="margin-top:12px;">
+                ${directEditMode ? `
+                  <button class="button button-primary" type="button" data-chapter-direct-save="${escapeHtml(pendingChapterId)}" ${disabledAttr(mutationBusy())}>${mutationBusy("chapter_manual_edit") ? "保存中..." : "保存正文"}</button>
+                  <button class="button button-ghost" type="button" data-chapter-direct-cancel="${escapeHtml(pendingChapterId)}" ${disabledAttr(mutationBusy())}>取消编辑</button>
+                ` : `
+                  <button class="button button-secondary" type="button" data-chapter-direct-edit="${escapeHtml(pendingChapterId)}" ${disabledAttr(mutationBusy())}>直接修改正文</button>
+                `}
+              </div>
               <div
-                class="chapter-body-selectable"
-                data-chapter-body-selectable="true"
+                class="chapter-body-selectable ${directEditMode ? "is-editing" : ""}"
+                ${directEditMode ? 'data-chapter-body-editable="true"' : 'data-chapter-body-selectable="true"'}
                 data-chapter-id="${escapeHtml(pending.chapterPlan?.chapterId || pending.chapterId || "")}"
                 tabindex="0"
-              >${escapeHtml(pendingChapterParts?.body || "")}</div>
+                ${directEditMode ? 'contenteditable="true" spellcheck="false"' : ""}
+              >${escapeHtml(directEditMode ? (directEditWorkbench?.draftBody || "") : (pendingChapterParts?.body || ""))}</div>
             `,
           })}` : ""}
           ${pending.sceneDrafts?.length ? `
@@ -1550,6 +1591,7 @@ function renderChapterReviewBox(pending = null) {
     .slice(0, 4);
   const feedbackSummary = String(reviewState.feedbackSupervisionSummary || "").trim();
   const chapterId = pending?.chapterPlan?.chapterId || pending?.chapterId || "pending";
+  const directEditActive = Boolean(directEditWorkbenchFor(chapterId, pending)?.isEditing);
   const workbench = partialRevisionWorkbenchFor(chapterId, pending);
   const selectionPreview = selectionPreviewText(workbench);
   const riskBlockHtml = approvalOverrideRequired
@@ -1578,22 +1620,22 @@ function renderChapterReviewBox(pending = null) {
     className: "review-box",
     titleHtml: "<h3>章节审查</h3>",
     bodyHtml: `
-      <p>${approvalOverrideRequired ? "当前章节仍有未解决问题；你可以继续重写，也可以在显式确认风险后仍然锁章。" : "通过后会锁章；如果不满意，你既可以按反馈重写整章，也可以先在上面的正文 body 中框选一个连续片段，只改那一段。"}</p>
+      <p>${directEditActive ? "当前正在直接编辑正文。请先保存或取消本次手动修改，再继续批准、整章重写或局部修订。" : approvalOverrideRequired ? "当前章节仍有未解决问题；你可以继续重写，也可以在显式确认风险后仍然锁章。" : "通过后会锁章；如果不满意，你既可以按反馈重写整章，也可以先在上面的正文 body 中框选一个连续片段，只改那一段。"}</p>
       ${wordCount ? `<p><small>当前待审章节字数：${escapeHtml(String(wordCount))} 字</small></p>` : ""}
       ${riskBlockHtml}
-      <textarea id="feedback-chapter" placeholder="写下你的修改意见，比如要加强哪段冲突、调整节奏、补足人物动机或优化章末牵引。" ${disabledAttr(mutationBusy())}></textarea>
+      <textarea id="feedback-chapter" placeholder="写下你的修改意见，比如要加强哪段冲突、调整节奏、补足人物动机或优化章末牵引。" ${disabledAttr(mutationBusy() || directEditActive)}></textarea>
       <div class="actions">
-        <button class="button button-primary" data-review-target="chapter" data-review-action="approve" ${disabledAttr(mutationBusy())}>${mutationBusy("chapter_review") ? "提交中..." : approveLabel}</button>
-        <button class="button button-danger" data-review-target="chapter" data-review-action="rewrite" ${disabledAttr(mutationBusy())}>${mutationBusy("chapter_review") ? "提交中..." : "根据反馈重写"}</button>
+        <button class="button button-primary" data-review-target="chapter" data-review-action="approve" ${disabledAttr(mutationBusy() || directEditActive)}>${mutationBusy("chapter_review") ? "提交中..." : approveLabel}</button>
+        <button class="button button-danger" data-review-target="chapter" data-review-action="rewrite" ${disabledAttr(mutationBusy() || directEditActive)}>${mutationBusy("chapter_review") ? "提交中..." : "根据反馈重写"}</button>
       </div>
       <div class="chapter-selection-review" style="margin-top:16px;">
         <strong>局部修订工作区</strong>
-        <p style="margin-top:6px;"><small>先在正文预览里直接框选一段连续文本，再写修改意见。系统会只替换这一段，其余正文保持不动。</small></p>
+        <p style="margin-top:6px;"><small>${directEditActive ? "当前已切换到正文直接编辑态；如需局部修订，请先保存或取消手动编辑。" : "先在正文预览里直接框选一段连续文本，再写修改意见。系统会只替换这一段，其余正文保持不动。"}</small></p>
         <div class="chapter-selection-preview">${selectionPreview ? escapeHtml(selectionPreview) : "当前还没有选中的正文片段。"}</div>
-        <textarea id="feedback-chapter-partial" placeholder="只描述这段该怎么改，比如压紧情绪、改顺动作逻辑、补一句更明确的人物反应。" ${disabledAttr(mutationBusy())}>${escapeHtml(workbench.feedback || "")}</textarea>
+        <textarea id="feedback-chapter-partial" placeholder="只描述这段该怎么改，比如压紧情绪、改顺动作逻辑、补一句更明确的人物反应。" ${disabledAttr(mutationBusy() || directEditActive)}>${escapeHtml(workbench.feedback || "")}</textarea>
         <div class="actions">
-          <button class="button button-secondary" type="button" data-chapter-selection-clear="${escapeHtml(chapterId)}" ${disabledAttr(mutationBusy())}>清除选区</button>
-          <button class="button button-secondary" data-review-target="chapter" data-review-action="partial_rewrite" ${disabledAttr(mutationBusy())}>${mutationBusy("chapter_review") ? "提交中..." : "只改选中部分"}</button>
+          <button class="button button-secondary" type="button" data-chapter-selection-clear="${escapeHtml(chapterId)}" ${disabledAttr(mutationBusy() || directEditActive)}>${directEditActive ? "直接编辑中" : "清除选区"}</button>
+          <button class="button button-secondary" data-review-target="chapter" data-review-action="partial_rewrite" ${disabledAttr(mutationBusy() || directEditActive)}>${mutationBusy("chapter_review") ? "提交中..." : "只改选中部分"}</button>
         </div>
       </div>
     `,
@@ -2248,6 +2290,111 @@ function bindEvents() {
       [nextRefs[index], nextRefs[nextIndex]] = [nextRefs[nextIndex], nextRefs[index]];
       workbench.sceneRefs = nextRefs;
       render();
+    });
+  });
+
+  document.querySelectorAll("[data-chapter-direct-edit]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const chapterId = button.getAttribute("data-chapter-direct-edit");
+      if (!chapterId) {
+        return;
+      }
+      const pending = snapshot?.staged?.pendingChapter || null;
+      const editWorkbench = directEditWorkbenchFor(chapterId, pending);
+      editWorkbench.isEditing = true;
+      editWorkbench.sourceBody = chapterBodyFromPending(pending);
+      editWorkbench.draftBody = editWorkbench.sourceBody;
+      const partialWorkbench = partialRevisionWorkbenchFor(chapterId, pending);
+      partialWorkbench.selectedText = "";
+      partialWorkbench.prefixContext = "";
+      partialWorkbench.suffixContext = "";
+      render();
+      window.requestAnimationFrame(() => {
+        const editor = document.querySelector(`[data-chapter-body-editable][data-chapter-id="${chapterId}"]`);
+        editor?.focus();
+      });
+    });
+  });
+
+  document.querySelectorAll("[data-chapter-direct-cancel]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const chapterId = button.getAttribute("data-chapter-direct-cancel");
+      if (!chapterId) {
+        return;
+      }
+      const editWorkbench = directEditWorkbenchFor(chapterId, snapshot?.staged?.pendingChapter || null);
+      editWorkbench.isEditing = false;
+      editWorkbench.draftBody = editWorkbench.sourceBody;
+      render();
+    });
+  });
+
+  document.querySelectorAll("[data-chapter-body-editable]").forEach((container) => {
+    const syncDraft = () => {
+      const chapterId = container.getAttribute("data-chapter-id") || "";
+      if (!chapterId) {
+        return;
+      }
+      const workbench = directEditWorkbenchFor(chapterId, snapshot?.staged?.pendingChapter || null);
+      workbench.draftBody = String(container.innerText || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/\r\n?/g, "\n");
+    };
+    container.addEventListener("input", syncDraft);
+    container.addEventListener("blur", syncDraft);
+  });
+
+  document.querySelectorAll("[data-chapter-direct-save]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const chapterId = button.getAttribute("data-chapter-direct-save");
+      if (!chapterId) {
+        return;
+      }
+      const pending = snapshot?.staged?.pendingChapter || null;
+      const workbench = directEditWorkbenchFor(chapterId, pending);
+      const editor = document.querySelector(`[data-chapter-body-editable][data-chapter-id="${chapterId}"]`);
+      if (editor) {
+        workbench.draftBody = String(editor.innerText || "")
+          .replace(/\u00a0/g, " ")
+          .replace(/\r\n?/g, "\n");
+      }
+      const nextBody = String(workbench.draftBody || "").replace(/\r\n?/g, "\n");
+      const currentBody = chapterBodyFromPending(pending);
+      if (!nextBody.trim()) {
+        showToast("章节正文不能为空。");
+        return;
+      }
+      if (nextBody === currentBody) {
+        workbench.isEditing = false;
+        workbench.sourceBody = currentBody;
+        workbench.draftBody = currentBody;
+        render();
+        showToast("正文没有变化。");
+        return;
+      }
+
+      await runMutation("chapter_manual_edit", async () => {
+        try {
+          const data = await api("/api/write/manual-edit", {
+            method: "POST",
+            body: apiBody({
+              chapterBody: nextBody,
+            }),
+          });
+          applyServerState(data);
+          const updatedPending = snapshot?.staged?.pendingChapter || null;
+          const updatedChapterId = updatedPending?.chapterPlan?.chapterId || updatedPending?.chapterId || chapterId;
+          const updatedWorkbench = directEditWorkbenchFor(updatedChapterId, updatedPending);
+          updatedWorkbench.isEditing = false;
+          updatedWorkbench.sourceBody = chapterBodyFromPending(updatedPending);
+          updatedWorkbench.draftBody = updatedWorkbench.sourceBody;
+          render();
+          showToast("正文修改已保存。");
+        } catch (error) {
+          await syncStateAfterError();
+          showToast(error.message);
+        }
+      });
     });
   });
 

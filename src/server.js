@@ -12,7 +12,7 @@ import { closeAllWorkspaceMcpManagers, getWorkspaceMcpManager } from "./mcp/inde
 import { runPlanDraft, reviewPlanDraft, reviewPlanFinal, runPlanFinalization } from "./orchestration/plan.js";
 import { generateStyleFingerprint } from "./orchestration/style-fingerprint.js";
 import { rebuildOpeningCollectionIndex } from "./opening/index.js";
-import { deleteLatestLockedChapter, reviewChapter, runWriteChapter } from "./orchestration/write.js";
+import { deleteLatestLockedChapter, reviewChapter, runWriteChapter, saveManualChapterEdit } from "./orchestration/write.js";
 import { rebuildRagCollectionIndex } from "./rag/index.js";
 import { createStore } from "./utils/store.js";
 import { createProjectWorkspace, deleteProjectWorkspace, ensureProjectId, listProjects } from "./utils/workspace.js";
@@ -876,6 +876,26 @@ const routes = {
         sceneIds: body.sceneIds || [],
         sceneOrder: body.sceneOrder || [],
         selection: body.selection || null,
+      });
+      return {
+        result,
+        projects: await listProjects(WORKSPACE_ROOT),
+        state: await buildSnapshot(context.store, context.projectId),
+        projectId: context.projectId,
+      };
+    });
+  }),
+
+  "POST /api/write/manual-edit": withErrorHandling(async (request, response) => {
+    const body = await readBody(request);
+    const context = await resolveProjectContext(new URL(request.url || "/", `http://${request.headers.host || `localhost:${PORT}`}`), body);
+    if (!context.store) {
+      sendJson(response, 404, { error: "Project not found" });
+      return;
+    }
+    await sendLockedJson(response, "chapter_manual_edit", async () => {
+      const result = await saveManualChapterEdit(context.store, {
+        chapterBody: String(body.chapterBody || ""),
       });
       return {
         result,

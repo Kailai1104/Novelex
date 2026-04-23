@@ -268,6 +268,89 @@ exec "${process.execPath}" "${FIXTURE_WEB_SEARCH_SERVER}"
   }
 });
 
+test("mcp manager ignores inherited npm cache env for web_search", async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-mcp-inherited-cache-"));
+  const binDir = path.join(tempRoot, "bin");
+  const fakeNpx = path.join(binDir, "npx");
+  const previousLowerCache = process.env.npm_config_cache;
+  const previousUpperCache = process.env.NPM_CONFIG_CACHE;
+  await fs.mkdir(binDir, { recursive: true });
+  await fs.writeFile(fakeNpx, `#!/bin/sh
+case "$npm_config_cache" in
+  "${tempRoot}"/runtime/npm-cache) ;;
+  *)
+    echo "inherited npm_config_cache leaked: $npm_config_cache" >&2
+    exit 61
+    ;;
+esac
+case "$1" in
+  --cache) ;;
+  *)
+    echo "--cache flag missing" >&2
+    exit 62
+    ;;
+esac
+case "$2" in
+  "${tempRoot}"/runtime/npm-cache) ;;
+  *)
+    echo "cache arg leaked: $2" >&2
+    exit 63
+    ;;
+esac
+exec "${process.execPath}" "${FIXTURE_WEB_SEARCH_SERVER}"
+`, "utf8");
+  await fs.chmod(fakeNpx, 0o755);
+
+  process.env.npm_config_cache = path.join(os.homedir(), ".npm");
+  process.env.NPM_CONFIG_CACHE = path.join(os.homedir(), ".npm");
+
+  saveCodexApiConfig(tempRoot, {
+    mcp: {
+      enabled: true,
+      servers: {
+        web_search: {
+          enabled: true,
+          transport: "stdio",
+          command: "npx",
+          args: ["-y", "minimax-coding-plan-mcp"],
+          startup_timeout_ms: 3000,
+          call_timeout_ms: 3000,
+          env: {
+            PATH: binDir,
+          },
+        },
+        local_rag: {
+          enabled: false,
+        },
+      },
+    },
+  });
+
+  const manager = createMcpManager({
+    rootDir: tempRoot,
+    configRootDir: tempRoot,
+  });
+
+  try {
+    const result = await manager.callTool("web_search", { query: "ignore inherited cache" });
+    assert.equal(result?.structuredContent?.query, "ignore inherited cache");
+  } finally {
+    if (previousLowerCache === undefined) {
+      delete process.env.npm_config_cache;
+    } else {
+      process.env.npm_config_cache = previousLowerCache;
+    }
+
+    if (previousUpperCache === undefined) {
+      delete process.env.NPM_CONFIG_CACHE;
+    } else {
+      process.env.NPM_CONFIG_CACHE = previousUpperCache;
+    }
+
+    await manager.closeAll();
+  }
+});
+
 test("web_search extends startup timeout for npx-based MiniMax MCP cold starts", async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-mcp-cold-start-"));
   const binDir = path.join(tempRoot, "bin");

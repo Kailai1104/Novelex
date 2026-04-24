@@ -817,6 +817,60 @@ async function withStubbedOpenAI(callback) {
       });
     }
 
+    if (instructions.includes("ChapterSlotDeriverAgent")) {
+      const chapterIds = [...inputText.matchAll(/"chapterId": "([^"]+)"/g)]
+        .map((match) => match[1])
+        .filter(Boolean);
+      const chapterSlots = chapterIds.length
+        ? chapterIds.map((chapterId, index) => ({
+          chapterId,
+          chapterNumber: index + 1,
+          stage: `阶段${Math.min(4, Math.floor(index / 6) + 1)}`,
+          titleHint: `标题提示${index + 1}`,
+          mission: `${chapterId} 需要继续兑现主线推进。`,
+          locationSeed: "主舞台",
+          expectedCarryover: "承接上一章留下的直接压力。",
+          expectedEscalation: "让局势更难、更贵、更难收场。",
+          nextHookSeed: "把新的行动窗口递给下一章。",
+          forbidReplayBeats: ["不要重演上一章已经完成的事件。"],
+          foreshadowingIds: index === 0 ? ["fsh_001"] : [],
+          freshStart: index === 0,
+          stageSeed: "围绕既定主线抬高规模。",
+        }))
+        : [{
+          chapterId: "ch001",
+          chapterNumber: 1,
+          stage: "阶段1",
+          titleHint: "标题提示1",
+          mission: "ch001 需要继续兑现主线推进。",
+          locationSeed: "主舞台",
+          expectedCarryover: "承接上一章留下的直接压力。",
+          expectedEscalation: "让局势更难、更贵、更难收场。",
+          nextHookSeed: "把新的行动窗口递给下一章。",
+          forbidReplayBeats: ["不要重演上一章已经完成的事件。"],
+          foreshadowingIds: ["fsh_001"],
+          freshStart: true,
+          stageSeed: "围绕既定主线抬高规模。",
+        }];
+      return jsonResponse({
+        output_text: JSON.stringify({ chapterSlots }),
+      });
+    }
+
+    if (instructions.includes("InitialWorldStateDeriverAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          current_story_time: "故事起始日",
+          current_primary_location: "主舞台",
+          active_plotlines: ["经营起盘", "势力试探"],
+          public_knowledge: ["局势正在加速变化。"],
+          secret_knowledge: ["更大的势力重排已经在暗中酝酿。"],
+          recent_major_events: ["主线准备正式启动。"],
+          upcoming_anchors: ["更大规模的扩张与冲突即将到来。"],
+        }),
+      });
+    }
+
     if (instructions.includes("WorldbuildingAgent")) {
       return jsonResponse({
         output_text: "# 世界观设定\n\n## 时代与格局\n- 故事发生在多方势力同时角逐的高压时代。\n- 生产、军备、港口、贸易和制度建设共同决定势力上限。\n\n## 写作约束\n- 所有重大推进都要落到资源、制度、军队和地盘变化上。\n- 每次扩张都必须伴随代价与反噬。\n",
@@ -937,6 +991,73 @@ async function withStubbedOpenAI(callback) {
           foreshadowingTasks: ["plant:fsh_001", "track:fsh_002"],
           continuityAnchors: ["章末要保留下一步扩张的悬念。"],
           researchFlags: ["涉及时代细节时不要写得太现代。"],
+        }),
+      });
+    }
+
+    if (instructions.includes("ContinuityGuardAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          defaultEntryMode: "direct_resume",
+          allowedEntryModes: ["direct_resume", "same_scene_later", "time_skip_under_pressure"],
+          supportsWakeAfterUnconsciousness: false,
+          resumeFrom: "承接上一章留下的直接压力。",
+          previousActionPressure: "上一章的动作压力仍在持续。",
+          forbiddenRestartTerms: ["不要重新惊醒", "不要重新确认身份"],
+          mandatoryEvidenceRefs: [],
+          unsupportedClaims: [],
+        }),
+      });
+    }
+
+    if (instructions.includes("OpeningQueryPlannerAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          queries: ["黄金三章 开场钩子 主角亮相", "黄金三章 冲突点燃 章末牵引"],
+          focusAspects: ["尽快建立钩子与主角处境", "让章末牵引自然递交下一章"],
+        }),
+      });
+    }
+
+    if (instructions.includes("OpeningRecallAgent")) {
+      const selectedChunkIds = [...inputText.matchAll(/- ([^｜\n]+)/g)]
+        .map((match) => match[1])
+        .slice(0, 2);
+      return jsonResponse({
+        output_text: JSON.stringify({
+          selectedChunkIds,
+          reasons: Object.fromEntries(selectedChunkIds.map((chunkId) => [chunkId, "该片段能提供稳定的开头结构参考。"])),
+        }),
+      });
+    }
+
+    if (instructions.includes("OpeningPatternSynthesizerAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: "开头应尽快把人物处境、目标压力和章末牵引钉牢，只借结构不借原句。",
+          openingHooks: ["开场先给主角当前最具体的压力。"],
+          protagonistEntryPatterns: ["主角以正在处理问题的状态出场，而不是做背景说明。"],
+          conflictIgnitionPatterns: ["在第一场就让外部条件或内部代价逼上来。"],
+          pacingSignals: ["前两段就把局势推到行动层。"],
+          chapterEndHookPatterns: ["章末用更具体的下一步风险或时限收束。"],
+          structuralBeats: ["处境入场 -> 压力显形 -> 行动试探 -> 章末再加压"],
+          avoidPatterns: ["不要用长篇设定说明开局。"],
+        }),
+      });
+    }
+
+    if (instructions.includes("OpeningReferenceScoperAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: "非首章只保留可连续继承的承压、升级和章末牵引结构。",
+          openingHooks: [],
+          protagonistEntryPatterns: [],
+          conflictIgnitionPatterns: ["延续上一章余波并立即进入当前行动。"],
+          pacingSignals: ["直接承压，不做重复冷启动。"],
+          chapterEndHookPatterns: ["章末继续加压，递交更具体的下一步风险。"],
+          structuralBeats: ["承接上一章余波 -> 当章行动推进 -> 章末加压"],
+          avoidPatterns: ["不要重新穿越或重新惊醒。"],
+          warnings: ["已压制首章冷启动模板。"],
         }),
       });
     }
@@ -1350,6 +1471,36 @@ async function withStubbedOpenAI(callback) {
       });
     }
 
+    if (instructions.includes("CharacterPresenceAgent")) {
+      const plannedCharacters = String(inputText.match(/计划登场角色：(.+)/)?.[1] || "")
+        .split("、")
+        .map((name) => name.trim())
+        .filter(Boolean);
+      const requiredCharacters = String(inputText.match(/必须具名出场角色：(.+)/)?.[1] || "")
+        .split("、")
+        .map((name) => name.trim())
+        .filter((name) => name && name !== "无");
+      const bodyText = String(inputText.split(/正文全文：\n/).at(-1) || "");
+      const charactersPresent = plannedCharacters.filter((name) => bodyText.includes(name));
+      const missingRequiredCharacters = requiredCharacters.filter((name) => !charactersPresent.includes(name));
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: charactersPresent.length
+            ? "正文已让主要计划角色实际出场。"
+            : "正文没有让计划角色明确出场。",
+          charactersPresent,
+          missingRequiredCharacters,
+          mentions: plannedCharacters.map((name) => ({
+            name,
+            present: charactersPresent.includes(name),
+            directlyNamed: charactersPresent.includes(name),
+            evidence: charactersPresent.includes(name) ? `${name} 在正文中被直接点名。` : "",
+            reason: charactersPresent.includes(name) ? "正文明确点名。" : "正文没有直接点名。",
+          })),
+        }),
+      });
+    }
+
     if (instructions.includes("ChapterFactExtractionAgent")) {
       const chapterMatch = inputText.match(/章节：(ch\d+)/);
       const chapterId = chapterMatch?.[1] || "ch001";
@@ -1446,6 +1597,148 @@ async function withStubbedOpenAI(callback) {
           openThreads: ["扩张带来的新压力还没有真正解决。"],
           mustNotContradict: ["不能否认上一章已经把局势推高。"],
           lastEnding: "上一章把盘面抬高后的压力仍在延续。",
+        }),
+      });
+    }
+
+    if (instructions.includes("GovernanceAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          chapterIntent: {
+            goal: "把当前章的核心推进真正落地。",
+            mustKeep: ["POV 稳定在当前角色", "保持既定事件顺序"],
+            mustAvoid: ["不要否认既定事实", "不要重演上一章已完成事件"],
+            styleEmphasis: ["动作先行", "对白承担推进"],
+            conflicts: [],
+            hookAgenda: {
+              mustAdvance: ["fsh_001"],
+              eligibleResolve: [],
+              staleDebt: [],
+              avoidNewHookFamilies: ["无"],
+            },
+          },
+          contextPackage: {
+            selectedContext: [
+              {
+                source: "novel_state/outline.md",
+                reason: "当前章节仍需服从锁定大纲。",
+                excerpt: "本章要把推进真正落地。",
+              },
+            ],
+          },
+          ruleStack: {
+            precedence: ["hardFacts", "softGoals", "deferRules", "currentTask"],
+            hardFacts: ["既定事实不能重置。"],
+            softGoals: ["本章完成一次有代价的推进。"],
+            deferRules: ["不能提前兑现后续阶段结局。"],
+            currentTask: ["把当前冲突推进到下一轮更高压力。"],
+          },
+        }),
+      });
+    }
+
+    if (instructions.includes("StyleGuideDeriverAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          title: "当前项目风格指南",
+          rules: ["保持第三人称有限视角。", "优先用动作和对白推进。"],
+          antiPatterns: ["不要写成提纲说明。", "不要在章末做总结性抒情。"],
+          voiceSummary: "冷硬、贴脸、动作先行的网文正文声音。",
+        }),
+      });
+    }
+
+    if (instructions.includes("AuditAnalyzerAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: "本章整体通过语义审计，没有关键阻断问题。",
+          score: 92,
+          issues: [],
+          dimensionSummaries: {
+            outline_drift: "主线推进正常。",
+            character_plausibility: "人物反应可信。",
+          },
+          sequenceSnapshot: [],
+          staleForeshadowings: [],
+          nextChapterGuardrails: ["下一章继续承接当前章末压力。"],
+        }),
+      });
+    }
+
+    if (instructions.includes("ChapterStateDeriverAgent")) {
+      const chapterPlanJson = inputText.match(/原章纲：\n([\s\S]*?)\n\n按正文校正后的实际出场角色：/);
+      const presenceJson = inputText.match(/按正文校正后的实际出场角色：\n([\s\S]*?)\n\n当前角色状态：/);
+      const chapterPlan = JSON.parse(chapterPlanJson?.[1] || "{}");
+      const presence = JSON.parse(presenceJson?.[1] || "{}");
+      const resolvedCharactersPresent = Array.isArray(presence.charactersPresent)
+        ? presence.charactersPresent
+        : (chapterPlan.charactersPresent || []);
+      return jsonResponse({
+        output_text: JSON.stringify({
+          characterStates: [
+            {
+              name: "李凡",
+              updated_after_chapter: "ch001",
+              physical: {
+                location: "赤屿内港",
+                health: "良好",
+                appearance_notes: "仍带着现场风压与紧绷感。",
+              },
+              psychological: {
+                current_goal: "把新的压力转成下一步可执行动作。",
+                emotional_state: "紧绷",
+                stress_level: 5,
+                key_beliefs: ["必须先把局势压住。"],
+              },
+              relationships: {},
+              knowledge: {
+                knows: ["当前压力已经升级。"],
+                does_not_know: ["更远处的终局变化。"],
+              },
+              inventory_and_resources: {
+                money: "有限",
+                key_items: ["当前调度清单"],
+              },
+              arc_progress: {
+                current_phase: "压力升级",
+                arc_note: "正在把控制力转成真实代价。",
+              },
+            },
+          ],
+          chapterMeta: {
+            chapter_id: chapterPlan.chapterId || "ch001",
+            chapterId: chapterPlan.chapterId || "ch001",
+            title: chapterPlan.title || "第1章",
+            stage: chapterPlan.stage || "阶段1",
+            time_in_story: chapterPlan.timeInStory || "故事推进中",
+            pov_character: chapterPlan.povCharacter || "李凡",
+            location: chapterPlan.location || "赤屿内港",
+            summary_50: chapterPlan.keyEvents?.join("；") || "本章把压力真正压成下一步行动。",
+            summary_200: `${chapterPlan.keyEvents?.join("；") || "本章围绕既定主线推进。"} ${chapterPlan.nextHook || "把更具体的下一步压力递给后文。"}`.trim(),
+            key_events: Array.isArray(chapterPlan.keyEvents) ? chapterPlan.keyEvents : ["推进当前主线", "压高下一步代价"],
+            continuity_anchors: chapterPlan.continuityAnchors || ["下一章继续承接当前章末压力"],
+            emotional_tone: chapterPlan.emotionalTone || "冷硬压迫",
+            next_hook: chapterPlan.nextHook || "下一步压力已经逼到眼前。",
+            characters_present: resolvedCharactersPresent,
+          },
+          worldState: {
+            current_story_time: "故事推进中",
+            current_primary_location: "赤屿内港",
+            active_plotlines: ["主线持续推进"],
+            public_knowledge: ["局势正在升高。"],
+            secret_knowledge: [],
+            recent_major_events: ["当前章节完成了一次关键推进。"],
+            upcoming_anchors: ["下一轮更高压力。"],
+          },
+          foreshadowingRegistry: {
+            foreshadowings: (chapterPlan.foreshadowingActions || []).map((item) => ({
+              id: item.id,
+              status: item.action === "resolve" ? "resolved" : "active",
+              last_touched_chapter: chapterPlan.chapterId || "ch001",
+              planted_chapter: item.action === "plant" ? (chapterPlan.chapterId || "ch001") : "",
+              resolved_chapter: item.action === "resolve" ? (chapterPlan.chapterId || "ch001") : "",
+            })),
+          },
         }),
       });
     }
@@ -5706,6 +5999,43 @@ requires_openai_auth = true
   assert.equal(settings.baseUrl, "https://capi.quan2go.com/openai");
   assert.equal(settings.hasApiKey, true);
   assert.equal(settings.availableProviders.length, 1);
+  assert.equal(settings.agentModels.primary.providerId, "OpenAI");
+  assert.equal(settings.agentModels.primary.model, "gpt-5.4");
+  assert.equal(settings.agentModels.secondary.providerId, "OpenAI");
+  assert.equal(settings.agentModels.secondary.model, "gpt-5.4");
+  assert.deepEqual(settings.agentRouting, {
+    complex: "primary",
+    simple: "secondary",
+  });
+}));
+
+test("legacy root model fields are derived into primary and secondary agent slots", async () => withIsolatedProviderEnv(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-agent-slot-legacy-config-"));
+  saveCodexApiConfig(tempRoot, {
+    model_provider: "OpenAI",
+    model: "gpt-5.4",
+    review_model: "gpt-5.4-mini",
+    codex_model: "gpt-5.3-codex",
+    model_providers: {
+      OpenAI: {
+        name: "OpenAI",
+        base_url: "https://openai.example/v1",
+        wire_api: "responses",
+        api_key: "openai-key",
+        response_model: "gpt-5.4",
+        review_model: "gpt-5.4-mini",
+        codex_model: "gpt-5.3-codex",
+      },
+    },
+  });
+
+  const settings = resolveProviderSettings({}, tempRoot);
+  assert.equal(settings.agentModels.primary.providerId, "OpenAI");
+  assert.equal(settings.agentModels.primary.model, "gpt-5.4");
+  assert.equal(settings.agentModels.secondary.providerId, "OpenAI");
+  assert.equal(settings.agentModels.secondary.model, "gpt-5.4-mini");
+  assert.equal(settings.responseModel, "gpt-5.4");
+  assert.equal(settings.reviewModel, "gpt-5.4");
 }));
 
 test("provider settings ignore unsupported Kimi entries but keep MiniMax from codex config", async () => withIsolatedProviderEnv(async () => {
@@ -5772,6 +6102,116 @@ test("provider settings ignore unsupported Kimi entries but keep MiniMax from co
     settings.availableProviders.map((item) => item.id),
     ["OpenAI", "MiniMax"],
   );
+}));
+
+test("agent model slots can route complex and simple calls to different providers", async () => withIsolatedProviderEnv(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-agent-slot-routing-"));
+  saveCodexApiConfig(tempRoot, {
+    model_provider: "OpenAI",
+    model: "legacy-primary",
+    review_model: "legacy-secondary",
+    codex_model: "gpt-5.3-codex",
+    agent_models: {
+      primary: {
+        provider: "OpenAI",
+        model: "gpt-5.4",
+      },
+      secondary: {
+        provider: "MiniMax",
+        model: "MiniMax-M2.5-highspeed",
+      },
+    },
+    model_providers: {
+      OpenAI: {
+        name: "OpenAI",
+        base_url: "https://openai.example/v1",
+        wire_api: "responses",
+        api_key: "openai-key",
+        response_model: "gpt-5.4",
+        review_model: "gpt-5.4",
+        codex_model: "gpt-5.3-codex",
+      },
+      MiniMax: {
+        name: "MiniMax",
+        base_url: "https://api.minimaxi.com/v1",
+        wire_api: "chat_completions",
+        api_key: "minimax-key",
+        response_model: "MiniMax-M2.5-highspeed",
+        review_model: "MiniMax-M2.5-highspeed",
+        codex_model: "MiniMax-M2.5-highspeed",
+      },
+    },
+  });
+
+  const previousFetch = globalThis.fetch;
+  const seenCalls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    const targetUrl = String(url || "");
+    const payload = JSON.parse(String(options.body || "{}"));
+    seenCalls.push({ targetUrl, payload });
+
+    if (targetUrl === "https://openai.example/v1/responses") {
+      return jsonResponse({
+        output_text: payload.instructions === "default route" ? "default-ok" : "complex-ok",
+      });
+    }
+
+    if (targetUrl === "https://api.minimaxi.com/v1/chat/completions") {
+      return jsonResponse({
+        choices: [
+          {
+            index: 0,
+            finish_reason: "stop",
+            message: {
+              role: "assistant",
+              content: "simple-ok",
+            },
+          },
+        ],
+      });
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    const provider = createProvider({}, { rootDir: tempRoot });
+    assert.equal(provider.settings.providerId, "OpenAI");
+    assert.equal(provider.settings.agentModels.primary.providerId, "OpenAI");
+    assert.equal(provider.settings.agentModels.secondary.providerId, "MiniMax");
+
+    const complexResult = await provider.generateText({
+      instructions: "complex route",
+      input: "complex",
+      agentComplexity: "complex",
+    });
+    const simpleResult = await provider.generateText({
+      instructions: "simple route",
+      input: "simple",
+      agentComplexity: "simple",
+    });
+    const defaultResult = await provider.generateText({
+      instructions: "default route",
+      input: "default",
+    });
+
+    assert.equal(complexResult.text, "complex-ok");
+    assert.equal(simpleResult.text, "simple-ok");
+    assert.equal(defaultResult.text, "default-ok");
+    assert.deepEqual(
+      seenCalls.map((entry) => entry.targetUrl),
+      [
+        "https://openai.example/v1/responses",
+        "https://api.minimaxi.com/v1/chat/completions",
+        "https://openai.example/v1/responses",
+      ],
+    );
+    assert.equal(seenCalls[0].payload.model, "gpt-5.4");
+    assert.equal(seenCalls[1].payload.model, "MiniMax-M2.5-highspeed");
+    assert.equal(seenCalls[2].payload.model, "gpt-5.4");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
 }));
 
 test("MiniMax provider settings default to a conservative max concurrency", async () => withIsolatedProviderEnv(async () => {

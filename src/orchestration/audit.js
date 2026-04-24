@@ -357,6 +357,7 @@ async function runSemanticAudit({
 
   return generateStructuredObject(provider, {
     label: "AuditAnalyzerAgent",
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 AuditAnalyzerAgent。你负责对章节做单一路径语义审计，不依赖启发式兜底。请只对启用维度做审计，区分 critical / warning / info。critical 代表不修会直接伤到章节成稿质量或连续性；warning 代表提醒但不必卡死；info 只做记录。不要因为措辞与提纲不同就误判。只输出 JSON，不要解释。",
     input: [
@@ -388,7 +389,6 @@ async function runSemanticAudit({
   "nextChapterGuardrails": ["下一章最该避免的偏移1", "偏移2"]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "chapter_audit",
       chapterId: chapterPlan.chapterId,

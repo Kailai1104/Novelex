@@ -613,6 +613,7 @@ async function runOutlineContextAgent({
   const structureData = bundle?.structureData || {};
   const stage = stageForChapter(structureData, chapterPlan);
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 OutlineContextAgent。你负责从已锁定的大纲包里，为当前章节筛选真正会影响写作的总纲、阶段与章节上下文。不要复述全书，只保留当前章节必须兑现、必须保留、必须延后、最容易写偏的内容。只输出 JSON。",
     input: [
@@ -637,7 +638,6 @@ async function runOutlineContextAgent({
   "recommendedFocus": "一句话概括本章真正该聚焦的核心"
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "plan_context_outline",
       chapterId: chapterPlan.chapterId,
@@ -690,6 +690,7 @@ async function runCharacterContextAgent({
   }).join("\n\n");
 
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 CharacterContextAgent。你负责根据当前章节，从角色资料里筛选 Writer 真正需要的角色写法约束。重点只看：当前诉求、知识边界、人物声音、关系张力、这章最容易写崩的地方。只输出 JSON。",
     input: [
@@ -714,7 +715,6 @@ async function runCharacterContextAgent({
   "forbiddenLeaks": ["绝对不能让角色提前知道/说出/做出的内容"]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "plan_context_characters",
       chapterId: chapterPlan.chapterId,
@@ -743,6 +743,7 @@ async function runWorldContextAgent({
   researchPacket,
 }) {
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 WorldContextAgent。你负责从世界观、世界状态、伏笔注册表与风格指南中，筛出当前章节真正需要的世界约束。重点只保留会影响这一章写法的时代细节、世界规则、伏笔任务、风格禁忌与连续性提醒。只输出 JSON。",
     input: [
@@ -763,7 +764,6 @@ async function runWorldContextAgent({
   "researchFlags": ["需要额外注意的考据点"]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "plan_context_world",
       chapterId: chapterPlan.chapterId,
@@ -817,6 +817,7 @@ async function runHistorySelectorAgent({
   candidates,
 }) {
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 HistorySelectorAgent。你能看到所有已完成历史章节的摘要。请根据当前章节需求，挑出最值得 Writer 回看的 0 到 4 章。只选真正会影响这一章的连续性、人物余波、未完线程或世界状态的章节。只输出 JSON。",
     input: [
@@ -831,7 +832,6 @@ async function runHistorySelectorAgent({
   }
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "history_context_select",
       chapterId: chapterPlan.chapterId,
@@ -858,6 +858,7 @@ async function runHistoryDigestAgent({
   selectedCandidates,
 }) {
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 HistoryContextAgent。你负责阅读被挑中的历史章节，为 Writer 整理当前章节真正需要承接的历史内容。不要复述整章，只保留必须承接的事实、情绪余波、未完线程和不能冲突的点。只输出 JSON。",
     input: [
@@ -881,7 +882,6 @@ async function runHistoryDigestAgent({
   "lastEnding": "一句话概括最该继承的上章余波"
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "history_context_digest",
       chapterId: chapterPlan.chapterId,

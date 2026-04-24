@@ -729,10 +729,16 @@ function renderProjectPanel() {
   const project = snapshot.project.project;
   const providerRuntime = snapshot.provider;
   const availableProviders = providerRuntime.availableProviders || [];
-  const activeProvider =
+  const primaryRuntime = providerRuntime.agentModels?.primary || null;
+  const secondaryRuntime = providerRuntime.agentModels?.secondary || null;
+  const primaryProvider =
+    availableProviders.find((item) => item.id === primaryRuntime?.providerId) ||
     availableProviders.find((item) => item.id === providerRuntime.providerId) ||
     availableProviders[0] ||
     null;
+  const secondaryProvider =
+    availableProviders.find((item) => item.id === secondaryRuntime?.providerId) ||
+    primaryProvider;
   return `
     <section class="panel span-12">
       <div class="panel-header">
@@ -741,8 +747,8 @@ function renderProjectPanel() {
           <h2>项目设定</h2>
         </div>
         <div class="pill-row">
-          ${renderPill("Provider", providerRuntime.providerName)}
-          ${renderPill("Effective", providerRuntime.effectiveMode)}
+          ${renderPill("主力", primaryRuntime?.providerName || providerRuntime.providerName)}
+          ${renderPill("辅助", secondaryRuntime?.providerName || secondaryRuntime?.providerId || "未配置")}
         </div>
       </div>
       <div class="provider-switch-card">
@@ -752,51 +758,75 @@ function renderProjectPanel() {
             <h3>模型切换</h3>
           </div>
           <div class="pill-row">
-            ${renderPill("当前", activeProvider?.name || providerRuntime.providerName)}
-            ${renderPill("协议", providerRuntime.apiStyle)}
+            ${renderPill("复杂 Agent", primaryRuntime?.model || providerRuntime.responseModel)}
+            ${renderPill("简单 Agent", secondaryRuntime?.model || providerRuntime.reviewModel)}
           </div>
         </div>
         <form class="project-form" id="provider-config-form">
           <div class="form-grid">
             <div class="field">
-              <label>模型服务</label>
-              <select name="providerId" id="provider-switcher" ${disabledAttr(mutationBusy())}>
+              <label>主力 Provider</label>
+              <select name="primaryProviderId" id="primary-provider-switcher" data-slot="primary" ${disabledAttr(mutationBusy())}>
                 ${availableProviders.map((item) => `
                   <option
                     value="${escapeHtml(item.id)}"
-                    data-response-model="${escapeHtml(item.responseModel || "")}"
-                    data-review-model="${escapeHtml(item.reviewModel || "")}"
-                    data-codex-model="${escapeHtml(item.codexResponseModel || "")}"
+                    data-model="${escapeHtml(item.responseModel || "")}"
                     data-wire-api="${escapeHtml(item.wireApi || "")}"
                     data-base-url="${escapeHtml(item.baseUrl || "")}"
                     data-has-api-key="${item.hasApiKey ? "true" : "false"}"
-                    ${item.id === providerRuntime.providerId ? "selected" : ""}
+                    ${item.id === primaryRuntime?.providerId ? "selected" : ""}
                   >${escapeHtml(item.name)}</option>`).join("")}
               </select>
             </div>
             <div class="field">
-              <label>接入协议</label>
-              <input id="provider-wire-api" value="${escapeHtml(activeProvider?.wireApi || providerRuntime.apiStyle || "")}" disabled />
+              <label>主力协议</label>
+              <input id="primary-provider-wire-api" value="${escapeHtml(primaryProvider?.wireApi || primaryRuntime?.apiStyle || providerRuntime.apiStyle || "")}" disabled />
             </div>
             <div class="field full">
-              <label>Base URL</label>
-              <input id="provider-base-url" value="${escapeHtml(activeProvider?.baseUrl || providerRuntime.baseUrl || "")}" disabled />
+              <label>主力 Base URL</label>
+              <input id="primary-provider-base-url" value="${escapeHtml(primaryProvider?.baseUrl || primaryRuntime?.baseUrl || providerRuntime.baseUrl || "")}" disabled />
             </div>
             <div class="field">
-              <label>文本模型</label>
-              <input name="responseModel" value="${escapeHtml(providerRuntime.responseModel || activeProvider?.responseModel || "")}" ${disabledAttr(mutationBusy())} />
+              <label>主力模型</label>
+              <input name="primaryModel" value="${escapeHtml(primaryRuntime?.model || primaryProvider?.responseModel || providerRuntime.responseModel || "")}" ${disabledAttr(mutationBusy())} />
             </div>
             <div class="field">
-              <label>审查模型</label>
-              <input name="reviewModel" value="${escapeHtml(providerRuntime.reviewModel || activeProvider?.reviewModel || "")}" ${disabledAttr(mutationBusy())} />
+              <label>主力 API Key 状态</label>
+              <input id="primary-provider-key-status" value="${primaryProvider?.hasApiKey ? "已检测到当前 Provider 的 API Key" : "当前 Provider 尚未配置 API Key"}" disabled />
+            </div>
+            <div class="field">
+              <label>辅助 Provider</label>
+              <select name="secondaryProviderId" id="secondary-provider-switcher" data-slot="secondary" ${disabledAttr(mutationBusy())}>
+                ${availableProviders.map((item) => `
+                  <option
+                    value="${escapeHtml(item.id)}"
+                    data-model="${escapeHtml(item.responseModel || "")}"
+                    data-wire-api="${escapeHtml(item.wireApi || "")}"
+                    data-base-url="${escapeHtml(item.baseUrl || "")}"
+                    data-has-api-key="${item.hasApiKey ? "true" : "false"}"
+                    ${item.id === secondaryRuntime?.providerId ? "selected" : ""}
+                  >${escapeHtml(item.name)}</option>`).join("")}
+              </select>
+            </div>
+            <div class="field">
+              <label>辅助协议</label>
+              <input id="secondary-provider-wire-api" value="${escapeHtml(secondaryProvider?.wireApi || secondaryRuntime?.apiStyle || providerRuntime.apiStyle || "")}" disabled />
+            </div>
+            <div class="field full">
+              <label>辅助 Base URL</label>
+              <input id="secondary-provider-base-url" value="${escapeHtml(secondaryProvider?.baseUrl || secondaryRuntime?.baseUrl || providerRuntime.baseUrl || "")}" disabled />
+            </div>
+            <div class="field">
+              <label>辅助模型</label>
+              <input name="secondaryModel" value="${escapeHtml(secondaryRuntime?.model || secondaryProvider?.responseModel || providerRuntime.reviewModel || "")}" ${disabledAttr(mutationBusy())} />
+            </div>
+            <div class="field">
+              <label>辅助 API Key 状态</label>
+              <input id="secondary-provider-key-status" value="${secondaryProvider?.hasApiKey ? "已检测到当前 Provider 的 API Key" : "当前 Provider 尚未配置 API Key"}" disabled />
             </div>
             <div class="field">
               <label>Codex 模型</label>
-              <input name="codexResponseModel" value="${escapeHtml(providerRuntime.codexResponseModel || activeProvider?.codexResponseModel || "")}" ${disabledAttr(mutationBusy())} />
-            </div>
-            <div class="field">
-              <label>API Key 状态</label>
-              <input id="provider-key-status" value="${activeProvider?.hasApiKey ? "已检测到当前 Provider 的 API Key" : "当前 Provider 尚未配置 API Key"}" disabled />
+              <input value="${escapeHtml(providerRuntime.codexResponseModel || primaryProvider?.codexResponseModel || "")}" disabled />
             </div>
             <div class="field full">
               <label>配置来源</label>
@@ -812,10 +842,10 @@ function renderProjectPanel() {
             </div>
           </div>
           <p class="helper-text">
-            这里的切换会直接写回 <code>novelex.codex.toml</code>。每个 Provider 会记住各自最近一次保存的模型名，切回时会自动带回。
+            这里的切换会直接写回 <code>novelex.codex.toml</code> 的 <code>agent_models.primary</code> 与 <code>agent_models.secondary</code>。
           </p>
           <p class="helper-text">
-            API Key 与 Base URL 都以 <code>novelex.codex.toml</code> 为准。若当前 Provider 缺少 Key，系统会显示为不可用。
+            主力模型负责复杂 agent，辅助模型负责简单 agent。API Key 与 Base URL 都以 <code>novelex.codex.toml</code> 为准。
             ${providerRuntime.configError ? ` 当前配置文件错误：${escapeHtml(providerRuntime.configError)}` : ""}
           </p>
           <div class="actions">
@@ -1804,8 +1834,9 @@ function collectFormData(form) {
   return Object.fromEntries(new FormData(form).entries());
 }
 
-function syncProviderDraftFromSelection() {
-  const select = document.querySelector("#provider-switcher");
+function syncProviderDraftFromSelection(slot) {
+  const normalizedSlot = slot === "secondary" ? "secondary" : "primary";
+  const select = document.querySelector(`#${normalizedSlot}-provider-switcher`);
   if (!select) {
     return;
   }
@@ -1820,21 +1851,13 @@ function syncProviderDraftFromSelection() {
     return;
   }
 
-  const responseModelInput = form.querySelector('[name="responseModel"]');
-  const reviewModelInput = form.querySelector('[name="reviewModel"]');
-  const codexModelInput = form.querySelector('[name="codexResponseModel"]');
-  const wireApiInput = document.querySelector("#provider-wire-api");
-  const baseUrlInput = document.querySelector("#provider-base-url");
-  const keyStatusInput = document.querySelector("#provider-key-status");
+  const modelInput = form.querySelector(`[name="${normalizedSlot}Model"]`);
+  const wireApiInput = document.querySelector(`#${normalizedSlot}-provider-wire-api`);
+  const baseUrlInput = document.querySelector(`#${normalizedSlot}-provider-base-url`);
+  const keyStatusInput = document.querySelector(`#${normalizedSlot}-provider-key-status`);
 
-  if (responseModelInput) {
-    responseModelInput.value = option.dataset.responseModel || "";
-  }
-  if (reviewModelInput) {
-    reviewModelInput.value = option.dataset.reviewModel || "";
-  }
-  if (codexModelInput) {
-    codexModelInput.value = option.dataset.codexModel || "";
+  if (modelInput) {
+    modelInput.value = option.dataset.model || "";
   }
   if (wireApiInput) {
     wireApiInput.value = option.dataset.wireApi || "";
@@ -1933,8 +1956,12 @@ function bindEvents() {
     });
   });
 
-  document.querySelector("#provider-switcher")?.addEventListener("change", () => {
-    syncProviderDraftFromSelection();
+  document.querySelector("#primary-provider-switcher")?.addEventListener("change", () => {
+    syncProviderDraftFromSelection("primary");
+  });
+
+  document.querySelector("#secondary-provider-switcher")?.addEventListener("change", () => {
+    syncProviderDraftFromSelection("secondary");
   });
 
   document.querySelector("#provider-config-form")?.addEventListener("submit", async (event) => {

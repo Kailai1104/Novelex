@@ -89,6 +89,7 @@ const OUTLINE_DIVERSITY_PRESETS = {
 
 const OUTLINE_CONSISTENCY_MAX_ATTEMPTS = 5;
 const OUTLINE_CONSISTENCY_AUDIT_RETRIES = 2;
+const RESEARCH_MCP_QUERY_TIMEOUT_MS = 8000;
 
 function step(id, label, layer, summary, extra = {}) {
   return {
@@ -121,6 +122,25 @@ function normalizeStringList(values, limit = 8) {
   return [...new Set((Array.isArray(values) ? values : [])
     .map((item) => String(item || "").trim())
     .filter(Boolean))].slice(0, limit);
+}
+
+async function withOperationTimeout(task, timeoutMs, label = "Operation timed out") {
+  const normalizedTimeoutMs = Number(timeoutMs);
+  if (!Number.isFinite(normalizedTimeoutMs) || normalizedTimeoutMs <= 0) {
+    return task;
+  }
+
+  let timer = null;
+  try {
+    return await Promise.race([
+      task,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(label)), normalizedTimeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 const OUTLINE_THREAD_MODES = new Set(["single_spine", "dual_spine", "braided"]);
@@ -485,6 +505,7 @@ async function buildDeterministicContinuityGuard({
   ], 6);
   const guard = await generateStructuredObject(provider, {
     label: "ContinuityGuardAgent",
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 ContinuityGuardAgent。你负责根据上章已锁定细纲、上章正文尾部、canon facts 和当前 chapter slot，为当前章节裁定允许的开场承接方式，并明确禁止的重开/重演模式。不要输出解释，只输出 JSON。",
     input: [
@@ -516,7 +537,6 @@ async function buildDeterministicContinuityGuard({
   "unsupportedClaims": ["当前不允许的开场说法"]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "continuity_guard",
       chapterId: chapterBase?.chapterId || "",
@@ -1142,6 +1162,7 @@ async function runChapterOutlineConsistencyAuditAgent({
   candidates = [],
 }) {
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 ChapterOutlineConsistencyAuditAgent。你负责审计章节细纲候选的整章跨章节一致性。重点检查：已定事实是否被重置、历史事实是否冲突、人物知识是否越界、未完线程是否断裂、章末压力是否真正递交、是否提前兑现未来伏笔、以及中段是否把第一章/上一章已完成事件重演。critical 会阻断进入正文；warning 只提醒。只输出 JSON。",
     input: [
@@ -1181,7 +1202,6 @@ async function runChapterOutlineConsistencyAuditAgent({
   ]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "chapter_outline_consistency_audit",
       chapterId: chapterBase.chapterId,
@@ -1248,6 +1268,7 @@ async function runChapterOutlineRepairAgent({
 }) {
   const factSections = buildFactPromptSections(resources.factContext);
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 ChapterOutlineRepairAgent。你会看到一组细纲候选和它们的一致性审计问题。请在保留可用场景资产、人物焦点和有效推进方向的前提下，修复跨章节连续性冲突。不要删成空壳，不要重开第一章式开场，不要重置已定事实。尽量保留原 proposalId。只输出 JSON。",
     input: [
@@ -1325,7 +1346,6 @@ async function runChapterOutlineRepairAgent({
   ]
 }`,
     ].filter(Boolean).join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "chapter_outline_repair",
       chapterId: resources.chapterBase.chapterId,
@@ -2062,6 +2082,7 @@ async function runResearchPlannerAgent({
   chapterPlan,
 }) {
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 ResearchPlannerAgent。请判断当前章节是否真的需要外部检索，并把需要搜索的事实问题拆成少量高价值查询。不要泛泛而谈，只保留会直接影响本章写法的时代细节、术语、礼制、工艺、地理、制度、兵制或生活方式。只输出 JSON。",
     input: [
@@ -2083,7 +2104,6 @@ async function runResearchPlannerAgent({
   "riskFlags": ["最容易写错的点"]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "research_planner",
       chapterId: chapterPlan.chapterId,
@@ -2130,10 +2150,20 @@ async function runResearchRetriever({
   try {
     const searchPackets = [];
     for (const query of plannerPacket.queries) {
-      const toolResult = await mcpManager.callTool("web_search", { query }, {
-        chapterId: chapterPlan.chapterId,
-        feature: "research_retriever",
-      });
+      let toolResult;
+      try {
+        toolResult = await withOperationTimeout(
+          mcpManager.callTool("web_search", { query }, {
+            chapterId: chapterPlan.chapterId,
+            feature: "research_retriever",
+          }),
+          RESEARCH_MCP_QUERY_TIMEOUT_MS,
+          `MCP web_search query timed out after ${RESEARCH_MCP_QUERY_TIMEOUT_MS}ms.`,
+        );
+      } catch (error) {
+        await mcpManager.closeAll().catch(() => {});
+        throw error;
+      }
       searchPackets.push(normalizeWebSearchToolResult(toolResult, { query }));
     }
 
@@ -2143,6 +2173,7 @@ async function runResearchRetriever({
     }
 
     const result = await provider.generateText({
+      agentComplexity: "complex",
       instructions:
         "你是 Novelex 的 ResearchRetriever。你会收到一组已经完成的外部搜索结果。请只基于这些结果输出 JSON，总结当前章节真正该用的事实、该避开的误写、推荐术语、不确定点与来源备注。",
       input: [
@@ -2170,6 +2201,7 @@ async function runResearchRetriever({
   } catch (mcpError) {
     try {
       const result = await provider.generateText({
+        agentComplexity: "complex",
         instructions:
           "你是 Novelex 的 ResearchRetriever。请直接调用 web_search 工具检索给定问题，只基于检索结果输出 JSON，总结当前章节真正该用的事实、该避开的误写、推荐术语、不确定点与来源备注。",
         input: [
@@ -2235,6 +2267,7 @@ async function runResearchSynthesizerAgent({
   }
 
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 ResearchSynthesizerAgent。请把检索结果压缩成 Writer 直接能消费的研究资料包。只保留会影响本章写法的事实、术语、误写风险和未决点。只输出 JSON。",
     input: [
@@ -2252,7 +2285,6 @@ async function runResearchSynthesizerAgent({
   "sourceNotes": ["来源说明1", "来源说明2"]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "research_synthesizer",
       chapterId: chapterPlan.chapterId,
@@ -2751,6 +2783,7 @@ async function runFeedbackSupervisorAgent({
   }
 
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       mode === "partial_rewrite"
         ? "你是 Novelex 的 FeedbackSupervisorAgent。你只负责检查当前候选替换片段是否落实了作者反馈。若仍未落实，要指出缺口，并给出新的 revision notes。若必须改动选区外文本才能落实，请明确把 scopeBlocked 设为 true。只输出 JSON。"
@@ -2765,7 +2798,6 @@ async function runFeedbackSupervisorAgent({
       selection,
       currentDraftMarkdown,
     }),
-    useReviewModel: true,
     metadata: {
       feature: mode === "partial_rewrite" ? "chapter_partial_feedback_supervisor" : "chapter_feedback_supervisor",
       chapterId: chapterPlan.chapterId,
@@ -3413,6 +3445,7 @@ async function buildDerivedChapterStateArtifacts({
 
   return generateStructuredObject(provider, {
     label: "ChapterStateDeriverAgent",
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 ChapterStateDeriverAgent。你负责在章节正文通过后，基于本章正文、章纲、当前角色状态、世界状态和伏笔注册表，派生新的 character_states、chapter_meta、world_state、foreshadowing_registry。不能重置已成立事实，不能发明正文中没有落地的重大结果。只输出 JSON。",
     input: [
@@ -3433,7 +3466,6 @@ async function buildDerivedChapterStateArtifacts({
   "foreshadowingRegistry": {}
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "chapter_state_derivation",
       chapterId: chapterPlan?.chapterId || "",
@@ -3453,6 +3485,63 @@ async function buildDerivedChapterStateArtifacts({
       return {
         characterStates,
         chapterMeta: {
+          chapter_id: String(
+            chapterMeta.chapter_id ||
+            chapterMeta.chapterId ||
+            chapterPlan?.chapterId ||
+            effectiveChapterPlan?.chapterId ||
+            "",
+          ).trim(),
+          chapterId: String(
+            chapterMeta.chapterId ||
+            chapterMeta.chapter_id ||
+            chapterPlan?.chapterId ||
+            effectiveChapterPlan?.chapterId ||
+            "",
+          ).trim(),
+          title: String(chapterMeta.title || effectiveChapterPlan?.title || chapterPlan?.title || "").trim(),
+          stage: String(chapterMeta.stage || effectiveChapterPlan?.stage || chapterPlan?.stage || "").trim(),
+          time_in_story: String(
+            chapterMeta.time_in_story ||
+            chapterMeta.timeInStory ||
+            effectiveChapterPlan?.timeInStory ||
+            chapterPlan?.timeInStory ||
+            "",
+          ).trim(),
+          pov_character: String(
+            chapterMeta.pov_character ||
+            chapterMeta.povCharacter ||
+            effectiveChapterPlan?.povCharacter ||
+            chapterPlan?.povCharacter ||
+            "",
+          ).trim(),
+          location: String(chapterMeta.location || effectiveChapterPlan?.location || chapterPlan?.location || "").trim(),
+          next_hook: String(
+            chapterMeta.next_hook ||
+            chapterMeta.nextHook ||
+            effectiveChapterPlan?.nextHook ||
+            chapterPlan?.nextHook ||
+            "",
+          ).trim(),
+          key_events: Array.isArray(chapterMeta.key_events)
+            ? chapterMeta.key_events
+            : Array.isArray(chapterMeta.keyEvents)
+              ? chapterMeta.keyEvents
+              : Array.isArray(effectiveChapterPlan?.keyEvents)
+                ? effectiveChapterPlan.keyEvents
+                : (chapterPlan?.keyEvents || []),
+          characters_present: Array.isArray(chapterMeta.characters_present)
+            ? chapterMeta.characters_present
+            : Array.isArray(chapterMeta.charactersPresent)
+              ? chapterMeta.charactersPresent
+              : (effectiveChapterPlan?.charactersPresent || chapterPlan?.charactersPresent || []),
+          emotional_tone: String(
+            chapterMeta.emotional_tone ||
+            chapterMeta.emotionalTone ||
+            effectiveChapterPlan?.emotionalTone ||
+            chapterPlan?.emotionalTone ||
+            "",
+          ).trim(),
           ...chapterMeta,
           planned_characters_present: chapterPlan?.charactersPresent || [],
           missing_required_characters: presence.missingRequiredCharacters,
@@ -3540,6 +3629,7 @@ async function runStyleGuideDeriverAgent({
 }) {
   const parsed = await generateStructuredObject(provider, {
     label: "StyleGuideDeriverAgent",
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 StyleGuideDeriverAgent。你的任务是为当前项目生成可直接给 Writer 使用的 style guide。若提供了首章正文，请优先从正文里提炼稳定文风与叙事禁忌；若没有正文，则基于项目信息和章纲生成一份可执行的临时风格基线。只输出 JSON。",
     input: [
@@ -3560,7 +3650,6 @@ async function runStyleGuideDeriverAgent({
   "voiceSummary": "一句概括这部作品当前应保持的声音"
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "style_guide_derivation",
       chapterId: chapterPlan?.chapterId || "",
@@ -4089,6 +4178,7 @@ async function generateChapterPartialRevisionText({
     promptTelemetry.writerPromptPacket = writerPromptPacket;
   }
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions: "你是 Novelex 的 RevisionAgent。你会看到整章写作上下文、原文全文、用户选中的原文片段和修改要求。你只能改写选中的片段，不能修改任何未选中部分。只输出最终替换片段，不要解释。",
     input: partialRevisionPromptInput({
       project,
@@ -4187,6 +4277,7 @@ async function generateChapterDraftText({
     : writerPromptPacket.markdown;
 
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions,
     input,
     metadata: {
@@ -4700,6 +4791,7 @@ async function runLockedChapterOutlineSyncAgent({
     : "无";
 
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 ChapterOutlineSyncAgent。当前章节正文已经通过人工批准，即将锁章。你的任务是以最终正文为唯一事实源，重建一个供后续章节继承的 chapter plan，并覆盖旧细纲。不要改 chapterId、chapterNumber、title、stage，不要把正文里没有落地的情节塞回去，不要生成新的伏笔 ID 或 action。只输出 JSON。",
     input: [
@@ -4749,7 +4841,6 @@ async function runLockedChapterOutlineSyncAgent({
   ]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "chapter_outline_lock_sync",
       chapterId: baseChapterPlan.chapterId,
@@ -4872,6 +4963,7 @@ async function runStagePlanningContextAgent({
 }) {
   const factSections = buildFactPromptSections(factContext);
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 StagePlanningContextAgent。你负责把当前章节在全书粗纲与当前阶段中的任务提炼出来，供后续章节细纲候选生成使用。必须服从章节锚点、已定稿历史与连续性护栏；chN>1 默认承接前章，不能重开第一章。不要写正文，不要写章节方案，只输出当前章节的义务、延后项、冲突轴和标题信号。只输出 JSON。",
     input: [
@@ -4904,7 +4996,6 @@ async function runStagePlanningContextAgent({
   "nextPressure": "本章结束后最该留下的下一压力"
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "chapter_outline_stage_context",
       chapterId: chapterBase.chapterId,
@@ -4953,6 +5044,7 @@ async function runCharacterPlanningContextAgent({
   }).join("\n\n");
 
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 CharacterPlanningContextAgent。你负责为当前章节筛选最该出场的人物、推荐 POV、关系压力和禁止泄漏内容。不要生成细纲或正文，只输出 JSON。",
     input: [
@@ -4970,7 +5062,6 @@ async function runCharacterPlanningContextAgent({
   "voiceNotes": ["角色写法提醒"]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "chapter_outline_character_context",
       chapterId: chapterBase.chapterId,
@@ -5006,6 +5097,7 @@ async function runHistoryPlanningContextAgent({
   const expandedDetails = expandCommittedHistoryDetails(priorOutlines, chapterBase, 4);
 
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 HistoryPlanningContextAgent。你负责读取全书已经定稿的章节细纲，从中筛出当前章节真正需要继承的历史语义。你的职责是粗粒度控制：提炼必须延续的事实、情绪、未完线程、优先推进的主线，以及本章该压低存在感的历史线程。不要负责 scene 级衔接，不要生成细纲，只输出 JSON。",
     input: [
@@ -5026,7 +5118,6 @@ async function runHistoryPlanningContextAgent({
   "lastEnding": "一句话概括上章余波"
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "chapter_outline_history_context",
       chapterId: chapterBase.chapterId,
@@ -5067,6 +5158,7 @@ async function runChapterContinuityAgent({
   const previousPlan = previousOutline?.chapterPlan || null;
   const factSections = buildFactPromptSections(factContext);
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 ChapterContinuityAgent。你专门负责章节之间的细粒度衔接：上一章怎么接进来、当前章主承接哪条线、哪些副线只能轻触、以及本章结尾要把什么压力递交给下一章。你只能在提供的证据范围内组织承接方式，不允许自由脑补失去意识、惊醒、重新确认身份等桥段。不要做全书语义总结，不要生成细纲或正文，只输出 JSON。",
     input: [
@@ -5104,7 +5196,6 @@ async function runChapterContinuityAgent({
   "unsupportedClaims": ["缺乏证据支持的设定或桥段"]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "chapter_outline_continuity_context",
       chapterId: chapterBase.chapterId,
@@ -5313,6 +5404,7 @@ function selectOutlineVariantProposal(parsed, expectedProposalId) {
 async function runChapterOutlineVariantAgent(options) {
   const { provider, chapterBase, outlineOptions, variantBrief } = options;
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 ChapterOutlineAgent / ChapterOutlineVariantAgent。你是并发候选生成中的一个独立 variant agent，只生成自己负责的一个章节细纲候选。你必须与其他 variant 在冲突轴、人物焦点、场景链和章末压力上拉开差异，但不能违反已定事实、章节衔接和细纲生成合同。只输出 JSON。",
     input: buildChapterOutlineVariantInput(options),
@@ -5902,6 +5994,7 @@ async function finalizeComposedChapterOutline({
 }) {
   const factSections = buildFactPromptSections(resources.factContext);
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 ChapterOutlineFinalizeAgent。作者已经从多个候选细纲里挑出一组 scenes。请把这些 scene 归一化成一个完整可执行的 chapter plan，补齐事件、弧光、钩子、角色名单和连续性锚点。只输出 JSON。",
     input: [

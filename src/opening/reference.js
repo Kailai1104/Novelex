@@ -142,6 +142,7 @@ async function runOpeningQueryPlannerAgent({
       : `${project.title} 的开头设计`;
 
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 OpeningQueryPlannerAgent。请围绕优秀网文前三章的结构学习，为当前任务生成少量高价值检索问题。重点关注开场钩子、主角亮相、冲突点燃、信息投放顺序、前三章升级节奏与章末牵引。严格避免要求模仿原句。只输出 JSON。",
     input: [
@@ -159,7 +160,6 @@ async function runOpeningQueryPlannerAgent({
   "focusAspects": ["要重点学习的开头结构1", "结构2"]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "opening_query_planner",
       mode,
@@ -182,6 +182,7 @@ async function runOpeningPatternSynthesizerAgent({
   matches,
 }) {
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 OpeningPatternSynthesizerAgent。你会看到若干优秀网文前三章片段。请把它们压缩成可供 Novelex agent 使用的黄金三章结构参考包，只总结结构方法，不允许鼓励模仿句子。只输出 JSON。",
     input: [
@@ -205,7 +206,6 @@ async function runOpeningPatternSynthesizerAgent({
   "avoidPatterns": ["应避免的问题1"]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "opening_pattern_synthesizer",
       mode,
@@ -233,6 +233,7 @@ async function runOpeningRecallAgent({
   chunks,
 }) {
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 OpeningRecallAgent。你会看到优秀网文前三章的 chunk 摘要目录。请只挑出最值得进入二次精读的片段，重点学习开场钩子、主角亮相、冲突点燃、前三章升级和章末牵引。只输出 JSON。",
     input: [
@@ -249,7 +250,6 @@ async function runOpeningRecallAgent({
   }
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "opening_recall",
       mode,
@@ -463,6 +463,7 @@ export async function scopeOpeningReferencePacketWithAgent(provider, packet, {
 
   return generateStructuredObject(provider, {
     label: "OpeningReferenceScoperAgent",
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 OpeningReferenceScoperAgent。你负责把黄金三章参考包压缩成适合当前章节位的抽象结构信号。对非第一章，必须主动压制第一章冷启动模板、源小说人物名、具体桥段和 Beat 编号，只保留连续章节也能安全继承的结构方法。只输出 JSON。",
     input: [
@@ -484,7 +485,6 @@ export async function scopeOpeningReferencePacketWithAgent(provider, packet, {
   "warnings": ["附加说明"]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "opening_reference_scope",
       chapterNumber: normalizedChapterNumber,

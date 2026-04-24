@@ -17,6 +17,7 @@ export async function generateStructuredObject(provider, {
   label = "StructuredAgent",
   instructions,
   input,
+  agentComplexity,
   useReviewModel = false,
   model,
   tools,
@@ -34,6 +35,7 @@ export async function generateStructuredObject(provider, {
   const result = await provider.generateText({
     instructions,
     input,
+    agentComplexity,
     useReviewModel,
     model,
     tools,

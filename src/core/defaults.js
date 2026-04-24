@@ -23,6 +23,16 @@ export const DEFAULT_PROJECT_STATE = {
     responseModel: "gpt-5.4",
     reviewModel: "gpt-5.4",
     codexResponseModel: "gpt-5.3-codex",
+    agentModels: {
+      primary: {
+        provider: "OpenAI",
+        model: "gpt-5.4",
+      },
+      secondary: {
+        provider: "OpenAI",
+        model: "gpt-5.4",
+      },
+    },
     reasoningEffort: "medium",
     forceStream: false,
   },

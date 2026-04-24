@@ -345,6 +345,83 @@ function fallbackProviderId(modelProviders = {}) {
   return Object.keys(modelProviders).find((providerId) => !UNSUPPORTED_PROVIDER_IDS.has(providerId)) || "OpenAI";
 }
 
+function resolveAgentSlotProvider(providerId, modelProviders = {}, fallbackId = "OpenAI") {
+  const requestedProviderId = String(providerId || "").trim();
+  if (requestedProviderId && modelProviders[requestedProviderId]) {
+    return requestedProviderId;
+  }
+  if (modelProviders[fallbackId]) {
+    return fallbackId;
+  }
+  return fallbackProviderId(modelProviders);
+}
+
+function resolveAgentSlotModel(model, preferredModel = "", providerBlock = {}, fallbackModel = "") {
+  return String(
+    model ||
+    preferredModel ||
+    providerBlock.response_model ||
+    providerBlock.model ||
+    fallbackModel ||
+    DEFAULT_PROVIDER_CATALOG.OpenAI.response_model,
+  ).trim() || DEFAULT_PROVIDER_CATALOG.OpenAI.response_model;
+}
+
+export function normalizeAgentModelSlots(data = {}, modelProviders = {}) {
+  const providers = modelProviders || {};
+  const rootProviderId = resolveAgentSlotProvider(data.model_provider, providers, fallbackProviderId(providers));
+  const rootProviderBlock =
+    providers[rootProviderId] ||
+    providers.OpenAI ||
+    defaultProviderCatalog().OpenAI;
+  const configuredPrimary = data.agent_models?.primary;
+  const configuredSecondary = data.agent_models?.secondary;
+  const hasExplicitSlots = Boolean(configuredPrimary || configuredSecondary);
+
+  const primaryProvider = resolveAgentSlotProvider(
+    configuredPrimary?.provider,
+    providers,
+    rootProviderId,
+  );
+  const primaryProviderBlock =
+    providers[primaryProvider] ||
+    providers.OpenAI ||
+    defaultProviderCatalog().OpenAI;
+  const primaryModel = resolveAgentSlotModel(
+    configuredPrimary?.model,
+    hasExplicitSlots ? "" : data.model,
+    primaryProviderBlock,
+    rootProviderBlock.response_model,
+  );
+
+  const secondaryProvider = resolveAgentSlotProvider(
+    configuredSecondary?.provider,
+    providers,
+    hasExplicitSlots ? primaryProvider : rootProviderId,
+  );
+  const secondaryProviderBlock =
+    providers[secondaryProvider] ||
+    providers.OpenAI ||
+    defaultProviderCatalog().OpenAI;
+  const secondaryModel = resolveAgentSlotModel(
+    configuredSecondary?.model,
+    hasExplicitSlots ? "" : (data.review_model || primaryModel),
+    secondaryProviderBlock,
+    primaryModel,
+  );
+
+  return {
+    primary: {
+      provider: primaryProvider,
+      model: primaryModel,
+    },
+    secondary: {
+      provider: secondaryProvider,
+      model: secondaryModel,
+    },
+  };
+}
+
 export function normalizeProviderCatalog(rawProviders = {}) {
   const normalized = {};
 
@@ -380,7 +457,12 @@ export function normalizeCodexConfigData(data = {}) {
   normalized.model_providers = normalizeProviderCatalog(normalized.model_providers || {});
   normalized.mcp = mergeConfigTree(DEFAULT_MCP_CONFIG, normalized.mcp || {});
 
-  const requestedProviderId = String(normalized.model_provider || "OpenAI").trim() || "OpenAI";
+  const hasExplicitAgentSlots = Boolean(normalized.agent_models?.primary || normalized.agent_models?.secondary);
+  const requestedProviderId = String(
+    (hasExplicitAgentSlots ? normalized.agent_models?.primary?.provider : "") ||
+    normalized.model_provider ||
+    "OpenAI",
+  ).trim() || "OpenAI";
   const providerId = normalized.model_providers[requestedProviderId]
     ? requestedProviderId
     : fallbackProviderId(normalized.model_providers);
@@ -393,6 +475,7 @@ export function normalizeCodexConfigData(data = {}) {
   normalized.model_provider = providerId;
   normalized.model =
     String(
+      (hasExplicitAgentSlots ? normalized.agent_models?.primary?.model : "") ||
       (keepRootModelSelection ? normalized.model : "") ||
       providerBlock.response_model ||
       providerBlock.model ||
@@ -400,6 +483,7 @@ export function normalizeCodexConfigData(data = {}) {
     ).trim() || DEFAULT_PROVIDER_CATALOG.OpenAI.response_model;
   normalized.review_model =
     String(
+      (hasExplicitAgentSlots ? normalized.model : "") ||
       (keepRootModelSelection ? normalized.review_model : "") ||
       providerBlock.review_model ||
       providerBlock.response_model ||
@@ -420,6 +504,8 @@ export function normalizeCodexConfigData(data = {}) {
   if (!Object.prototype.hasOwnProperty.call(normalized, "disable_response_storage")) {
     normalized.disable_response_storage = true;
   }
+
+  normalized.agent_models = normalizeAgentModelSlots(normalized, normalized.model_providers);
 
   return normalized;
 }

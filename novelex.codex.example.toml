@@ -7,6 +7,14 @@ disable_response_storage = true
 zhipu_api_key = "YOUR_ZHIPU_API_KEY"
 force_stream = false
 
+[agent_models.primary]
+provider = "OpenAI"
+model = "gpt-5.4"
+
+[agent_models.secondary]
+provider = "MiniMax"
+model = "MiniMax-M2.5-highspeed"
+
 [mcp]
 enabled = true
 

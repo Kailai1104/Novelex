@@ -12,6 +12,7 @@ function parseAgentJson(result) {
 
 async function runStyleFingerprintAgent(provider, { name, sampleText }) {
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions: [
       "你是 Novelex 的 StyleFingerprintAgent。",
       "你的任务是读取一篇范文，抽取它在写作层面的稳定风格特征，并输出结构化 JSON。",
@@ -36,7 +37,6 @@ async function runStyleFingerprintAgent(provider, { name, sampleText }) {
   "recommendations": ["建议项1", "建议项2"]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "style_fingerprint_generation",
     },

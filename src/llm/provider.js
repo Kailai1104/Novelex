@@ -1360,7 +1360,7 @@ function providerSupportsNativeWebSearch(settings) {
   return settings.providerId === "MiniMax";
 }
 
-export function resolveProviderSettings(projectState, rootDir = process.cwd(), options = {}) {
+function resolveSingleProviderSettings(projectState, rootDir = process.cwd(), options = {}) {
   const codexConfig = loadCodexApiConfig(rootDir);
   const providerConfig = {
     ...(projectState?.providerConfig || {}),
@@ -1475,6 +1475,97 @@ export function resolveProviderSettings(projectState, rootDir = process.cwd(), o
   };
 }
 
+function buildAgentModelRuntime(slotName, slotConfig, providerSettings) {
+  return {
+    slot: slotName,
+    providerId: providerSettings.providerId,
+    providerName: providerSettings.providerName,
+    model: String(slotConfig?.model || providerSettings.responseModel || "").trim(),
+    apiStyle: providerSettings.apiStyle,
+    configuredMode: providerSettings.configuredMode,
+    effectiveMode: providerSettings.effectiveMode,
+    hasApiKey: providerSettings.hasApiKey,
+    baseUrl: providerSettings.baseUrl,
+    maxConcurrency: providerSettings.maxConcurrency,
+    requestTimeoutMs: providerSettings.requestTimeoutMs,
+    overloadRetryWindowMs: providerSettings.overloadRetryWindowMs,
+    overloadBaseDelayMs: providerSettings.overloadBaseDelayMs,
+    overloadMaxDelayMs: providerSettings.overloadMaxDelayMs,
+    overloadJitterRatio: providerSettings.overloadJitterRatio,
+    supportsNativeWebSearch: providerSettings.supportsNativeWebSearch,
+  };
+}
+
+export function resolveProviderSettings(projectState, rootDir = process.cwd(), options = {}) {
+  if (options.providerIdOverride) {
+    return resolveSingleProviderSettings(projectState, rootDir, options);
+  }
+
+  const codexConfig = loadCodexApiConfig(rootDir);
+  const providerConfig = {
+    ...(projectState?.providerConfig || {}),
+  };
+  const fileData = normalizeCodexConfigData(codexConfig.data || {});
+  const runtimeAgentModels = providerConfig.agentModels || {};
+  const preferFileValues = Boolean(codexConfig.exists && !codexConfig.error);
+  const primarySlotConfig = preferFileValues
+    ? (fileData.agent_models?.primary || {
+      provider: fileData.model_provider,
+      model: fileData.model,
+    })
+    : {
+      provider: String(runtimeAgentModels?.primary?.provider || providerConfig.providerName || "OpenAI").trim() || "OpenAI",
+      model:
+        String(runtimeAgentModels?.primary?.model || providerConfig.responseModel || fileData.model || "").trim() ||
+        fileData.model,
+    };
+  const secondarySlotConfig = preferFileValues
+    ? (fileData.agent_models?.secondary || {
+      provider: primarySlotConfig.provider,
+      model: fileData.review_model || primarySlotConfig.model,
+    })
+    : {
+      provider: String(runtimeAgentModels?.secondary?.provider || primarySlotConfig.provider || "OpenAI").trim() || "OpenAI",
+      model:
+        String(runtimeAgentModels?.secondary?.model || providerConfig.reviewModel || primarySlotConfig.model || "").trim() ||
+        primarySlotConfig.model,
+    };
+  const primarySettings = resolveSingleProviderSettings(projectState, rootDir, {
+    ...options,
+    providerIdOverride: primarySlotConfig.provider,
+  });
+  const secondarySettings = resolveSingleProviderSettings(projectState, rootDir, {
+    ...options,
+    providerIdOverride: secondarySlotConfig.provider,
+  });
+  const agentModels = {
+    primary: buildAgentModelRuntime("primary", primarySlotConfig, primarySettings),
+    secondary: buildAgentModelRuntime("secondary", secondarySlotConfig, secondarySettings),
+  };
+
+  return {
+    ...primarySettings,
+    responseModel: agentModels.primary.model,
+    reviewModel: agentModels.primary.model,
+    agentModels,
+    agentRouting: {
+      complex: "primary",
+      simple: "secondary",
+    },
+    deprecatedCompatFields: [
+      "providerId",
+      "providerName",
+      "configuredMode",
+      "effectiveMode",
+      "apiStyle",
+      "baseUrl",
+      "hasApiKey",
+      "responseModel",
+      "reviewModel",
+    ],
+  };
+}
+
 export function publicProviderSettings(settings) {
   return {
     configuredMode: settings.configuredMode,
@@ -1498,6 +1589,9 @@ export function publicProviderSettings(settings) {
     overloadJitterRatio: settings.overloadJitterRatio,
     supportsNativeWebSearch: settings.supportsNativeWebSearch,
     availableProviders: settings.availableProviders,
+    agentModels: settings.agentModels,
+    agentRouting: settings.agentRouting,
+    deprecatedCompatFields: settings.deprecatedCompatFields,
     configSource: settings.configSource,
     configPath: settings.configPath,
     configLoaded: settings.configLoaded,
@@ -1505,9 +1599,9 @@ export function publicProviderSettings(settings) {
   };
 }
 
-export function createProvider(projectState, options = {}) {
+function createSingleProviderClient(projectState, options = {}) {
   const outerOptions = options;
-  const settings = resolveProviderSettings(projectState, options.rootDir, {
+  const settings = resolveSingleProviderSettings(projectState, options.rootDir, {
     providerIdOverride: options.providerIdOverride,
     maxConcurrency: options.maxConcurrency,
     requestTimeoutMs: options.requestTimeoutMs,
@@ -1839,6 +1933,59 @@ export function createProvider(projectState, options = {}) {
     settings,
     async generateText(options) {
       return generateText(options);
+    },
+  };
+}
+
+function slotNameForAgentComplexity(settings, agentComplexity = "complex") {
+  if (String(agentComplexity || "").trim() === "simple") {
+    return settings?.agentRouting?.simple || "secondary";
+  }
+  return settings?.agentRouting?.complex || "primary";
+}
+
+function slotConfigForAgentComplexity(settings, agentComplexity = "complex") {
+  const slotName = slotNameForAgentComplexity(settings, agentComplexity);
+  return {
+    slotName,
+    slotConfig: settings?.agentModels?.[slotName] || settings?.agentModels?.primary || null,
+  };
+}
+
+export function createProvider(projectState, options = {}) {
+  if (options.providerIdOverride) {
+    return createSingleProviderClient(projectState, options);
+  }
+
+  const settings = resolveProviderSettings(projectState, options.rootDir, options);
+  const primaryClient = createSingleProviderClient(projectState, {
+    ...options,
+    providerIdOverride: settings.agentModels?.primary?.providerId || settings.providerId,
+  });
+  const secondaryClient = createSingleProviderClient(projectState, {
+    ...options,
+    providerIdOverride: settings.agentModels?.secondary?.providerId || settings.providerId,
+  });
+
+  return {
+    settings,
+    resolveAgentModel(agentComplexity = "complex") {
+      return slotConfigForAgentComplexity(settings, agentComplexity).slotConfig;
+    },
+    async generateText(rawOptions = {}) {
+      const optionsWithDefaults = {
+        ...(rawOptions || {}),
+      };
+      const { slotName, slotConfig } = slotConfigForAgentComplexity(
+        settings,
+        optionsWithDefaults.agentComplexity,
+      );
+      const targetClient = slotName === "secondary" ? secondaryClient : primaryClient;
+      const routedOptions = {
+        ...optionsWithDefaults,
+        model: optionsWithDefaults.model || slotConfig?.model || primaryClient.settings.responseModel,
+      };
+      return targetClient.generateText(routedOptions);
     },
   };
 }

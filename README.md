@@ -406,6 +406,14 @@ disable_response_storage = true
 zhipu_api_key = "YOUR_ZHIPU_API_KEY"
 force_stream = false
 
+[agent_models.primary]
+provider = "OpenAI"
+model = "gpt-5.4"
+
+[agent_models.secondary]
+provider = "MiniMax"
+model = "MiniMax-M2.5-highspeed"
+
 [mcp]
 enabled = true
 
@@ -467,9 +475,11 @@ overload_retry_window_ms = 1800000
 
 | 字段 | 作用 |
 | --- | --- |
-| `model_provider` | 当前激活的 provider id |
-| `model` | 默认正文 / 主生成模型 |
-| `review_model` | 审查、研究规划、风格分析等偏 review 任务模型 |
+| `[agent_models.primary]` | 复杂 agent 使用的主力模型槽位，可跨 provider |
+| `[agent_models.secondary]` | 简单 agent 使用的辅助模型槽位，可跨 provider |
+| `model_provider` | 旧版兼容字段；读取老配置时可推导出主力槽位 |
+| `model` | 旧版兼容字段；读取老配置时可推导出主力模型 |
+| `review_model` | 旧版兼容字段；读取老配置时可推导出辅助模型 |
 | `codex_model` | 代码/工具链相关模型名 |
 | `model_reasoning_effort` | 推理强度 |
 | `disable_response_storage` | 是否让 responses API 存储响应 |
@@ -481,6 +491,8 @@ overload_retry_window_ms = 1800000
 | `max_concurrency` | provider 级请求并发上限，MiniMax 建议从 `1` 开始 |
 | `request_timeout_ms` | 单次请求超时，MiniMax 可适当调大 |
 | `overload_retry_window_ms` | 遇到 429/529 等拥挤错误时的总等待窗口 |
+
+说明：若显式配置了 `agent_models.primary/secondary`，系统将以双槽配置为准；旧根字段只保留读取兼容，不再用于表达跨 provider 的辅助槽。
 
 ### 环境变量替代
 

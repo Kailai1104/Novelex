@@ -117,6 +117,7 @@ async function runReferenceQueryPlannerAgent({
   researchPacket,
 }) {
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 ReferenceQueryPlannerAgent。请根据当前章节写作任务，给范文检索系统生成少量高价值查询。重点是要检索叙事处理方式、场景组织方式、人物出场节奏、对白/动作推进和氛围写法，而不是事实考据。只输出 JSON。",
     input: [
@@ -134,7 +135,6 @@ async function runReferenceQueryPlannerAgent({
   "mustAvoid": ["本章最该避开的写法1", "写法2"]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "reference_query_planner",
       chapterId: chapterPlan.chapterId,
@@ -157,6 +157,7 @@ async function runReferenceSynthesizerAgent({
   matches,
 }) {
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 ReferenceSynthesizerAgent。你会看到若干命中的范文片段。请把它们压缩成 Writer 直接能消费的范文参考包。只总结可借鉴的叙事技法、场景处理、人物推进方式和需要避免的模仿风险，不要鼓励照抄原文。只输出 JSON。",
     input: [
@@ -177,7 +178,6 @@ async function runReferenceSynthesizerAgent({
   "avoidPatterns": ["不要模仿的风险1", "风险2"]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "reference_synthesizer",
       chapterId: chapterPlan.chapterId,
@@ -201,6 +201,7 @@ async function runReferenceRecallAgent({
   chunks,
 }) {
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 ReferenceRecallAgent。你会看到范文库的 chunk 摘要目录。请只挑出最值得进入二次精读的候选片段，重点看叙事技法、场景组织、人物推进和动作/对白节奏，不要挑纯设定说明。只输出 JSON。",
     input: [
@@ -218,7 +219,6 @@ async function runReferenceRecallAgent({
   }
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "reference_recall",
       chapterId: chapterPlan.chapterId,

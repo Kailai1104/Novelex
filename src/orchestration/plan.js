@@ -489,6 +489,7 @@ function projectWithCast(project, cast) {
 
 async function generateCastViaProvider(provider, project, feedbackNotes) {
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 CharacterPlanningAgent。请根据项目信息为长篇网络小说规划一组最关键的核心角色。你必须先理解题材、时代、世界规则与主角目标，再决定人物的身份、命名和历史真实性约束。只输出 JSON，不要解释。",
     input: [
@@ -535,6 +536,7 @@ async function generateCastViaProvider(provider, project, feedbackNotes) {
 async function generateOutlineViaProvider(provider, project, cast, feedbackNotes, openingReferencePacket = null) {
   const resolvedProject = projectWithCast(project, cast);
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 OutlineAgent。请为长篇网络小说生成一版高度贴合项目需求的大纲草稿。主轴必须围绕主角目标、题材承诺、主要势力冲突和角色弧光展开。只输出 JSON 对象，不要解释。",
     input: [
@@ -578,6 +580,7 @@ async function generateOutlineViaProvider(provider, project, cast, feedbackNotes
 
 async function expandCastViaProvider(provider, project, cast, outlineDraft, feedbackNotes) {
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 CastExpansionAgent。请检查当前大纲草稿与现有角色表之间是否存在缺口。如果大纲已经引入了不在 cast 里的持续性人物，或者明显需要补入的长期核心配角，请把他们补全为正式角色条目。只输出 JSON，不要解释。",
     input: [
@@ -645,6 +648,7 @@ async function reviseOutlineWithNotesViaProvider(provider, project, cast, outlin
   }
 
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 RevisionAgent。请根据 Critic 和人类反馈修订当前大纲草稿。保持题材、主角目标与角色设定不变，只做有针对性的结构修订。只输出 JSON 对象，不要解释。",
     input: [
@@ -682,6 +686,7 @@ async function reviseOutlineWithNotesViaProvider(provider, project, cast, outlin
 
 async function critiqueOutlineDraftAViaProvider(provider, project, cast, outlineDraft, openingReferencePacket = null) {
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 CriticAgent_A。请像资深网络小说策划编辑一样，严格评估当前大纲草稿是否真正贴合项目需求。重点检查：题材承诺、主角目标、主要冲突、角色配置、阶段推进、读者期待。只输出 JSON，不要解释。",
     input: [
@@ -707,7 +712,6 @@ async function critiqueOutlineDraftAViaProvider(provider, project, cast, outline
   ]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
   });
 
   return normalizeRubricCriticResult(parseJsonResult(result, "CriticAgent_A"), "CriticAgent_A");
@@ -715,6 +719,7 @@ async function critiqueOutlineDraftAViaProvider(provider, project, cast, outline
 
 async function critiqueOutlineDraftBViaProvider(provider, project, cast, outlineDraft, openingReferencePacket = null) {
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 CriticAgent_B。请采用逆向重建的方式评估大纲草稿：先只根据草稿重建这本书的题材承诺、主角目标和故事规模，再与原项目要求对比，判断是否偏轴。只输出 JSON，不要解释。",
     input: [
@@ -736,7 +741,6 @@ async function critiqueOutlineDraftBViaProvider(provider, project, cast, outline
   "issues": ["如果偏轴，这里写修订建议"]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
   });
 
   return normalizeReverseCriticResult(parseJsonResult(result, "CriticAgent_B"), "CriticAgent_B");
@@ -753,6 +757,7 @@ async function critiqueFinalPlanAViaProvider(
   openingReferencePacket = null,
 ) {
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 CriticAgent_A。请像总编审稿一样，评估最终锁定大纲包是否已经具备持续写作能力。重点检查：主线闭环、阶段与章节可执行性、人物弧光可追踪性、世界约束是否支撑写作、是否真正服务项目题材。只输出 JSON，不要解释。",
     input: [
@@ -781,7 +786,6 @@ async function critiqueFinalPlanAViaProvider(
   ]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
   });
 
   return normalizeRubricCriticResult(parseJsonResult(result, "CriticAgent_A"), "CriticAgent_A");
@@ -789,6 +793,7 @@ async function critiqueFinalPlanAViaProvider(
 
 async function critiqueFinalPlanBViaProvider(provider, project, outlineDraft, outlineMarkdown, structureData, openingReferencePacket = null) {
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 CriticAgent_B。请采用逆向重建法评估最终锁定大纲包：根据最终大纲与结构规划，重建这本书的主角目标、题材承诺、规模升级路径，再与项目原始要求比较，判断是否偏轴。只输出 JSON，不要解释。",
     input: [
@@ -811,7 +816,6 @@ async function critiqueFinalPlanBViaProvider(provider, project, outlineDraft, ou
   "issues": ["如果偏轴，这里写修订建议"]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
   });
 
   return normalizeReverseCriticResult(parseJsonResult(result, "CriticAgent_B"), "CriticAgent_B");
@@ -820,6 +824,7 @@ async function critiqueFinalPlanBViaProvider(provider, project, outlineDraft, ou
 async function generateWorldbuildingViaProvider(provider, project, outlineDraft, structureData, finalNotes) {
   try {
     const result = await provider.generateText({
+      agentComplexity: "complex",
       instructions:
         "你是 Novelex 的 WorldbuildingAgent。请输出一份适合长篇创作持续调用的世界观设定 Markdown。内容必须贴合项目题材、时代和大纲，不得套用固定类型模板。",
       input: [
@@ -853,6 +858,7 @@ async function generateFinalOutlineViaProvider(
   openingReferencePacket = null,
 ) {
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 OutlineAgent。请把现有大纲草稿、结构规划、人物弧光整合成最终锁定大纲 Markdown。它必须能直接指导后续写作，而不是概念说明文。",
     input: [
@@ -915,6 +921,7 @@ async function enrichCharactersViaProvider(
 
       try {
         const result = await provider.generateText({
+          agentComplexity: "complex",
           instructions:
             "你是 Novelex 的 CharacterAgent。请为给定角色生成可直接写入项目文档的人物资料。只输出 JSON，不要解释。",
           input: [
@@ -1001,6 +1008,7 @@ async function enrichCharactersViaProvider(
 
 async function generateForeshadowingRegistryViaProvider(provider, project, outlineDraft, cast, finalNotes) {
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 ForeshadowingPlannerAgent。请围绕当前项目的大纲与角色设计 3 到 8 条长期伏笔。伏笔必须服务主线、势力变化、人物弧光或关键资源争夺。只输出 JSON，不要解释。",
     input: [
@@ -1044,6 +1052,7 @@ async function generateStageBlueprintViaProvider(
   );
 
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 StructureAgent。你这次只负责生成一个阶段的阶段蓝图，不生成逐章章纲。请让这一阶段天然体现题材承诺、主角目标和规模升级。只输出 JSON，不要解释。",
     input: [
@@ -1107,6 +1116,7 @@ async function generateStructureBatchViaProvider(
   );
 
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 StructureAgent。你这次只负责一个阶段中的一小段章节章纲，不负责整本书。请严格按指定章节范围输出详细 JSON。只输出 JSON，不要解释。",
     input: [
@@ -1201,6 +1211,7 @@ async function critiqueStructureOutputViaProvider(
   openingReferencePacket = null,
 ) {
   const result = await provider.generateText({
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 StructureCriticAgent。请评估当前 StructureAgent 输出是否存在模板化、题材偏离、推进失真、钩子重复、场景空泛、角色驱动不足等问题。优先抓可执行的结构问题。只输出 JSON，不要解释。",
     input: [
@@ -1228,7 +1239,6 @@ async function critiqueStructureOutputViaProvider(
     ]
       .filter(Boolean)
       .join("\n\n"),
-    useReviewModel: true,
   });
 
   return normalizeStructureCriticResult(
@@ -1246,6 +1256,7 @@ async function deriveChapterSlotsViaProvider(
 ) {
   return generateStructuredObject(provider, {
     label: "ChapterSlotDeriverAgent",
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 ChapterSlotDeriverAgent。请基于锁定大纲、结构规划与伏笔注册表，为每一章生成 Writer 可用的 chapter slot。不要使用固定模板句，必须让每章 mission、carryover、escalation 和禁止重演点与实际结构一致。只输出 JSON。",
     input: [
@@ -1255,7 +1266,6 @@ async function deriveChapterSlotsViaProvider(
       `伏笔注册表：\n${JSON.stringify(foreshadowingRegistry, null, 2)}`,
       `请输出 JSON：\n{\n  "chapterSlots": [\n    {\n      "chapterId": "ch001",\n      "chapterNumber": 1,\n      "stage": "阶段1",\n      "titleHint": "标题提示",\n      "mission": "本章任务",\n      "locationSeed": "地点种子",\n      "expectedCarryover": "本章应承接什么",\n      "expectedEscalation": "本章应如何升级",\n      "nextHookSeed": "下一章牵引",\n      "forbidReplayBeats": ["不要重演的 beat"],\n      "foreshadowingIds": ["fsh_001"],\n      "freshStart": true,\n      "stageSeed": "阶段种子"\n    }\n  ]\n}`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "chapter_slots",
     },
@@ -1289,6 +1299,7 @@ async function deriveInitialWorldStateViaProvider(
 ) {
   return generateStructuredObject(provider, {
     label: "InitialWorldStateDeriverAgent",
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 InitialWorldStateDeriverAgent。请基于项目设定、锁定大纲与结构规划，生成故事开局时的 world_state。不要用空泛模板，要让 public_knowledge、secret_knowledge、active_plotlines、upcoming_anchors 都与真实结构对应。只输出 JSON。",
     input: [
@@ -1297,7 +1308,6 @@ async function deriveInitialWorldStateViaProvider(
       `结构规划：\n${JSON.stringify(structureData, null, 2)}`,
       `请输出 JSON：\n{\n  "current_story_time": "故事时间",\n  "current_primary_location": "主要地点",\n  "active_plotlines": [],\n  "public_knowledge": [],\n  "secret_knowledge": [],\n  "recent_major_events": [],\n  "upcoming_anchors": []\n}`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "initial_world_state",
     },
@@ -2143,7 +2153,7 @@ export async function runPlanDraft(store) {
       "character_planning_agent",
       "CharacterPlanningAgent",
       "plan",
-      `使用 ${provider.settings.responseModel} 自动规划主要人物与命名。`,
+      `使用 ${provider.settings.agentModels?.primary?.providerName || provider.settings.providerName} / ${provider.settings.agentModels?.primary?.model || provider.settings.responseModel} 自动规划主要人物与命名。`,
       {
         preview: cast
           .map(
@@ -2157,7 +2167,7 @@ export async function runPlanDraft(store) {
       "outline_agent",
       "OutlineAgent",
       "plan",
-      `使用 ${provider.settings.responseModel} 生成一句话核心梗、简纲和粗纲草稿。`,
+      `使用 ${provider.settings.agentModels?.primary?.providerName || provider.settings.providerName} / ${provider.settings.agentModels?.primary?.model || provider.settings.responseModel} 生成一句话核心梗、简纲和粗纲草稿。`,
       { preview: createExcerpt(outlineDraft.outlineMarkdown, 220) },
     ),
     step(

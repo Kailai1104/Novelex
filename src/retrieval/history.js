@@ -88,6 +88,7 @@ async function chooseFilesWithAgent(provider, queryText, candidates) {
   }
 
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 FileRetrievalAgent。你只能根据候选文件的文件名和描述做选择。请选出对当前章节写作最有帮助的 1 到 4 个文件。只输出 JSON，不要解释。",
     input: [

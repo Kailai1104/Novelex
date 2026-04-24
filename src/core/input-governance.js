@@ -329,6 +329,7 @@ export async function runGovernanceAgent({
 
   const packet = await generateStructuredObject(provider, {
     label: "GovernanceAgent",
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 GovernanceAgent。你的职责是把写作主路径需要的 chapter_intent、context_package 和 rule_stack 统一整理成一份可执行治理包。必须只基于给定上下文做取舍，不要发明新剧情。chapter_intent 负责本章目标与禁区，context_package 负责最值得引用的来源，rule_stack 负责 hardFacts / softGoals / deferRules / currentTask。只输出 JSON。",
     input: [
@@ -377,7 +378,6 @@ ${JSON.stringify({
   }
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "input_governance",
       chapterId: chapterPlan?.chapterId || "",

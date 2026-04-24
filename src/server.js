@@ -182,6 +182,7 @@ function sanitizeProjectInput(input, current) {
 }
 
 function sanitizeProviderInput(input, projectState) {
+  const existingAgentModels = projectState.providerConfig?.agentModels || {};
   return {
     providerMode:
       input.providerMode === "openai-responses"
@@ -198,6 +199,22 @@ function sanitizeProviderInput(input, projectState) {
       codexResponseModel:
         String(input.codexResponseModel || projectState.providerConfig?.codexResponseModel || "").trim() ||
         projectState.providerConfig?.codexResponseModel,
+      agentModels: {
+        primary: {
+          provider:
+            String(input.primaryProviderId || existingAgentModels?.primary?.provider || "OpenAI").trim() || "OpenAI",
+          model:
+            String(input.primaryModel || existingAgentModels?.primary?.model || projectState.providerConfig?.responseModel || "").trim() ||
+            projectState.providerConfig?.responseModel,
+        },
+        secondary: {
+          provider:
+            String(input.secondaryProviderId || existingAgentModels?.secondary?.provider || existingAgentModels?.primary?.provider || "OpenAI").trim() || "OpenAI",
+          model:
+            String(input.secondaryModel || existingAgentModels?.secondary?.model || projectState.providerConfig?.reviewModel || projectState.providerConfig?.responseModel || "").trim() ||
+            projectState.providerConfig?.responseModel,
+        },
+      },
       reasoningEffort: "medium",
       apiStyle: "responses",
     },
@@ -207,36 +224,59 @@ function sanitizeProviderInput(input, projectState) {
 function sanitizeTomlProviderInput(input, rootDir = WORKSPACE_ROOT) {
   const existing = loadCodexApiConfig(rootDir);
   const currentConfig = normalizeCodexConfigData(existing.data || {});
-  const providerId = String(input.providerId || currentConfig.model_provider || "OpenAI").trim() || "OpenAI";
-  const providerBlock = currentConfig.model_providers?.[providerId];
+  const primaryProviderId = String(
+    input.primaryProviderId ||
+    currentConfig.agent_models?.primary?.provider ||
+    currentConfig.model_provider ||
+    "OpenAI",
+  ).trim() || "OpenAI";
+  const secondaryProviderId = String(
+    input.secondaryProviderId ||
+    currentConfig.agent_models?.secondary?.provider ||
+    currentConfig.agent_models?.primary?.provider ||
+    currentConfig.model_provider ||
+    "OpenAI",
+  ).trim() || "OpenAI";
+  const primaryProviderBlock = currentConfig.model_providers?.[primaryProviderId];
+  const secondaryProviderBlock = currentConfig.model_providers?.[secondaryProviderId];
 
-  if (!providerBlock) {
-    throw new Error(`Unknown provider: ${providerId}`);
+  if (!primaryProviderBlock) {
+    throw new Error(`Unknown provider: ${primaryProviderId}`);
+  }
+  if (!secondaryProviderBlock) {
+    throw new Error(`Unknown provider: ${secondaryProviderId}`);
   }
 
-  const responseModel =
-    String(input.responseModel || providerBlock.response_model || currentConfig.model || "").trim() ||
-    currentConfig.model;
-  const reviewModel =
-    String(input.reviewModel || providerBlock.review_model || currentConfig.review_model || responseModel).trim() ||
-    responseModel;
-  const codexModel =
-    String(input.codexResponseModel || providerBlock.codex_model || currentConfig.codex_model || responseModel).trim() ||
-    responseModel;
+  const primaryModel =
+    String(
+      input.primaryModel ||
+      currentConfig.agent_models?.primary?.model ||
+      primaryProviderBlock.response_model ||
+      primaryProviderBlock.model ||
+      currentConfig.model ||
+      "",
+    ).trim() || currentConfig.model;
+  const secondaryModel =
+    String(
+      input.secondaryModel ||
+      currentConfig.agent_models?.secondary?.model ||
+      secondaryProviderBlock.response_model ||
+      secondaryProviderBlock.model ||
+      currentConfig.review_model ||
+      primaryModel ||
+      "",
+    ).trim() || primaryModel;
 
   return {
     ...currentConfig,
-    model_provider: providerId,
-    model: responseModel,
-    review_model: reviewModel,
-    codex_model: codexModel,
-    model_providers: {
-      ...currentConfig.model_providers,
-      [providerId]: {
-        ...providerBlock,
-        response_model: responseModel,
-        review_model: reviewModel,
-        codex_model: codexModel,
+    agent_models: {
+      primary: {
+        provider: primaryProviderId,
+        model: primaryModel,
+      },
+      secondary: {
+        provider: secondaryProviderId,
+        model: secondaryModel,
       },
     },
   };

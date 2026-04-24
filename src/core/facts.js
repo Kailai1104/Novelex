@@ -77,6 +77,7 @@ export async function runChapterFactExtractionAgent({
   const excerpt = createExcerpt(chapterDraft?.markdown || "", 6000);
 
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 ChapterFactExtractionAgent。你的任务是从已批准的章节正文中提取结构化 canon facts（既定事实账本）。只输出 JSON，不要解释。",
     input: [
@@ -228,6 +229,7 @@ export async function runFactSelectorAgent({
     .join("\n");
 
   const result = await provider.generateText({
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 FactSelectorAgent。请从已批准章节的事实账本中，挑出与当前章节最相关的一组事实。只输出 JSON，不要解释。",
     input: [

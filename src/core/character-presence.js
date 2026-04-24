@@ -81,6 +81,7 @@ export async function analyzeCharacterPresence({
 
   const normalized = await generateStructuredObject(provider, {
     label: "CharacterPresenceAgent",
+    agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 CharacterPresenceAgent。你的任务是判断章节正文里，哪些计划角色真的出场或被明确点名，哪些只是泛称、擦边提及或根本没出现。必须严格以正文为准，只输出 JSON。",
     input: [
@@ -105,7 +106,6 @@ export async function analyzeCharacterPresence({
   ]
 }`,
     ].join("\n\n"),
-    useReviewModel: true,
     metadata: {
       feature: "character_presence",
       chapterId: chapterPlan?.chapterId || "",

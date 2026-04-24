@@ -36,6 +36,10 @@ async function withIsolatedProviderEnv(callback) {
     "MOONSHOT_BASE_URL",
     "MINIMAX_API_KEY",
     "MINIMAX_BASE_URL",
+    "GEMINI_API_KEY",
+    "GEMINI_BASE_URL",
+    "NOVAI_API_KEY",
+    "NOVAI_BASE_URL",
     "NOVELEX_PROVIDER_MODE",
     "NOVELEX_MODEL",
     "NOVELEX_REVIEW_MODEL",
@@ -196,6 +200,25 @@ function buildEmbeddingVector(text) {
 
 function chapterTitle(number) {
   return `第${number}章·推进与扩张 ${number}`;
+}
+
+function buildWriterStubChapter(event, feedback = "") {
+  const normalizedEvent = String(event || "推进关键事件").trim();
+  const feedbackLine = String(feedback || "").trim();
+  const body = [
+    `赤屿内港的风一阵紧过一阵，棚顶绳结被扯得吱呀作响。李凡没有浪费任何时间，站到长桌尽头就把今日真正要落地的事直接摁到桌面上：${normalizedEvent}。账册、草图、值哨名单和船坞进度全摊开之后，屋里的人很快都明白，这不是讨论要不要做，而是讨论谁先扛、谁现在就去做、谁若拖慢一步就要替所有人的代价负责。`,
+    `他先点的是粮、火药和木料的流向。过去还能靠经验和人情勉强维持的环节，在局势升高之后都成了明面上的漏洞。李凡把几处最容易被人卡住的节点逐条挑出来，要求各组从今日起按同一套口径回报，不准再拿“差不多”“应该够用”这种话混过去。顾骁本想先说海防哨位的问题，话到嘴边又停住，因为他也看出来了，一旦补给和工坊节奏对不上，外面的试探还没压进来，内部就会先自己垮出一道口子。`,
+    `宋应星把手边草图翻到最后两页，直接把最费工、最耗时、却又最不能省的几处标红。他没有用一堆空泛的术语替众人减压，而是把每一处工序背后的后果讲得极清楚：哪一道少做了半日，下一批成品就会虚；哪一处偷了料，真正出事时就不是修补，而是整套安排一起塌下去。李凡听完没有立刻表态，只让他把可提前并行的部分单独列出来，因为眼下要争的不是纸面最漂亮的方案，而是在风险已经逼近时，仍然能撑住推进的次序。`,
+    `屋里的气氛真正绷紧，是在顾骁把前线巡检带回来的消息抛出来之后。外头的人还没有正式翻脸，但试探的手已经伸得足够深，连码头装卸的节奏、值夜换岗的空窗都被人摸得差不多了。李凡没有顺着这股火气把人推去硬碰，而是先把能立刻补上的口子一件件钉住：谁去盯工坊夜班，谁去重新校账，谁去把最慢的那条船腾出装药空间，谁去把外头的眼线故意引到错误的方向。命令一层层压下去，众人才第一次感觉到，这场会并不是要把压力说清楚，而是要把压力变成一套立刻执行的动作。`,
+    `有人还是提出了质疑，担心这样一来前头后头都会吃紧，稍有不慎就会把刚稳住的盘面再次扯裂。李凡没有压人，也没有用一句“必须如此”把问题盖过去。他把账上还能挪动的余地、眼下最不能失手的节点和拖延之后一定会更贵的代价摆在一起，让每个人自己看清哪条路其实更险。${feedbackLine ? `他还顺手把“${feedbackLine}”这条要求压进分工里，明确谁负责补现场反应，谁负责把前后因果当场做实，免得执行落到最后又剩空口概括。` : "他说得并不激烈，但每一句都往最硬的地方落，听的人很难再拿侥幸心态替自己留退路。"}等到最后一个问题被摊开时，屋里的犹豫已经少了大半，取而代之的是一种被迫进入实战的清醒。`,
+    `真正让众人改变态度的，不是李凡语气有多重，而是他把代价分配得足够具体。多备一批火药意味着今晚就要截掉别处的人手；提前赶出那几件器具，就意味着某条原本能缓一缓的修补必须往后让；把港口的盘查再收紧一层，短时间内就会得罪原本还能两边说话的人。每一步都有痛感，每一步也都在告诉众人，所谓扩张从来不是多拿一点好处，而是先决定愿意为哪条路付出更重的成本。这样的判断一旦做下，就不能再靠明日的运气替今日收尾。`,
+    `会商推进到中段，门外又送来一份新报。消息不长，却足够让人心里一沉：外部那股势力并没有被眼前的表面秩序哄住，反而在等他们自己露出更明显的疲态。宋应星听完只问了一句工坊最慢的那道工序还能不能提速，顾骁则直接去看值哨名单里哪一段最容易被人钻过去。李凡把两人的反应收在眼里，没有再重复刚才说过的话，只把最关键的一条补上去：既然对面已经开始按他们的弱点试探，那本章这一步就不能只求稳住，必须把回应做成足以改变对方判断的结果。`,
+    `于是后面的分工彻底从“准备”变成了“执行”。有人被赶去仓口重排装运次序，有人拿着临时更改的清单去追工坊夜班，还有人被派去盯住那些最可能在关键时刻失手的中间环节。顾骁出门前停了一下，低声问李凡是不是要把海面上的布置一并提前。李凡没有立刻答应，只说先把手里能控制的动作做满，再把那一线真正压到对面眼前。这个回答听上去保守，实际却比空喊强硬得多，因为它意味着接下来每一个环节都得按真正开局的标准执行，而不是再拿试探当借口。`,
+    `临散之前，李凡把所有人的目光重新拉回那张摊开的桌面。他没有总结气氛，也没有说什么漂亮话，只把已经定下的次序又压了一遍：先补最容易失血的口子，再让能出结果的动作尽快出结果，最后把回应抬到足够让下一轮试探改道的程度。屋里一时间没人再接话，只有风从棚口灌进来，带得纸页边角轻轻翻动。众人各自领命出去时，都知道今晚之后盘面不会恢复轻松，可也正因为这一轮没有被拖成空耗，原本散乱的压力第一次被拧成了同一个方向。`,
+    `等到港口灯火次第亮起，赤屿内外的节奏已经和几个时辰前完全不同。工坊那边的锤声比往常更密，值夜的人手重新补上，连最容易被忽略的转运空档都被悄悄填平。李凡站在高处往下看，没有把这点变化当成胜势，因为他知道真正的麻烦还没上桌。可至少到了这一刻，他已经把“${normalizedEvent}”从一句必须完成的提纲，压成了所有人都能感到疼、也都不得不往前推的现实动作。更远处的黑潮仍在逼近，而下一轮更硬的条件，也已经在夜色里摆到了门口。`,
+  ];
+
+  return body.join("\n\n");
 }
 
 function buildStructureResponse(totalChapters) {
@@ -470,6 +493,24 @@ test("runValidations flags meta leakage and first-person narration in third-pers
     validation.style.issues.some((item) => item.includes("系统元信息")) ||
       validation.style.issues.some((item) => item.includes("第一人称")),
   );
+});
+
+test("runValidations flags missing planned named characters", () => {
+  const validation = runValidations(
+    {
+      title: "第一章",
+      keyEvents: ["李凡稳住船身", "林定海下令清舱"],
+      charactersPresent: ["李凡", "林定海", "众水手"],
+      foreshadowingActions: [],
+    },
+    {
+      markdown: "# 第一章\n\n李凡压住舵链，几名水手跟着扑上来稳船。",
+      usedForeshadowings: [],
+    },
+  );
+
+  assert.equal(validation.plausibility.passed, false);
+  assert.match(validation.plausibility.summary, /林定海/u);
 });
 
 async function withStubbedOpenAI(callback) {
@@ -1018,6 +1059,85 @@ async function withStubbedOpenAI(callback) {
       });
     }
 
+    if (instructions.includes("ChapterOutlineConsistencyAuditAgent")) {
+      const proposalIds = [...new Set(
+        [...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]).filter(Boolean),
+      )].slice(0, 5);
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: "细纲整章一致性检查通过。",
+          candidateAudits: (proposalIds.length ? proposalIds : ["proposal_1"]).map((proposalId) => ({
+            proposalId,
+            passed: true,
+            score: 92,
+            summary: `${proposalId} 没有发现阻断性的跨章节一致性问题。`,
+            issues: [],
+            revisionNotes: [],
+          })),
+        }),
+      });
+    }
+
+    if (instructions.includes("ChapterOutlineRepairAgent")) {
+      const chapterMatch = inputText.match(/当前章节：ch(\d+)/);
+      const chapterNumber = Number(chapterMatch?.[1] || 1);
+      const proposalIds = [...new Set(
+        [...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]).filter(Boolean),
+      )].slice(0, 3);
+      return jsonResponse({
+        output_text: JSON.stringify({
+          proposals: (proposalIds.length ? proposalIds : ["proposal_1"]).map((proposalId, index) => ({
+            proposalId,
+            summary: "修复后直接承接上一章压力，删除重开式开场和事实重置。",
+            rationale: "保留原候选的冲突轴和人物焦点，只修复跨章节连续性冲突。",
+            diffSummary: `第 ${index + 1} 个候选已改成直接承压推进。`,
+            title: `第${chapterNumber}章·续压修复`,
+            timeInStory: `故事第${chapterNumber}日`,
+            povCharacter: "李凡",
+            location: "赤屿内港",
+            keyEvents: ["承接上一章压力", "把执行代价推到台前", "章末留下更急压力"],
+            arcContribution: ["李凡在更高风险下继续掌控局面"],
+            nextHook: "更急的行动窗口已经逼到眼前。",
+            emotionalTone: "承压推进",
+            threadMode: "single_spine",
+            dominantThread: "承接上一章压力继续推进，不重开开篇。",
+            entryMode: "direct_resume",
+            entryLink: "承接上一章留下的高压盘面与执行压力。",
+            exitPressure: "更急的行动窗口已经逼到眼前。",
+            charactersPresent: ["李凡", "宋应星", "郑芝龙"],
+            continuityAnchors: ["承接上一章压力", "不得重置已定事实"],
+            evidenceRefs: ["ch001_outline_exit"],
+            scenes: [
+              {
+                label: "承压续场",
+                location: "赤屿内港·议事棚",
+                focus: "把上一章留下的压力接到当前行动现场",
+                tension: "执行窗口正在收紧",
+                characters: ["李凡", "宋应星"],
+                threadId: "main",
+                scenePurpose: "承接上一章余波并明确本章主问题",
+                inheritsFromPrevious: "承接上一章留下的高压盘面与执行压力",
+                outcome: "本章主问题被推进到更具体的执行代价",
+                handoffToNext: "把外部试探推向正面回应",
+              },
+              {
+                label: "抬高代价",
+                location: "赤屿内港·码头",
+                focus: "把主线推向更高风险的执行选择",
+                tension: "外部试探和内部代价同时压上来",
+                characters: ["李凡", "郑芝龙"],
+                threadId: "main",
+                scenePurpose: "让主线继续升级并递交章末压力",
+                inheritsFromPrevious: "承接前场确认后的即时后果",
+                outcome: "下一步行动窗口被压缩",
+                handoffToNext: "把更急的行动窗口递给下一章",
+              },
+            ],
+          })),
+        }),
+      });
+    }
+
     if (instructions.includes("ChapterOutlineAgent")) {
       const chapterMatch = inputText.match(/当前章节：ch(\d+)/);
       const chapterNumber = Number(chapterMatch?.[1] || 1);
@@ -1411,12 +1531,12 @@ async function withStubbedOpenAI(callback) {
     }
 
     if (instructions.includes("WriterAgent")) {
-      const eventMatch = inputText.match(/本(?:场景|章)(?:对应|必须落地的)事件：(.+)/);
-      const feedbackMatch = inputText.match(/人类反馈：(.+)/);
+      const eventMatch = inputText.match(/本(?:场景|章)(?:对应|必须落地的)事件：(.+)/) || inputText.match(/^\-\s*必须落地：(.+)$/m);
+      const feedbackMatch = inputText.match(/人类反馈：(.+)/) || inputText.match(/^##\s*人类反馈[\s\S]*?^\-\s*(.+)$/m);
       const event = (eventMatch?.[1] || "推进关键事件").trim();
       const feedback = (feedbackMatch?.[1] || "").trim();
       return jsonResponse({
-        output_text: `李凡没有浪费任何时间，直接把注意力压到“${event}”上，要求所有人围绕资源、军备和下一步扩张重新站位。\n宋应星很快补上技术与执行方案，${feedback ? `而这一次他也明确响应了“${feedback}”这条修订要求。` : "让局势迅速进入可执行状态。"}\n等冲突真正落地时，所有人都意识到，这一章的推进已经把盘面往更大的方向抬高了。`,
+        output_text: buildWriterStubChapter(event, feedback),
       });
     }
 
@@ -1620,6 +1740,11 @@ test("Novelex workflows can complete a full draft-and-approve cycle", async () =
   const finalBundle = await store.loadPlanFinal();
   assert.equal(finalBundle.structureData.chapters.length, 0);
   assert.equal(finalBundle.outlineData.chapters.length, 0);
+  assert.ok(Array.isArray(finalBundle.chapterSlots));
+  assert.ok(finalBundle.chapterSlots.length > 0);
+  assert.ok(Array.isArray(finalBundle.outlineData.chapterSlots));
+  assert.ok(finalBundle.outlineData.chapterSlots.length > 0);
+  assert.ok(await store.exists(path.join(tempRoot, "novel_state", "chapter_slots.json")));
 
   const outlineRun = await runWriteChapter(store);
   assert.equal(outlineRun.project.phase.write.status, "chapter_outline_pending_review");
@@ -1718,6 +1843,137 @@ test("Novelex workflows can complete a full draft-and-approve cycle", async () =
       .map((item) => item.id),
     committedOutlineExists.chapterPlan.foreshadowingActions.map((item) => item.id),
   );
+})));
+
+test("chapter outline audit repairs rejected candidates to preserve requested count", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-outline-count-repair-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+
+  const previousFetch = globalThis.fetch;
+  let outlineCalls = 0;
+  const outlineVariants = [];
+  let auditCalls = 0;
+  let repairCalls = 0;
+
+  const makeProposal = (proposalId, index) => ({
+    proposalId,
+    summary: `方案 ${index} 承接开篇压力。`,
+    rationale: "保持穿越醒觉、船上危机和追船压力都在同一条因果链上。",
+    diffSummary: `第 ${index} 个候选的冲突轴不同。`,
+    title: `第一章·候选${index}`,
+    timeInStory: "故事第一日",
+    povCharacter: "李凡",
+    location: "铜山外海",
+    keyEvents: ["李凡在进水底舱醒觉", "用理工判断稳住船", "追船压力逼近"],
+    arcContribution: ["李凡用行动争取临时指挥权"],
+    nextHook: "追船动向仍未明。",
+    emotionalTone: "窒息高压",
+    threadMode: "single_spine",
+    dominantThread: "李凡必须在沉船危机里证明自己还有用。",
+    entryMode: "direct_resume",
+    entryLink: "无前章，从李凡意识在海水灌入底舱的瞬间浮起切入。",
+    exitPressure: "追船动向仍未明。",
+    charactersPresent: ["李凡", "林定海"],
+    continuityAnchors: ["船、火药、口粮、活口都不能消失"],
+    scenes: [
+      {
+        label: `候选${index}开场`,
+        location: "铜山外海·进水底舱",
+        focus: "让李凡在海水灌入时完成意识重组。",
+        tension: "窒息、进水和船员敌意同时压上来。",
+        characters: ["李凡", "林定海"],
+        threadId: "main",
+        scenePurpose: "直接切入开篇身体危机。",
+        inheritsFromPrevious: "无前章，从海水灌入底舱的瞬间切入。",
+        outcome: "李凡确认处境并抓住第一条自救判断。",
+        handoffToNext: "把压舱和火药风险交给下一场。",
+      },
+    ],
+  });
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input);
+
+    if (instructions.includes("ChapterOutlineAgent") && inputText.includes("当前章节：ch001")) {
+      outlineCalls += 1;
+      outlineVariants.push(inputText.match(/当前 Variant：(proposal_\d+)/)?.[1] || "");
+      return jsonResponse({
+        output_text: JSON.stringify({
+          proposals: [makeProposal("proposal_1", 1), makeProposal("proposal_2", 2), makeProposal("proposal_3", 3)],
+        }),
+      });
+    }
+
+    if (instructions.includes("ChapterOutlineConsistencyAuditAgent") && inputText.includes("当前章节：ch001")) {
+      auditCalls += 1;
+      const proposalIds = auditCalls === 1
+        ? ["proposal_1", "proposal_2", "proposal_3"]
+        : ["proposal_1", "proposal_2_repaired", "proposal_3"];
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: auditCalls === 1 ? "两个候选需要修复。" : "所有候选已通过。",
+          candidateAudits: proposalIds.map((proposalId) => {
+            const passed = auditCalls > 1 || proposalId === "proposal_1";
+            return {
+              proposalId,
+              passed,
+              score: passed ? 91 : 40,
+              summary: passed ? "连续性通过。" : "入口或章末压力需要修复。",
+              issues: passed ? [] : [
+                {
+                  id: "outline_contract_conflict",
+                  severity: "critical",
+                  category: "细纲合同",
+                  description: "未严格承接开篇入口合同。",
+                  evidence: proposalId,
+                  suggestion: "保留差异方向，但改写入口和章末压力。",
+                },
+              ],
+              revisionNotes: passed ? [] : ["改写入口和章末压力。"],
+            };
+          }),
+        }),
+      });
+    }
+
+    if (instructions.includes("ChapterOutlineRepairAgent") && inputText.includes("当前章节：ch001")) {
+      repairCalls += 1;
+      return jsonResponse({
+        output_text: JSON.stringify({
+          proposals: [makeProposal("proposal_2_repaired", 2)],
+        }),
+      });
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    await runWriteChapter(store, {
+      outlineOptions: { variantCount: 3, diversityPreset: "wide" },
+    });
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const outlineDraft = await store.loadChapterDraft("ch001");
+  assert.equal(outlineCalls, 3);
+  assert.deepEqual(outlineVariants, ["proposal_1", "proposal_2", "proposal_3"]);
+  assert.equal(outlineDraft.chapterOutlineCandidates.length, 3);
+  assert.deepEqual(outlineDraft.chapterOutlineCandidates.map((candidate) => candidate.proposalId), [
+    "proposal_1",
+    "proposal_2_repaired",
+    "proposal_3",
+  ]);
+  assert.equal(outlineDraft.outlineContinuityAudit.manualReviewRequired, false);
+  assert.equal(auditCalls, 2);
+  assert.equal(repairCalls, 1);
 })));
 
 test("chapter approval blocks locking when post-lock outline sync fails", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
@@ -2019,6 +2275,648 @@ test("chapter outline planning reads committed outline history and continuity pr
   assert.equal(sawContinuityPrompt, true);
   assert.ok(outlineDraft.chapterOutlineContext?.historyPlanning?.priorityThreads?.length);
   assert.ok(outlineDraft.chapterOutlineContext?.continuityPlanning?.entryLink);
+})));
+
+test("chapter outline continuity guard blocks third chapter restart openings", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-outline-restart-guard-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+
+  await lockNextChapter(store);
+  await lockNextChapter(store);
+
+  const previousFetch = globalThis.fetch;
+  let badOutlineCallCount = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input);
+    const isChapterThree = inputText.includes("当前章节：ch003");
+
+    if (isChapterThree && instructions.includes("StagePlanningContextAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          chapterMission: "第一次惊醒后重新确认身份，并重新证明自己能够立足。",
+          requiredBeats: ["惊醒确认自己穿越", "第一次立威证明自己", "重新进入开篇危机"],
+          mustPreserve: ["重新确认身份"],
+          deferRules: ["不能提前解决终局"],
+          suggestedConflictAxis: ["身体危机型开场"],
+          titleSignals: ["惊醒", "身份"],
+          nextPressure: "再次醒来后面对新的危机。",
+        }),
+      });
+    }
+
+    if (isChapterThree && instructions.includes("ChapterContinuityAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          entryMode: "wake_after_unconsciousness",
+          entryLink: "李凡从昏迷里惊醒，重新确认自己是谁。",
+          dominantCarryoverThread: "重新开篇确认身份。",
+          subordinateThreads: ["身体危机"],
+          mustAdvanceThisChapter: "第一次证明自己能控制局面。",
+          canPauseThisChapter: ["上一章压力"],
+          exitPressureToNextChapter: "重新确认身份后的危机扩大。",
+          continuityRisks: ["可能需要解释为何昏迷。"],
+          evidenceRefs: [],
+          unsupportedClaims: [],
+        }),
+      });
+    }
+
+    if (isChapterThree && instructions.includes("ChapterOutlineAgent")) {
+      badOutlineCallCount += 1;
+      if (badOutlineCallCount === 1) {
+        return jsonResponse({
+          output_text: JSON.stringify({
+            proposals: [
+              {
+                proposalId: "proposal_bad_1",
+                summary: "错误地重开开篇。",
+                rationale: "误用第一章模板。",
+                diffSummary: "惊醒重置。",
+                title: "第三章·惊醒",
+                timeInStory: "故事第三日",
+                povCharacter: "李凡",
+                location: "赤屿内港",
+                keyEvents: ["李凡惊醒", "重新确认自己是谁", "第一次证明自己"],
+                arcContribution: ["重新开篇"],
+                nextHook: "新的危机出现。",
+                emotionalTone: "恍惚",
+                threadMode: "single_spine",
+                dominantThread: "重新确认身份。",
+                entryLink: "李凡惊醒后重新确认自己是谁。",
+                exitPressure: "新的危机出现。",
+                charactersPresent: ["李凡", "宋应星"],
+                continuityAnchors: ["惊醒", "重新确认身份"],
+                scenes: [
+                  {
+                    label: "惊醒",
+                    location: "赤屿内港",
+                    focus: "李凡醒来并重新确认自己是谁",
+                    tension: "身体危机",
+                    characters: ["李凡"],
+                    threadId: "main",
+                    scenePurpose: "重开开篇",
+                    inheritsFromPrevious: "从昏迷惊醒",
+                    outcome: "重新确认身份",
+                    handoffToNext: "第一次证明自己",
+                  },
+                ],
+              },
+              {
+                proposalId: "proposal_bad_2",
+                summary: "同样错误地重演第一章。",
+                rationale: "误用身体危机开场。",
+                diffSummary: "醒来重置。",
+                title: "第三章·再醒",
+                timeInStory: "故事第三日",
+                povCharacter: "李凡",
+                location: "赤屿内港",
+                keyEvents: ["李凡醒来", "再次确认穿越", "首次立威"],
+                arcContribution: ["重新开篇"],
+                nextHook: "新的危机出现。",
+                emotionalTone: "恍惚",
+                threadMode: "single_spine",
+                dominantThread: "再次确认穿越。",
+                entryLink: "李凡醒来，再次确认穿越。",
+                exitPressure: "新的危机出现。",
+                charactersPresent: ["李凡"],
+                continuityAnchors: ["醒来", "首次立威"],
+                scenes: [
+                  {
+                    label: "醒来",
+                    location: "赤屿内港",
+                    focus: "李凡醒来，再次确认穿越",
+                    tension: "身体危机",
+                    characters: ["李凡"],
+                    threadId: "main",
+                    scenePurpose: "重演第一章",
+                    inheritsFromPrevious: "醒来",
+                    outcome: "首次立威",
+                    handoffToNext: "进入危机",
+                  },
+                ],
+              },
+            ],
+          }),
+        });
+      }
+
+      return jsonResponse({
+        output_text: JSON.stringify({
+          proposals: [
+            {
+              proposalId: "proposal_guarded_1",
+              summary: "直接承接 ch002 章末压力，把高压盘面推向更具体的执行代价。",
+              rationale: "按连续性护栏承接前章。",
+              diffSummary: "不重开，直接续压。",
+              title: "第三章·续压",
+              timeInStory: "故事第三日",
+              povCharacter: "李凡",
+              location: "赤屿内港",
+              keyEvents: ["承接上一章高压盘面", "把资源缺口推成执行代价", "章末留下更急压力"],
+              arcContribution: ["李凡在更高风险下继续主导局面"],
+              nextHook: "更急的执行窗口已经压到眼前。",
+              emotionalTone: "承压推进",
+              threadMode: "single_spine",
+              dominantThread: "承接 ch002 压力继续推进。",
+              entryMode: "direct_resume",
+              entryLink: "承接上一章留下的高压盘面与资源压力。",
+              exitPressure: "更急的执行窗口已经压到眼前。",
+              charactersPresent: ["李凡", "宋应星"],
+              continuityAnchors: ["承接上一章压力", "不重开身份确认"],
+              evidenceRefs: ["ch002_outline_exit"],
+              scenes: [
+                {
+                  label: "承压续场",
+                  location: "赤屿内港",
+                  focus: "承接上一章留下的高压与资源压力",
+                  tension: "执行窗口正在缩短",
+                  characters: ["李凡", "宋应星"],
+                  threadId: "main",
+                  scenePurpose: "把 ch002 章末压力接到当前行动现场",
+                  inheritsFromPrevious: "承接上一章留下的高压盘面与资源压力",
+                  outcome: "本章主问题转成更具体的执行代价",
+                  handoffToNext: "把外部试探压到正面回应",
+                },
+              ],
+            },
+          ],
+        }),
+      });
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    const outlineRun = await runWriteChapter(store);
+    assert.equal(outlineRun.project.phase.write.status, "chapter_outline_pending_review");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const outlineDraft = await store.loadChapterDraft("ch003");
+  const firstSceneText = JSON.stringify(outlineDraft.chapterOutlineCandidates[0]?.chapterPlan?.scenes?.[0] || {});
+
+  assert.ok(outlineDraft.chapterSlot?.titleHint);
+  assert.ok(outlineDraft.chapterSlot?.mission);
+  assert.ok(outlineDraft.chapterSlot?.locationSeed);
+  assert.ok(outlineDraft.chapterSlot?.expectedCarryover);
+  assert.notEqual(outlineDraft.chapterOutlineContext?.continuityPlanning?.entryMode, "wake_after_unconsciousness");
+  assert.doesNotMatch(JSON.stringify(outlineDraft.chapterOutlineContext?.stagePlanning || {}), /第一次|惊醒|重新确认身份/);
+  assert.doesNotMatch(firstSceneText, /惊醒|醒来|睁眼确认自己是谁|重新确认自己是谁/);
+  assert.match(firstSceneText, /承接|上一章|高压|压力/);
+  assert.equal(outlineDraft.continuityGuard?.supportsWakeAfterUnconsciousness, false);
+  assert.ok(outlineDraft.chapterOutlineHistory.some((item) => item.action === "outline_audit_regenerate"));
+  assert.ok(await store.exists(path.join(tempRoot, "runtime", "staging", "write", "ch003", "continuity_guard.json")));
+  assert.ok(await store.exists(path.join(tempRoot, "runtime", "staging", "write", "ch003", "context_conflicts.json")));
+  assert.ok(await store.exists(path.join(tempRoot, "runtime", "staging", "write", "ch003", "outline_generation_contract.json")));
+})));
+
+test("chapter outline consistency audit repairs mid-chapter canon fact resets", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-outline-canon-repair-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+  await lockNextChapter(store);
+
+  const previousFetch = globalThis.fetch;
+  let repairCalls = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input);
+
+    if (instructions.includes("ChapterOutlineAgent") && inputText.includes("当前章节：ch002")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          proposals: [
+            {
+              proposalId: "proposal_bad_fact",
+              summary: "第一场承接正确，但中段重置上一章事实。",
+              rationale: "故意制造 canon fact 冲突。",
+              diffSummary: "中段把既定火药规矩当成第一次提出。",
+              title: "第二章·错把旧令当新规",
+              timeInStory: "故事第2日",
+              povCharacter: "李凡",
+              location: "赤屿内港",
+              keyEvents: ["承接上一章压力", "把上一章火药规矩当成第一次提出", "章末留下压力"],
+              arcContribution: ["李凡继续主导局面"],
+              nextHook: "外部压力继续压来。",
+              emotionalTone: "承压推进",
+              threadMode: "single_spine",
+              dominantThread: "承接上一章压力，但错误重置火药规矩。",
+              entryMode: "direct_resume",
+              entryLink: "承接上一章留下的高压盘面与执行压力。",
+              exitPressure: "外部压力继续压来。",
+              charactersPresent: ["李凡", "宋应星"],
+              continuityAnchors: ["承接上一章压力"],
+              scenes: [
+                {
+                  label: "承压续场",
+                  location: "赤屿内港·议事棚",
+                  focus: "承接上一章留下的压力",
+                  tension: "执行窗口正在收紧",
+                  characters: ["李凡", "宋应星"],
+                  threadId: "main",
+                  scenePurpose: "接住上一章余波",
+                  inheritsFromPrevious: "承接上一章留下的高压盘面与执行压力",
+                  outcome: "压力被接到当前现场",
+                  handoffToNext: "转入火药摆放争议",
+                },
+                {
+                  label: "错误重置",
+                  location: "赤屿内港·库棚",
+                  focus: "把上一章已经落实的火药规矩重新当成第一次临时新提出来",
+                  tension: "既定事实被重置",
+                  characters: ["李凡"],
+                  threadId: "main",
+                  scenePurpose: "制造事实冲突",
+                  inheritsFromPrevious: "承接前场压力",
+                  outcome: "火药规矩被写成第一次提出",
+                  handoffToNext: "章末留压",
+                },
+              ],
+            },
+          ],
+        }),
+      });
+    }
+
+    if (instructions.includes("ChapterOutlineConsistencyAuditAgent") && inputText.includes("proposal_repaired_fact")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: "修复后没有阻断性连续性冲突。",
+          candidateAudits: [
+            {
+              proposalId: "proposal_repaired_fact",
+              passed: true,
+              score: 91,
+              summary: "已承接上一章既定事实。",
+              issues: [],
+              revisionNotes: [],
+            },
+          ],
+        }),
+      });
+    }
+
+    if (instructions.includes("ChapterOutlineConsistencyAuditAgent") && inputText.includes("第一次临时新提出来")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: "细纲中段重置了上一章已定事实。",
+          candidateAudits: ["proposal_1", "proposal_2", "proposal_3"].map((proposalId) => ({
+              proposalId,
+              passed: false,
+              score: 35,
+              summary: "中段把上一章已落地命令写成首次提出。",
+              issues: [
+                {
+                  id: "canon_fact_continuity",
+                  severity: "critical",
+                  category: "既定事实连续性",
+                  description: "把上一章已经落实的火药摆放命令重新写成首次提出的新规。",
+                  evidence: "第一次临时新提出来",
+                  suggestion: "保留执行争执和后果，不要重置命令本身。",
+                },
+              ],
+              revisionNotes: ["删除“第一次提出”，改成执行后果继续发酵。"],
+            })),
+        }),
+      });
+    }
+
+    if (instructions.includes("ChapterOutlineRepairAgent") && inputText.includes("第一次临时新提出来")) {
+      repairCalls += 1;
+      return jsonResponse({
+        output_text: JSON.stringify({
+          proposals: [
+            {
+              proposalId: "proposal_repaired_fact",
+              summary: "修复为承接上一章已定火药规矩的执行后果。",
+              rationale: "不重置命令，只写执行代价继续发酵。",
+              diffSummary: "把首次提出改成旧命令的后果延续。",
+              title: "第二章·旧令压场",
+              timeInStory: "故事第2日",
+              povCharacter: "李凡",
+              location: "赤屿内港",
+              keyEvents: ["承接上一章压力", "火药旧令引发执行代价", "章末留下外部压力"],
+              arcContribution: ["李凡必须承受已定命令的后果"],
+              nextHook: "外部压力继续压来。",
+              emotionalTone: "承压推进",
+              threadMode: "single_spine",
+              dominantThread: "承接上一章旧令后果继续推进。",
+              entryMode: "direct_resume",
+              entryLink: "承接上一章留下的高压盘面与执行压力。",
+              exitPressure: "外部压力继续压来。",
+              charactersPresent: ["李凡", "宋应星"],
+              continuityAnchors: ["火药规矩已在上一章落地，不能重置"],
+              evidenceRefs: ["fact_ch001_001"],
+              scenes: [
+                {
+                  label: "旧令余波",
+                  location: "赤屿内港·库棚",
+                  focus: "让上一章火药规矩的执行后果继续发酵",
+                  tension: "旧令带来的成本压到现场",
+                  characters: ["李凡", "宋应星"],
+                  threadId: "main",
+                  scenePurpose: "承接上一章既定命令的后果",
+                  inheritsFromPrevious: "承接上一章留下的高压盘面与执行压力",
+                  outcome: "旧令的执行代价显形",
+                  handoffToNext: "把外部压力推到章末",
+                },
+              ],
+            },
+          ],
+        }),
+      });
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    const outlineRun = await runWriteChapter(store);
+    assert.equal(outlineRun.project.phase.write.status, "chapter_outline_pending_review");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const outlineDraft = await store.loadChapterDraft("ch002");
+  assert.equal(repairCalls, 1);
+  assert.equal(outlineDraft.chapterOutlineCandidates[0].proposalId, "proposal_repaired_fact");
+  assert.equal(outlineDraft.outlineContinuityAudit.manualReviewRequired, false);
+  assert.ok(outlineDraft.chapterOutlineHistory.some((item) => item.action === "outline_consistency_repair"));
+})));
+
+test("chapter outline consistency repair can pass on the third audit round", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-outline-third-pass-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+  await lockNextChapter(store);
+
+  const previousFetch = globalThis.fetch;
+  let auditCalls = 0;
+  let repairCalls = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input);
+
+    if (instructions.includes("ChapterOutlineConsistencyAuditAgent") && inputText.includes("当前章节：ch002")) {
+      auditCalls += 1;
+      const proposalId = [...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]).at(-1) || "proposal_1";
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: auditCalls < 3 ? "仍有残留连续性冲突。" : "第三轮已修复。",
+          candidateAudits: [
+            {
+              proposalId,
+              passed: auditCalls >= 3,
+              score: auditCalls >= 3 ? 90 : 40,
+              summary: auditCalls >= 3 ? "已通过。" : "仍需修。",
+              issues: auditCalls >= 3 ? [] : [
+                {
+                  id: "history_thread_break",
+                  severity: "critical",
+                  category: "历史线程",
+                  description: "未承接上一章留下的压力。",
+                  evidence: "缺少上章压力",
+                  suggestion: "补上上章压力和章末交棒。",
+                },
+              ],
+              revisionNotes: auditCalls >= 3 ? [] : ["补上上章压力和章末交棒。"],
+            },
+          ],
+        }),
+      });
+    }
+
+    if (instructions.includes("ChapterOutlineRepairAgent") && inputText.includes("当前章节：ch002")) {
+      repairCalls += 1;
+      return previousFetch(url, options);
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    await runWriteChapter(store);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const outlineDraft = await store.loadChapterDraft("ch002");
+  assert.equal(auditCalls, 3);
+  assert.equal(repairCalls, 2);
+  assert.equal(outlineDraft.outlineContinuityAudit.manualReviewRequired, false);
+  assert.equal(outlineDraft.outlineContinuityAudit.attempts.length, 3);
+  assert.equal(outlineDraft.chapterOutlineHistory.filter((item) => item.action === "outline_consistency_repair").length, 2);
+})));
+
+test("chapter outline consistency audit enters manual review after five failing rounds", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-outline-manual-after-five-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+  await lockNextChapter(store);
+
+  const previousFetch = globalThis.fetch;
+  let auditCalls = 0;
+  let repairCalls = 0;
+  let writerCalls = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input);
+
+    if (instructions.includes("WriterAgent")) {
+      writerCalls += 1;
+    }
+
+    if (instructions.includes("ChapterOutlineConsistencyAuditAgent") && inputText.includes("当前章节：ch002")) {
+      auditCalls += 1;
+      const proposalId = [...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]).at(-1) || "proposal_1";
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: "持续存在阻断性连续性冲突。",
+          candidateAudits: [
+            {
+              proposalId,
+              passed: false,
+              score: 30,
+              summary: "仍然重置历史事实。",
+              issues: [
+                {
+                  id: "canon_fact_continuity",
+                  severity: "critical",
+                  category: "既定事实连续性",
+                  description: "仍然把上一章已定事实重置成新信息。",
+                  evidence: "重置既定事实",
+                  suggestion: "彻底删除事实重置。",
+                },
+              ],
+              revisionNotes: ["彻底删除事实重置。"],
+            },
+          ],
+        }),
+      });
+    }
+
+    if (instructions.includes("ChapterOutlineRepairAgent") && inputText.includes("当前章节：ch002")) {
+      repairCalls += 1;
+      return previousFetch(url, options);
+    }
+
+    return previousFetch(url, options);
+  };
+
+  let outlineRun;
+  try {
+    outlineRun = await runWriteChapter(store);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const outlineDraft = await store.loadChapterDraft("ch002");
+  assert.equal(outlineRun.project.phase.write.status, "chapter_outline_pending_review");
+  assert.equal(outlineDraft.reviewState.manualReviewRequired, true);
+  assert.equal(outlineDraft.outlineContinuityAudit.manualReviewRequired, true);
+  assert.equal(outlineDraft.outlineContinuityAudit.attempts.length, 5);
+  assert.equal(auditCalls, 5);
+  assert.equal(repairCalls, 4);
+  assert.equal(writerCalls, 0);
+})));
+
+test("composed chapter outline finalization is re-audited before writer generation", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-outline-compose-reaudit-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+
+  await runWriteChapter(store);
+  const outlineDraft = await store.loadChapterDraft("ch001");
+  const selectedSceneRefs = [
+    outlineDraft.chapterOutlineCandidates[0].chapterPlan.scenes[0].sceneRef,
+    outlineDraft.chapterOutlineCandidates[1].chapterPlan.scenes[1].sceneRef,
+  ];
+
+  const previousFetch = globalThis.fetch;
+  let sawFinalize = false;
+  let writerCalls = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input);
+
+    if (instructions.includes("ChapterOutlineFinalizeAgent")) {
+      sawFinalize = true;
+      return jsonResponse({
+        output_text: JSON.stringify({
+          title: "第1章·错误拼接",
+          timeInStory: "故事第1日",
+          povCharacter: "李凡",
+          location: "赤屿内港",
+          keyEvents: ["重置已发生事件"],
+          arcContribution: ["错误重置"],
+          nextHook: "错误压力。",
+          emotionalTone: "混乱",
+          threadMode: "single_spine",
+          dominantThread: "错误重置历史。",
+          entryLink: "承接压力。",
+          exitPressure: "错误压力。",
+          charactersPresent: ["李凡"],
+          continuityAnchors: ["错误重置"],
+          scenes: [
+            {
+              label: "错误拼接",
+              location: "赤屿内港",
+              focus: "把已发生事件重新写成未发生",
+              tension: "历史冲突",
+              characters: ["李凡"],
+              threadId: "main",
+              scenePurpose: "制造冲突",
+              inheritsFromPrevious: "承接压力",
+              outcome: "历史被重置",
+              handoffToNext: "错误压力",
+            },
+          ],
+        }),
+      });
+    }
+
+    if (instructions.includes("ChapterOutlineConsistencyAuditAgent") && sawFinalize) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: "组合细纲最终稿存在历史冲突。",
+          candidateAudits: [
+            {
+              proposalId: "proposal_1",
+              passed: false,
+              score: 25,
+              summary: "组合稿重置历史。",
+              issues: [
+                {
+                  id: "history_fact_conflict",
+                  severity: "critical",
+                  category: "历史事实冲突",
+                  description: "组合细纲把已经发生的事件重新写成未发生。",
+                  evidence: "重新写成未发生",
+                  suggestion: "按已锁章节事实重接 scene。",
+                },
+              ],
+              revisionNotes: ["按已锁章节事实重接 scene。"],
+            },
+          ],
+        }),
+      });
+    }
+
+    if (instructions.includes("WriterAgent")) {
+      writerCalls += 1;
+    }
+
+    return previousFetch(url, options);
+  };
+
+  let reviewRun;
+  try {
+    reviewRun = await reviewChapter(store, {
+      target: "chapter_outline",
+      approved: true,
+      reviewAction: "approve_composed",
+      selectedSceneRefs,
+      authorNotes: "组合后需要复审。",
+      feedback: "",
+    });
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const nextDraft = await store.loadChapterDraft("ch001");
+  assert.equal(reviewRun.project.phase.write.status, "chapter_outline_pending_review");
+  assert.equal(nextDraft.reviewState.manualReviewRequired, true);
+  assert.equal(nextDraft.outlineContinuityAudit.manualReviewRequired, true);
+  assert.equal(writerCalls, 0);
 })));
 
 test("style fingerprints are stored globally, editable, and reusable across projects", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
@@ -2653,6 +3551,28 @@ test("audit heuristics flag repeated chapter restarts as critical issues", () =>
 
   const replayIssue = heuristics.issues.find((item) => item.id === "chapter_restart_replay");
   assert.equal(replayIssue?.severity, "critical");
+});
+
+test("audit heuristics flag missing planned named characters as outline drift", () => {
+  const heuristics = runAuditHeuristics({
+    chapterPlan: {
+      chapterId: "ch001",
+      title: "风急夜港",
+      chapterNumber: 1,
+      emotionalTone: "高压",
+      charactersPresent: ["李凡", "林定海", "许三娘", "众水手"],
+    },
+    chapterDraft: {
+      markdown: "# 风急夜港\n\n李凡一手按住桅索，许三娘抱着账册从棚口闯进来，众水手跟着奔向船舷。",
+    },
+    researchPacket: null,
+    foreshadowingRegistry: { foreshadowings: [] },
+    recentChapters: [],
+  });
+
+  const issue = heuristics.issues.find((item) => item.id === "outline_drift");
+  assert.equal(issue?.severity, "critical");
+  assert.match(issue?.description || "", /林定海/u);
 });
 
 test("chapter generation sends stitched replay drafts to manual review after targeted and full auto-repairs", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
@@ -4909,6 +5829,33 @@ test("MiniMax provider settings honor explicit timeout and retry-window override
   assert.equal(settings.maxConcurrency, 1);
   assert.equal(settings.requestTimeoutMs, 420000);
   assert.equal(settings.overloadRetryWindowMs, 2700000);
+}));
+
+test("Gemini provider settings use NovAI chat completions defaults", async () => withIsolatedProviderEnv(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-gemini-provider-config-"));
+  saveCodexApiConfig(tempRoot, {
+    model_provider: "Gemini",
+    model_providers: {
+      Gemini: {
+        api_key: "novai-key",
+      },
+    },
+  });
+
+  const settings = resolveProviderSettings({}, tempRoot);
+  assert.equal(settings.providerId, "Gemini");
+  assert.equal(settings.providerName, "Gemini");
+  assert.equal(settings.configuredMode, "openai-chat-completions");
+  assert.equal(settings.effectiveMode, "openai-chat-completions");
+  assert.equal(settings.apiStyle, "chat_completions");
+  assert.equal(settings.baseUrl, "https://us.novaiapi.com/v1");
+  assert.equal(settings.responseModel, "gemini-3.1-pro-preview");
+  assert.equal(settings.reviewModel, "gemini-3.1-pro-preview");
+  assert.equal(settings.codexResponseModel, "gemini-3.1-pro-preview");
+  assert.equal(settings.maxConcurrency, 1);
+  assert.equal(settings.requestTimeoutMs, 300000);
+  assert.equal(settings.overloadRetryWindowMs, 1800000);
+  assert.equal(settings.hasApiKey, true);
 }));
 
 test("MiniMax native web search is preferred when the active provider supports it", async () => withIsolatedProviderEnv(async () => {

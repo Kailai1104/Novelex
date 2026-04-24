@@ -4,6 +4,7 @@ import {
   createExcerpt,
   unique,
 } from "./text.js";
+import { missingRequiredNamedCharacters } from "./character-presence.js";
 
 function normalizeText(value) {
   return String(value || "").replace(/\r\n/g, "\n");
@@ -631,6 +632,18 @@ export function runAuditHeuristics({
 }) {
   const markdown = chapterDraft?.markdown || "";
   const issues = [];
+  const missingNamedCharacters = missingRequiredNamedCharacters(chapterPlan, markdown);
+
+  if (missingNamedCharacters.length) {
+    issues.push(createIssue(
+      "outline_drift",
+      "critical",
+      "大纲偏移",
+      `细纲要求登场的具名角色未在正文中实际出场：${missingNamedCharacters.join("、")}。`,
+      `计划登场=${(chapterPlan?.charactersPresent || []).join("、") || "无"} / 正文缺失=${missingNamedCharacters.join("、")}`,
+      "把缺席角色写进对应 scene 的动作、对白或站位反应里，不要再用无名功能角色替代其剧情职责。",
+    ));
+  }
 
   const metaLeakEvidence = detectMetaLeaks(markdown);
   if (metaLeakEvidence.length) {

@@ -1,14 +1,84 @@
 import path from "node:path";
 
-import { normalizeLocalRagToolResult } from "../mcp/index.js";
 import { createContextSource, mergeContextSources } from "../core/input-governance.js";
 import { createExcerpt, extractJsonObject, safeJsonParse, unique } from "../core/text.js";
+import { renderWriterContextMarkdown } from "../retrieval/writer-context.js";
 import { loadCollectionChunks } from "./index.js";
 
 function normalizeList(values, limit = 8) {
   return unique((Array.isArray(values) ? values : [])
     .map((item) => String(item || "").trim())
     .filter(Boolean)).slice(0, limit);
+}
+
+function signalTextFromValue(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value).trim();
+  }
+  if (Array.isArray(value)) {
+    return normalizeReferenceSignalList(value, 4).join("；");
+  }
+  if (typeof value !== "object") {
+    return "";
+  }
+
+  for (const key of [
+    "signal",
+    "pattern",
+    "summary",
+    "description",
+    "instruction",
+    "guidance",
+    "label",
+    "text",
+    "content",
+    "title",
+    "name",
+    "value",
+    "reason",
+    "method",
+    "beat",
+  ]) {
+    const candidate = signalTextFromValue(value[key]);
+    if (candidate) {
+      return candidate;
+    }
+  }
+
+  const entries = Object.entries(value)
+    .map(([key, item]) => {
+      const text = signalTextFromValue(item);
+      if (!text) {
+        return "";
+      }
+      return key === "type" || key === "kind" ? text : `${key}:${text}`;
+    })
+    .filter(Boolean);
+
+  return entries.length ? createExcerpt(entries.join("；"), 160) : "";
+}
+
+export function normalizeReferenceSignalList(values, limit = 8) {
+  const collected = [];
+  const visit = (item) => {
+    if (Array.isArray(item)) {
+      item.forEach(visit);
+      return;
+    }
+    const text = signalTextFromValue(item);
+    if (text && text !== "[object Object]") {
+      collected.push(text);
+    }
+  };
+
+  (Array.isArray(values) ? values : []).forEach(visit);
+  return unique(collected).slice(0, limit);
 }
 
 export function createEmptyReferencePacket(extra = {}) {
@@ -79,23 +149,6 @@ async function runReferenceQueryPlannerAgent({
   };
 }
 
-function fallbackReferencePlanner({ chapterPlan, planContext }) {
-  return {
-    queries: normalizeList([
-      `${chapterPlan.title} ${chapterPlan.keyEvents.join(" ")}`,
-      chapterPlan.arcContribution.join(" "),
-      planContext?.outline?.recommendedFocus || "",
-    ], 4),
-    focusAspects: normalizeList([
-      ...chapterPlan.keyEvents,
-      ...(chapterPlan.arcContribution || []),
-    ], 6),
-    mustAvoid: normalizeList([
-      ...(planContext?.outline?.continuityRisks || []),
-    ], 6),
-  };
-}
-
 async function runReferenceSynthesizerAgent({
   provider,
   project,
@@ -134,24 +187,56 @@ async function runReferenceSynthesizerAgent({
   const parsed = parseAgentJson(result, "ReferenceSynthesizerAgent");
   return {
     summary: String(parsed.summary || "").trim(),
-    styleSignals: normalizeList(parsed.styleSignals, 6),
-    scenePatterns: normalizeList(parsed.scenePatterns, 6),
-    avoidPatterns: normalizeList(parsed.avoidPatterns, 6),
+    styleSignals: normalizeReferenceSignalList(parsed.styleSignals, 6),
+    scenePatterns: normalizeReferenceSignalList(parsed.scenePatterns, 6),
+    avoidPatterns: normalizeReferenceSignalList(parsed.avoidPatterns, 6),
   };
 }
 
-function fallbackReferenceSynthesis({ planner, matches }) {
-  return {
-    summary: `本章可参考 ${matches.length} 个范文片段的场景组织与语言节奏，但不要直接照抄原句。`,
-    styleSignals: normalizeList([
-      ...planner.focusAspects,
-      ...matches.map((item) => `${item.sourcePath}：${item.excerpt}`),
-    ], 6),
-    scenePatterns: normalizeList([
-      ...matches.map((item) => `${item.sourcePath} 适合参考其场景推进节奏与动作/对白配比。`),
-    ], 6),
-    avoidPatterns: normalizeList(planner.mustAvoid, 6),
-  };
+async function runReferenceRecallAgent({
+  provider,
+  project,
+  chapterPlan,
+  planner,
+  chunks,
+}) {
+  const result = await provider.generateText({
+    instructions:
+      "你是 Novelex 的 ReferenceRecallAgent。你会看到范文库的 chunk 摘要目录。请只挑出最值得进入二次精读的候选片段，重点看叙事技法、场景组织、人物推进和动作/对白节奏，不要挑纯设定说明。只输出 JSON。",
+    input: [
+      `作品：${project.title}`,
+      `当前章节：${chapterPlan.chapterId} ${chapterPlan.title}`,
+      `检索问题：${planner.queries.join("；") || "无"}`,
+      `重点参考：${planner.focusAspects.join("；") || "无"}`,
+      `需要避开：${planner.mustAvoid.join("；") || "无"}`,
+      `候选 chunk 目录：\n${chunks.map((item) => `- ${item.chunkId}｜${item.collectionName}/${item.sourcePath}｜摘录:${item.excerpt || createExcerpt(item.text, 120)}`).join("\n")}`,
+      `请输出 JSON：
+{
+  "selectedChunkIds": ["chunk_1", "chunk_2"],
+  "reasons": {
+    "chunk_1": "为什么适合进入精读"
+  }
+}`,
+    ].join("\n\n"),
+    useReviewModel: true,
+    metadata: {
+      feature: "reference_recall",
+      chapterId: chapterPlan.chapterId,
+    },
+  });
+
+  const parsed = parseAgentJson(result, "ReferenceRecallAgent");
+  const reasons = parsed.reasons && typeof parsed.reasons === "object" ? parsed.reasons : {};
+  const selectedIds = new Set((Array.isArray(parsed.selectedChunkIds) ? parsed.selectedChunkIds : [])
+    .map((id) => String(id || "").trim())
+    .filter(Boolean));
+  return chunks
+    .filter((item) => selectedIds.has(item.chunkId))
+    .slice(0, 8)
+    .map((item) => ({
+      ...item,
+      recallReason: String(reasons[item.chunkId] || "").trim(),
+    }));
 }
 
 function buildReferenceMarkdown(packet) {
@@ -197,50 +282,38 @@ export function mergeReferenceIntoWriterContext(writerContext, referencePacket) 
   }
 
   const referenceSources = buildReferenceSources(referencePacket);
+  const cleanedStyleSignals = normalizeReferenceSignalList(referencePacket?.styleSignals, 6);
+  const cleanedScenePatterns = normalizeReferenceSignalList(referencePacket?.scenePatterns, 6);
+  const cleanedAvoidPatterns = normalizeReferenceSignalList(referencePacket?.avoidPatterns, 8);
+  const referenceSignals = normalizeReferenceSignalList([
+    ...(writerContext?.referenceSignals || []),
+    ...cleanedStyleSignals,
+    ...cleanedScenePatterns,
+  ], 8);
   const priorities = normalizeList([
     ...(writerContext?.priorities || []),
-    ...(referencePacket.styleSignals || []),
-    ...(referencePacket.scenePatterns || []),
+    ...cleanedStyleSignals,
+    ...cleanedScenePatterns,
   ], 12);
   const risks = normalizeList([
     ...(writerContext?.risks || []),
-    ...(referencePacket.avoidPatterns || []),
+    ...cleanedAvoidPatterns,
   ], 12);
   const selectedSources = mergeContextSources([
     writerContext?.selectedSources || [],
     referenceSources,
   ], 16);
-  const sourceLines = selectedSources
-    .map((item) => `- ${item.source}｜${item.reason}｜${item.excerpt || "无摘录"}`)
-    .join("\n");
-
-  const markdown = [
-    `# ${writerContext?.chapterId || "chapter"} Writer 上下文包`,
-    "",
-    "## 优先落实",
-    `- ${priorities.join("\n- ") || "无"}`,
-    "",
-    "## 连续性风险",
-    `- ${risks.join("\n- ") || "无"}`,
-    "",
-    "## 范文参考包",
-    referencePacket.briefingMarkdown || "当前没有额外范文参考。",
-    "",
-    "## 计划侧摘要",
-    writerContext?.planContextSummary || "无",
-    "",
-    "## 历史侧摘要",
-    writerContext?.historyContextSummary || "无",
-    "",
-    "## 可追溯来源",
-    sourceLines || "- 无",
-  ].join("\n");
-
-  return {
+  const nextWriterContext = {
     ...writerContext,
     priorities,
     risks,
     selectedSources,
+    referenceSignals,
+  };
+  const markdown = renderWriterContextMarkdown(nextWriterContext);
+
+  return {
+    ...nextWriterContext,
     summaryText: createExcerpt(markdown, 320),
     briefingMarkdown: markdown,
   };
@@ -272,101 +345,73 @@ export async function buildReferencePacket({
     });
   }
 
-  let planner = fallbackReferencePlanner({ chapterPlan, planContext });
   const warnings = [];
-  try {
-    planner = await runReferenceQueryPlannerAgent({
-      provider,
-      project,
-      chapterPlan,
-      planContext,
-      historyContext,
-      researchPacket,
-    });
-  } catch (error) {
-    warnings.push(`ReferenceQueryPlannerAgent 失败，已回退到规则构造查询：${error instanceof Error ? error.message : String(error || "")}`);
-  }
+  const planner = await runReferenceQueryPlannerAgent({
+    provider,
+    project,
+    chapterPlan,
+    planContext,
+    historyContext,
+    researchPacket,
+  });
+  const matches = await runReferenceRecallAgent({
+    provider,
+    project,
+    chapterPlan,
+    planner,
+    chunks,
+  });
 
-  try {
-    const ragResult = normalizeLocalRagToolResult(await mcpManager.callTool("local_rag", {
-      collectionType: "reference",
-      collectionIds,
-      queries: planner.queries,
-      limit: 8,
-    }));
-    const matches = Array.isArray(ragResult.matches) ? ragResult.matches : [];
-    warnings.push(...(ragResult.warnings || []));
-
-    if (!matches.length) {
-      const emptyPacket = createEmptyReferencePacket({
-        triggered: true,
-        mode: "hybrid-rag",
-        collectionIds,
-        queries: planner.queries,
-        focusAspects: planner.focusAspects,
-        mustAvoid: planner.mustAvoid,
-        summary: ragResult.summary || "已执行范文检索，但没有命中高相关片段。",
-        warnings,
-      });
-      emptyPacket.briefingMarkdown = buildReferenceMarkdown(emptyPacket);
-      return emptyPacket;
-    }
-
-    let synthesis = fallbackReferenceSynthesis({ planner, matches });
-    try {
-      synthesis = await runReferenceSynthesizerAgent({
-        provider,
-        project,
-        chapterPlan,
-        planner,
-        matches,
-      });
-    } catch (error) {
-      warnings.push(`ReferenceSynthesizerAgent 失败，已回退到规则摘要：${error instanceof Error ? error.message : String(error || "")}`);
-    }
-
-    const packet = {
+  if (!matches.length) {
+    const emptyPacket = createEmptyReferencePacket({
       triggered: true,
-      mode: "hybrid-rag",
+      mode: "llm_retrieval",
       collectionIds,
       queries: planner.queries,
       focusAspects: planner.focusAspects,
       mustAvoid: planner.mustAvoid,
-      matches: matches.map((item) => ({
-        chunkId: item.chunkId,
-        collectionId: item.collectionId,
-        collectionName: item.collectionName,
-        sourcePath: item.sourcePath,
-        excerpt: item.excerpt,
-        text: createExcerpt(item.text, 600),
-        position: item.position,
-        fusedScore: item.fusedScore,
-        vectorScore: item.vectorScore,
-        keywordScore: item.keywordScore,
-      })),
-      styleSignals: synthesis.styleSignals,
-      scenePatterns: synthesis.scenePatterns,
-      avoidPatterns: normalizeList([
-        ...synthesis.avoidPatterns,
-        ...planner.mustAvoid,
-      ], 8),
-      summary: synthesis.summary || ragResult.summary,
-      warnings,
-    };
-    packet.briefingMarkdown = buildReferenceMarkdown(packet);
-    return packet;
-  } catch (error) {
-    const packet = createEmptyReferencePacket({
-      triggered: true,
-      mode: "embedding_failed",
-      collectionIds,
-      queries: planner.queries,
-      focusAspects: planner.focusAspects,
-      mustAvoid: planner.mustAvoid,
-      summary: `范文检索失败：${error instanceof Error ? error.message : String(error || "")}`,
+      summary: "已执行 LLM 范文检索，但没有命中高相关片段。",
       warnings,
     });
-    packet.briefingMarkdown = buildReferenceMarkdown(packet);
-    return packet;
+    emptyPacket.briefingMarkdown = buildReferenceMarkdown(emptyPacket);
+    return emptyPacket;
   }
+
+  const synthesis = await runReferenceSynthesizerAgent({
+    provider,
+    project,
+    chapterPlan,
+    planner,
+    matches,
+  });
+
+  const packet = {
+    triggered: true,
+    mode: "llm_retrieval",
+    collectionIds,
+    queries: planner.queries,
+    focusAspects: planner.focusAspects,
+    mustAvoid: planner.mustAvoid,
+    matches: matches.map((item, index) => ({
+      chunkId: item.chunkId,
+      collectionId: item.collectionId,
+      collectionName: item.collectionName,
+      sourcePath: item.sourcePath,
+      excerpt: item.excerpt,
+      text: createExcerpt(item.text, 600),
+      position: item.position,
+      retrievalRank: index + 1,
+      retrievalReason: item.recallReason || "",
+    })),
+    styleSignals: synthesis.styleSignals,
+    scenePatterns: synthesis.scenePatterns,
+    avoidPatterns: normalizeList([
+      ...synthesis.avoidPatterns,
+      ...planner.mustAvoid,
+    ], 8),
+    summary: synthesis.summary,
+    warnings,
+  };
+  packet.briefingMarkdown = buildReferenceMarkdown(packet);
+  return packet;
 }

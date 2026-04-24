@@ -2,12 +2,83 @@ import path from "node:path";
 
 import { createContextSource, mergeContextSources } from "../core/input-governance.js";
 import { createExcerpt, extractJsonObject, safeJsonParse, unique } from "../core/text.js";
-import { loadOpeningCollectionChunks, runHybridRetrieval } from "./index.js";
+import { generateStructuredObject } from "../llm/structured.js";
+import { renderWriterContextMarkdown } from "../retrieval/writer-context.js";
+import { loadOpeningCollectionChunks } from "./index.js";
 
 function normalizeList(values, limit = 8) {
   return unique((Array.isArray(values) ? values : [])
     .map((item) => String(item || "").trim())
     .filter(Boolean)).slice(0, limit);
+}
+
+function openingSignalTextFromValue(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value).trim();
+  }
+  if (Array.isArray(value)) {
+    return normalizeOpeningSignalList(value, 4).join("；");
+  }
+  if (typeof value !== "object") {
+    return "";
+  }
+
+  for (const key of [
+    "summary",
+    "description",
+    "signal",
+    "pattern",
+    "instruction",
+    "guidance",
+    "text",
+    "content",
+    "label",
+    "title",
+    "name",
+    "value",
+    "reason",
+    "beat",
+  ]) {
+    const candidate = openingSignalTextFromValue(value[key]);
+    if (candidate) {
+      return candidate;
+    }
+  }
+
+  const entries = Object.entries(value)
+    .map(([key, item]) => {
+      const text = openingSignalTextFromValue(item);
+      if (!text) {
+        return "";
+      }
+      return key === "type" || key === "kind" ? text : `${key}:${text}`;
+    })
+    .filter(Boolean);
+
+  return entries.length ? createExcerpt(entries.join("；"), 160) : "";
+}
+
+function normalizeOpeningSignalList(values, limit = 8) {
+  const collected = [];
+  const visit = (item) => {
+    if (Array.isArray(item)) {
+      item.forEach(visit);
+      return;
+    }
+    const text = openingSignalTextFromValue(item);
+    if (text && text !== "[object Object]") {
+      collected.push(text);
+    }
+  };
+
+  (Array.isArray(values) ? values : []).forEach(visit);
+  return unique(collected).slice(0, limit);
 }
 
 function parseAgentJson(result, label) {
@@ -103,24 +174,6 @@ async function runOpeningQueryPlannerAgent({
   };
 }
 
-function fallbackOpeningPlanner({ project, mode, chapterPlan, chapterBase, planContext }) {
-  const subject = chapterPlan?.title || chapterBase?.title || project.title;
-  return {
-    queries: normalizeList([
-      `${project.genre} 黄金三章 ${subject}`,
-      `${project.protagonistGoal} 开场钩子 主角亮相`,
-      planContext?.outline?.recommendedFocus || "",
-      `${openingModeLabel(mode)} 冲突升级 章末钩子`,
-    ], 4),
-    focusAspects: normalizeList([
-      "第一场如何立问题",
-      "主角如何快速建立辨识度与欲望",
-      "前三章冲突如何层层抬升",
-      "章末钩子怎样连续加压",
-    ], 6),
-  };
-}
-
 async function runOpeningPatternSynthesizerAgent({
   provider,
   project,
@@ -162,37 +215,59 @@ async function runOpeningPatternSynthesizerAgent({
   const parsed = parseAgentJson(result, "OpeningPatternSynthesizerAgent");
   return {
     summary: String(parsed.summary || "").trim(),
-    openingHooks: normalizeList(parsed.openingHooks, 6),
-    protagonistEntryPatterns: normalizeList(parsed.protagonistEntryPatterns, 6),
-    conflictIgnitionPatterns: normalizeList(parsed.conflictIgnitionPatterns, 6),
-    pacingSignals: normalizeList(parsed.pacingSignals, 6),
-    chapterEndHookPatterns: normalizeList(parsed.chapterEndHookPatterns, 6),
-    structuralBeats: normalizeList(parsed.structuralBeats, 8),
-    avoidPatterns: normalizeList(parsed.avoidPatterns, 8),
+    openingHooks: normalizeOpeningSignalList(parsed.openingHooks, 6),
+    protagonistEntryPatterns: normalizeOpeningSignalList(parsed.protagonistEntryPatterns, 6),
+    conflictIgnitionPatterns: normalizeOpeningSignalList(parsed.conflictIgnitionPatterns, 6),
+    pacingSignals: normalizeOpeningSignalList(parsed.pacingSignals, 6),
+    chapterEndHookPatterns: normalizeOpeningSignalList(parsed.chapterEndHookPatterns, 6),
+    structuralBeats: normalizeOpeningSignalList(parsed.structuralBeats, 8),
+    avoidPatterns: normalizeOpeningSignalList(parsed.avoidPatterns, 8),
   };
 }
 
-function fallbackOpeningSynthesis({ matches }) {
-  return {
-    summary: `已从 ${matches.length} 个优秀开头片段中提炼前三章结构规律，只借结构，不借句子。`,
-    openingHooks: normalizeList(matches.map((item) => `${item.sourcePath}：开局迅速抛出问题或压力。`), 4),
-    protagonistEntryPatterns: ["主角应尽快带着欲望、处境和行动亮相。"],
-    conflictIgnitionPatterns: ["第一章尽快让主线冲突落地，不要被背景说明淹没。"],
-    pacingSignals: ["前三章要持续加压，每章都要比上一章更具体。"] ,
-    chapterEndHookPatterns: ["每章结尾都留下下一步必须立刻处理的新压力。"],
-    structuralBeats: [
-      "第一场立问题",
-      "主角快速亮相并展示欲望/困境",
-      "当章内形成真实碰撞",
-      "章末抬高下一章压力",
-    ],
-    avoidPatterns: [
-      "避免背景说明过载",
-      "避免主角长期被动",
-      "避免信息堆砌但没有行动",
-      "避免章末没有牵引",
-    ],
-  };
+async function runOpeningRecallAgent({
+  provider,
+  project,
+  mode,
+  planner,
+  chunks,
+}) {
+  const result = await provider.generateText({
+    instructions:
+      "你是 Novelex 的 OpeningRecallAgent。你会看到优秀网文前三章的 chunk 摘要目录。请只挑出最值得进入二次精读的片段，重点学习开场钩子、主角亮相、冲突点燃、前三章升级和章末牵引。只输出 JSON。",
+    input: [
+      `作品：${project.title}`,
+      `模式：${openingModeLabel(mode)}`,
+      `检索问题：${planner.queries.join("；") || "无"}`,
+      `重点学习：${planner.focusAspects.join("；") || "无"}`,
+      `候选 chunk 目录：\n${chunks.map((item) => `- ${item.chunkId}｜${item.collectionName}/${item.sourcePath}｜摘录:${item.excerpt || createExcerpt(item.text, 120)}`).join("\n")}`,
+      `请输出 JSON：
+{
+  "selectedChunkIds": ["chunk_1", "chunk_2"],
+  "reasons": {
+    "chunk_1": "为什么值得精读"
+  }
+}`,
+    ].join("\n\n"),
+    useReviewModel: true,
+    metadata: {
+      feature: "opening_recall",
+      mode,
+    },
+  });
+
+  const parsed = parseAgentJson(result, "OpeningRecallAgent");
+  const reasons = parsed.reasons && typeof parsed.reasons === "object" ? parsed.reasons : {};
+  const selectedIds = new Set((Array.isArray(parsed.selectedChunkIds) ? parsed.selectedChunkIds : [])
+    .map((id) => String(id || "").trim())
+    .filter(Boolean));
+  return chunks
+    .filter((item) => selectedIds.has(item.chunkId))
+    .slice(0, 8)
+    .map((item) => ({
+      ...item,
+      recallReason: String(reasons[item.chunkId] || "").trim(),
+    }));
 }
 
 function buildOpeningReferenceMarkdown(packet) {
@@ -225,6 +300,217 @@ function buildOpeningReferenceMarkdown(packet) {
   ].join("\n");
 }
 
+const FRESH_START_OPENING_PATTERN = /惊醒|醒来|睁眼|睁开眼|刚恢复意识|重新确认|再次确认|我是谁|穿越|身份首次|主角首次|身体危机/u;
+const ABSTRACT_OPENING_SIGNALS = {
+  continuation_reference: {
+    conflictIgnitionPatterns: [
+      "延续上一章已经成立的生存、权力或身份压力，不另起一套开篇型冲突。",
+      "让角色在当下危机里用行动证明价值，而不是回头重讲设定。",
+    ],
+    pacingSignals: [
+      "开场 1-2 段直接承接上一章余波，尽快进入本章动作。",
+      "每场都必须带来新的信息、代价或关系变化，避免重复确认同一结论。",
+    ],
+    chapterEndHookPatterns: [
+      "章末用未完成决策、新外部压力或更高代价继续加压，不做封闭总结。",
+    ],
+    structuralBeats: [
+      "承接上一章直接余波 -> 当章行动试探 -> 新代价或新风险压上来",
+    ],
+  },
+  escalation_reference: {
+    conflictIgnitionPatterns: [],
+    pacingSignals: [
+      "开场直接进入已存在压力，中段抬高代价，后段递交更大的下一轮冲突。",
+      "避免重复亮相、重复证明或重复解释，把篇幅优先留给升级后的行动与后果。",
+    ],
+    chapterEndHookPatterns: [
+      "章末把更高层级的风险或决策压到眼前，让读者自然进入下一章。",
+    ],
+    structuralBeats: [
+      "直接承压 -> 升级碰撞 -> 更大风险或更硬决策递交下一章",
+    ],
+  },
+};
+
+function filterContinuationBeats(values, limit = 6) {
+  return normalizeList(values, limit).filter((item) => !FRESH_START_OPENING_PATTERN.test(item));
+}
+
+function structuralBeatsForMode(packet, referenceMode) {
+  const beats = normalizeList(packet?.structuralBeats || [], 8);
+  if (referenceMode === "full_opening_reference") {
+    return beats;
+  }
+  if (referenceMode === "continuation_reference") {
+    return filterContinuationBeats(beats, 4);
+  }
+
+  const escalationBeats = beats.filter((item) =>
+    /升级|加压|兑现|章末|牵引|钩子|冲突|代价|风险|推进/u.test(item) &&
+      !FRESH_START_OPENING_PATTERN.test(item),
+  );
+  return (escalationBeats.length ? escalationBeats : filterContinuationBeats(beats, 3)).slice(0, 4);
+}
+
+function abstractOpeningSignalsForMode(referenceMode) {
+  return {
+    ...(ABSTRACT_OPENING_SIGNALS[referenceMode] || ABSTRACT_OPENING_SIGNALS.escalation_reference),
+  };
+}
+
+export function scopeOpeningReferencePacket(packet, {
+  chapterNumber = 1,
+  freshStart = false,
+  continuityGuard = null,
+} = {}) {
+  if (!packet?.triggered) {
+    return packet;
+  }
+
+  const normalizedChapterNumber = Number(chapterNumber) || 1;
+  const isFreshStart = Boolean(freshStart) || normalizedChapterNumber <= 1;
+  const referenceMode = isFreshStart
+    ? "full_opening_reference"
+    : normalizedChapterNumber === 2
+      ? "continuation_reference"
+      : "escalation_reference";
+  const chapterPhase = isFreshStart
+    ? "chapter_1"
+    : normalizedChapterNumber === 2
+      ? "chapter_2"
+      : "chapter_3_escalation";
+
+  if (referenceMode === "full_opening_reference") {
+    const scoped = {
+      ...packet,
+      referenceMode,
+      applicable_phase: chapterPhase,
+      requires_fresh_start: true,
+      freshStart: true,
+      matches: (packet.matches || []).map((item) => ({
+        ...item,
+        applicable_phase: chapterPhase,
+        requires_fresh_start: true,
+      })),
+    };
+    scoped.briefingMarkdown = buildOpeningReferenceMarkdown(scoped);
+    return scoped;
+  }
+
+  const baseAvoidPatterns = normalizeList([
+    ...(packet.avoidPatterns || []),
+    "非开篇章节禁止重新穿越、重新惊醒或重新确认身份。",
+    "若连续性护栏未提供昏迷证据，不得采用醒来/恢复意识式开场。",
+    "不得把上一章已经完成的第一次立威或首次证明写成首次发生。",
+  ], 10);
+  const abstractSignals = abstractOpeningSignalsForMode(referenceMode);
+  const scoped = {
+    ...packet,
+    referenceMode,
+    applicable_phase: chapterPhase,
+    requires_fresh_start: false,
+    freshStart: false,
+    openingHooks: [],
+    protagonistEntryPatterns: [],
+    conflictIgnitionPatterns: abstractSignals.conflictIgnitionPatterns,
+    pacingSignals: abstractSignals.pacingSignals,
+    chapterEndHookPatterns: abstractSignals.chapterEndHookPatterns,
+    structuralBeats: abstractSignals.structuralBeats,
+    avoidPatterns: baseAvoidPatterns,
+    suppressedSections: referenceMode === "continuation_reference"
+      ? ["openingHooks", "protagonistEntryPatterns", "sourceSpecificConflictIgnitionPatterns", "sourceSpecificStructuralBeats"]
+      : ["openingHooks", "protagonistEntryPatterns", "conflictIgnitionPatterns", "sourceSpecificStructuralBeats"],
+    warnings: normalizeList([
+      ...(packet.warnings || []),
+      `黄金三章参考已按 ${referenceMode} 降权，只保留与连续章节相容的结构项。`,
+      "非开篇章节已移除源小说人物名、具体桥段与 Beat 编号，只保留抽象结构信号。",
+      ...(!continuityGuard?.supportsWakeAfterUnconsciousness && normalizedChapterNumber > 1
+        ? ["连续性护栏未发现昏迷证据，已压制醒来/惊醒式开场参考。"]
+        : []),
+    ], 12),
+    matches: (packet.matches || []).map((item) => ({
+      ...item,
+      applicable_phase: chapterPhase,
+      requires_fresh_start: false,
+      })),
+  };
+  scoped.summary = referenceMode === "continuation_reference"
+    ? "非开篇章节仅借“承接上一章余波 -> 当章行动试探 -> 章末继续加压”的抽象结构，不借原书人物与桥段。"
+    : "第三章附近仅借“直接承压 -> 冲突升级 -> 章末递交更大风险”的抽象结构，不借原书人物与桥段。";
+  scoped.briefingMarkdown = buildOpeningReferenceMarkdown(scoped);
+  return scoped;
+}
+
+export async function scopeOpeningReferencePacketWithAgent(provider, packet, {
+  chapterNumber = 1,
+  freshStart = false,
+  continuityGuard = null,
+} = {}) {
+  if (!packet?.triggered) {
+    return packet;
+  }
+
+  const heuristicScoped = scopeOpeningReferencePacket(packet, {
+    chapterNumber,
+    freshStart,
+    continuityGuard,
+  });
+  const normalizedChapterNumber = Number(chapterNumber) || 1;
+  if (normalizedChapterNumber <= 1) {
+    return heuristicScoped;
+  }
+
+  return generateStructuredObject(provider, {
+    label: "OpeningReferenceScoperAgent",
+    instructions:
+      "你是 Novelex 的 OpeningReferenceScoperAgent。你负责把黄金三章参考包压缩成适合当前章节位的抽象结构信号。对非第一章，必须主动压制第一章冷启动模板、源小说人物名、具体桥段和 Beat 编号，只保留连续章节也能安全继承的结构方法。只输出 JSON。",
+    input: [
+      `chapterNumber=${normalizedChapterNumber}`,
+      `freshStart=${freshStart ? "true" : "false"}`,
+      `continuityGuard=${JSON.stringify(continuityGuard || {}, null, 2)}`,
+      `原始 opening packet：\n${JSON.stringify(packet, null, 2)}`,
+      `参考默认压缩结果：\n${JSON.stringify(heuristicScoped, null, 2)}`,
+      `请输出 JSON：
+{
+  "summary": "作用说明",
+  "openingHooks": [],
+  "protagonistEntryPatterns": [],
+  "conflictIgnitionPatterns": ["抽象后的冲突点燃方式"],
+  "pacingSignals": ["抽象后的节奏信号"],
+  "chapterEndHookPatterns": ["抽象后的章末牵引"],
+  "structuralBeats": ["抽象后的结构拍点"],
+  "avoidPatterns": ["当前章节位必须避免的模式"],
+  "warnings": ["附加说明"]
+}`,
+    ].join("\n\n"),
+    useReviewModel: true,
+    metadata: {
+      feature: "opening_reference_scope",
+      chapterNumber: normalizedChapterNumber,
+    },
+    normalize(parsed) {
+      const scoped = {
+        ...heuristicScoped,
+        summary: String(parsed.summary || heuristicScoped.summary || "").trim(),
+        openingHooks: normalizeList(parsed.openingHooks, 6),
+        protagonistEntryPatterns: normalizeList(parsed.protagonistEntryPatterns, 6),
+        conflictIgnitionPatterns: normalizeList(parsed.conflictIgnitionPatterns, 6),
+        pacingSignals: normalizeList(parsed.pacingSignals, 6),
+        chapterEndHookPatterns: normalizeList(parsed.chapterEndHookPatterns, 6),
+        structuralBeats: normalizeList(parsed.structuralBeats, 8),
+        avoidPatterns: normalizeList(parsed.avoidPatterns, 10),
+        warnings: normalizeList([
+          ...(heuristicScoped.warnings || []),
+          ...(Array.isArray(parsed.warnings) ? parsed.warnings : []),
+        ], 12),
+      };
+      scoped.briefingMarkdown = buildOpeningReferenceMarkdown(scoped);
+      return scoped;
+    },
+  });
+}
+
 function toOpeningSource(match) {
   return createContextSource({
     source: path.join("runtime", "opening_collections", match.collectionId, "sources", match.sourcePath),
@@ -245,6 +531,13 @@ export function mergeOpeningIntoWriterContext(writerContext, openingReferencePac
   }
 
   const openingSources = buildOpeningReferenceSources(openingReferencePacket);
+  const openingSignals = normalizeOpeningSignalList([
+    ...(writerContext?.openingSignals || []),
+    ...(openingReferencePacket.conflictIgnitionPatterns || []),
+    ...(openingReferencePacket.pacingSignals || []),
+    ...(openingReferencePacket.chapterEndHookPatterns || []),
+    ...(openingReferencePacket.structuralBeats || []),
+  ], 8);
   const priorities = normalizeList([
     ...(writerContext?.priorities || []),
     ...(openingReferencePacket.openingHooks || []).map((item) => `黄金三章开场参考：${item}`),
@@ -261,37 +554,17 @@ export function mergeOpeningIntoWriterContext(writerContext, openingReferencePac
     writerContext?.selectedSources || [],
     openingSources,
   ], 18);
-  const sourceLines = selectedSources
-    .map((item) => `- ${item.source}｜${item.reason}｜${item.excerpt || "无摘录"}`)
-    .join("\n");
-
-  const markdown = [
-    `# ${writerContext?.chapterId || "chapter"} Writer 上下文包`,
-    "",
-    "## 优先落实",
-    `- ${priorities.join("\n- ") || "无"}`,
-    "",
-    "## 连续性风险",
-    `- ${risks.join("\n- ") || "无"}`,
-    "",
-    "## 黄金三章参考包",
-    openingReferencePacket.briefingMarkdown || "当前没有额外黄金三章参考。",
-    "",
-    "## 计划侧摘要",
-    writerContext?.planContextSummary || "无",
-    "",
-    "## 历史侧摘要",
-    writerContext?.historyContextSummary || "无",
-    "",
-    "## 可追溯来源",
-    sourceLines || "- 无",
-  ].join("\n");
-
-  return {
+  const nextWriterContext = {
     ...writerContext,
     priorities,
     risks,
     selectedSources,
+    openingSignals,
+  };
+  const markdown = renderWriterContextMarkdown(nextWriterContext);
+
+  return {
+    ...nextWriterContext,
     summaryText: createExcerpt(markdown, 320),
     briefingMarkdown: markdown,
   };
@@ -357,105 +630,73 @@ export async function buildOpeningReferencePacket({
     });
   }
 
-  let planner = fallbackOpeningPlanner({
+  const warnings = [];
+  const planner = await runOpeningQueryPlannerAgent({
+    provider,
     project,
     mode,
     chapterPlan,
     chapterBase,
     planContext,
+    historyContext,
   });
-  const warnings = [];
+  const matches = await runOpeningRecallAgent({
+    provider,
+    project,
+    mode,
+    planner,
+    chunks,
+  });
 
-  try {
-    planner = await runOpeningQueryPlannerAgent({
-      provider,
-      project,
-      mode,
-      chapterPlan,
-      chapterBase,
-      planContext,
-      historyContext,
-    });
-  } catch (error) {
-    warnings.push(`OpeningQueryPlannerAgent 失败，已回退到规则构造查询：${error instanceof Error ? error.message : String(error || "")}`);
-  }
-
-  try {
-    const matches = await runHybridRetrieval({
-      queries: planner.queries,
-      chunks,
-      limit: 8,
-      rootDir: store.paths.configRootDir,
-    });
-
-    if (!matches.length) {
-      const emptyPacket = createEmptyOpeningReferencePacket({
-        triggered: true,
-        mode,
-        collectionIds,
-        queries: planner.queries,
-        focusAspects: planner.focusAspects,
-        summary: "已执行黄金三章检索，但没有命中高相关片段。",
-        warnings,
-      });
-      emptyPacket.briefingMarkdown = buildOpeningReferenceMarkdown(emptyPacket);
-      return emptyPacket;
-    }
-
-    let synthesis = fallbackOpeningSynthesis({ matches });
-    try {
-      synthesis = await runOpeningPatternSynthesizerAgent({
-        provider,
-        project,
-        mode,
-        planner,
-        matches,
-      });
-    } catch (error) {
-      warnings.push(`OpeningPatternSynthesizerAgent 失败，已回退到规则摘要：${error instanceof Error ? error.message : String(error || "")}`);
-    }
-
-    const packet = {
+  if (!matches.length) {
+    const emptyPacket = createEmptyOpeningReferencePacket({
       triggered: true,
-      mode,
+      mode: "llm_retrieval",
       collectionIds,
       queries: planner.queries,
       focusAspects: planner.focusAspects,
-      matches: matches.map((item) => ({
-        chunkId: item.chunkId,
-        collectionId: item.collectionId,
-        collectionName: item.collectionName,
-        sourcePath: item.sourcePath,
-        excerpt: item.excerpt,
-        text: createExcerpt(item.text, 600),
-        position: item.position,
-        fusedScore: item.fusedScore,
-        vectorScore: item.vectorScore,
-        keywordScore: item.keywordScore,
-      })),
-      openingHooks: synthesis.openingHooks,
-      protagonistEntryPatterns: synthesis.protagonistEntryPatterns,
-      conflictIgnitionPatterns: synthesis.conflictIgnitionPatterns,
-      pacingSignals: synthesis.pacingSignals,
-      chapterEndHookPatterns: synthesis.chapterEndHookPatterns,
-      structuralBeats: synthesis.structuralBeats,
-      avoidPatterns: synthesis.avoidPatterns,
-      summary: synthesis.summary,
-      warnings,
-    };
-    packet.briefingMarkdown = buildOpeningReferenceMarkdown(packet);
-    return packet;
-  } catch (error) {
-    const packet = createEmptyOpeningReferencePacket({
-      triggered: true,
-      mode,
-      collectionIds,
-      queries: planner.queries,
-      focusAspects: planner.focusAspects,
-      summary: `黄金三章检索失败：${error instanceof Error ? error.message : String(error || "")}`,
+      summary: "已执行黄金三章 LLM 检索，但没有命中高相关片段。",
       warnings,
     });
-    packet.briefingMarkdown = buildOpeningReferenceMarkdown(packet);
-    return packet;
+    emptyPacket.briefingMarkdown = buildOpeningReferenceMarkdown(emptyPacket);
+    return emptyPacket;
   }
+
+  const synthesis = await runOpeningPatternSynthesizerAgent({
+    provider,
+    project,
+    mode,
+    planner,
+    matches,
+  });
+
+  const packet = {
+    triggered: true,
+    mode: "llm_retrieval",
+    collectionIds,
+    queries: planner.queries,
+    focusAspects: planner.focusAspects,
+    matches: matches.map((item, index) => ({
+      chunkId: item.chunkId,
+      collectionId: item.collectionId,
+      collectionName: item.collectionName,
+      sourcePath: item.sourcePath,
+      excerpt: item.excerpt,
+      text: createExcerpt(item.text, 600),
+      position: item.position,
+      retrievalRank: index + 1,
+      retrievalReason: item.recallReason || "",
+    })),
+    openingHooks: synthesis.openingHooks,
+    protagonistEntryPatterns: synthesis.protagonistEntryPatterns,
+    conflictIgnitionPatterns: synthesis.conflictIgnitionPatterns,
+    pacingSignals: synthesis.pacingSignals,
+    chapterEndHookPatterns: synthesis.chapterEndHookPatterns,
+    structuralBeats: synthesis.structuralBeats,
+    avoidPatterns: synthesis.avoidPatterns,
+    summary: synthesis.summary,
+    warnings,
+  };
+  packet.briefingMarkdown = buildOpeningReferenceMarkdown(packet);
+  return packet;
 }

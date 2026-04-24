@@ -1222,12 +1222,18 @@ function defaultEnvApiKeyNames(providerId) {
   if (providerId === "OpenAI") {
     return ["OPENAI_API_KEY"];
   }
+  if (providerId === "Gemini") {
+    return ["GEMINI_API_KEY", "NOVAI_API_KEY"];
+  }
   return [`${String(providerId || "").toUpperCase()}_API_KEY`];
 }
 
 function defaultEnvBaseUrlNames(providerId) {
   if (providerId === "OpenAI") {
     return ["OPENAI_BASE_URL"];
+  }
+  if (providerId === "Gemini") {
+    return ["GEMINI_BASE_URL", "NOVAI_BASE_URL"];
   }
   return [`${String(providerId || "").toUpperCase()}_BASE_URL`];
 }

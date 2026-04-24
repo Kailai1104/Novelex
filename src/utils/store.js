@@ -311,6 +311,7 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
     await writeText(path.join(finalDir, "worldbuilding.md"), payload.worldbuildingMarkdown);
     await writeText(path.join(finalDir, "structure.md"), payload.structureMarkdown);
     await writeJson(path.join(finalDir, "structure_data.json"), payload.structureData);
+    await writeJson(path.join(finalDir, "chapter_slots.json"), payload.chapterSlots || []);
     await writeJson(path.join(finalDir, "world_state.json"), payload.worldState);
     await writeJson(
       path.join(finalDir, "foreshadowing_registry.json"),
@@ -366,10 +367,16 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
     const researchPacket = payload.researchPacket || {};
     const referencePacket = payload.referencePacket || {};
     const openingReferencePacket = payload.openingReferencePacket || {};
+    const chapterSlot = payload.chapterSlot || null;
+    const continuityGuard = payload.continuityGuard || {};
+    const contextConflicts = payload.contextConflicts || {};
+    const outlineGenerationContract = payload.outlineGenerationContract || {};
+    const outlineContinuityAudit = payload.outlineContinuityAudit || {};
     const chapterIntent = payload.chapterIntent || {};
     const contextPackage = payload.contextPackage || {};
     const ruleStack = payload.ruleStack || {};
     const contextTrace = payload.contextTrace || payload.trace || {};
+    const writerPromptPacket = payload.writerPromptPacket || null;
     const auditDrift = payload.auditDrift || {};
     const factContext = payload.factContext || {};
     await ensureDir(chapterDir);
@@ -388,12 +395,20 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
     await writeText(path.join(chapterDir, "outline_context.md"), chapterOutlineContext.briefingMarkdown || "");
     await writeJson(path.join(chapterDir, "outline_candidates.json"), chapterOutlineCandidates);
     await writeJson(path.join(chapterDir, "outline_history.json"), chapterOutlineHistory);
+    await writeJson(path.join(chapterDir, "chapter_slot.json"), chapterSlot);
+    await writeJson(path.join(chapterDir, "continuity_guard.json"), continuityGuard);
+    await writeText(path.join(chapterDir, "continuity_guard.md"), continuityGuard.markdown || "");
+    await writeJson(path.join(chapterDir, "context_conflicts.json"), contextConflicts);
+    await writeJson(path.join(chapterDir, "outline_generation_contract.json"), outlineGenerationContract);
+    await writeJson(path.join(chapterDir, "outline_continuity_audit.json"), outlineContinuityAudit);
     await writeJson(path.join(chapterDir, "writer_context.json"), writerContext);
     await writeText(path.join(chapterDir, "writer_context.md"), writerContext.briefingMarkdown || "");
     await writeJson(path.join(chapterDir, "chapter_intent.json"), chapterIntent);
     await writeJson(path.join(chapterDir, "context_package.json"), contextPackage);
     await writeJson(path.join(chapterDir, "rule_stack.json"), ruleStack);
     await writeJson(path.join(chapterDir, "trace.json"), contextTrace);
+    await writeJson(path.join(chapterDir, "writer_prompt_packet.json"), writerPromptPacket);
+    await writeText(path.join(chapterDir, "writer_prompt_packet.md"), writerPromptPacket?.markdown || "");
     await writeJson(path.join(chapterDir, "research_packet.json"), researchPacket);
     await writeText(path.join(chapterDir, "research_packet.md"), researchPacket.briefingMarkdown || "");
     await writeJson(path.join(chapterDir, "reference_packet.json"), referencePacket);

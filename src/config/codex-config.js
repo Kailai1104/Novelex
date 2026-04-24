@@ -47,6 +47,17 @@ const OPTIONAL_PROVIDER_DEFAULTS = {
     review_model: "MiniMax-M2.5-highspeed",
     codex_model: "MiniMax-M2.5-highspeed",
   },
+  Gemini: {
+    name: "Gemini",
+    base_url: "https://us.novaiapi.com/v1",
+    wire_api: "chat_completions",
+    response_model: "gemini-3.1-pro-preview",
+    review_model: "gemini-3.1-pro-preview",
+    codex_model: "gemini-3.1-pro-preview",
+    max_concurrency: 1,
+    request_timeout_ms: 300000,
+    overload_retry_window_ms: 1800000,
+  },
 };
 const UNSUPPORTED_PROVIDER_IDS = new Set(["Kimi"]);
 

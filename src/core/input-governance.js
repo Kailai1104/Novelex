@@ -1,6 +1,9 @@
 import { auditChapterDrift } from "./audit-drift.js";
+import { requiredCharactersConstraint } from "./character-presence.js";
+import { buildContextTrace } from "./context-trace.js";
 import { buildHookAgenda } from "./hook-agenda.js";
 import { createExcerpt, unique } from "./text.js";
+import { generateStructuredObject } from "../llm/structured.js";
 
 const RULE_PRECEDENCE = ["hardFacts", "softGoals", "deferRules", "currentTask"];
 
@@ -131,6 +134,7 @@ export function buildGovernedChapterIntent({
     ).trim(),
     mustKeep: normalizeList([
       `POV稳定在 ${chapterPlan?.povCharacter || "当前视角角色"}`,
+      requiredCharactersConstraint(chapterPlan),
       ...(planContext?.outline?.mustPreserve || []),
       ...(planContext?.world?.continuityAnchors || []),
       ...(historyPacket?.mustNotContradict || []),
@@ -221,6 +225,9 @@ export function buildRuleStack({
 }) {
   const factHardFacts = [];
   const factSoftGoals = [];
+  const openingTaskSignals = Number(chapterPlan?.chapterNumber || chapterIntent?.chapter || 0) <= 1
+    ? (openingReferencePacket?.structuralBeats || []).slice(0, 1)
+    : [];
 
   if (factContext) {
     for (const fact of factContext.establishedFacts || []) {
@@ -270,10 +277,200 @@ export function buildRuleStack({
     currentTask: normalizeList([
       planContext?.outline?.recommendedFocus || "",
       ...(chapterPlan?.keyEvents || []).slice(0, 3),
-      ...(openingReferencePacket?.structuralBeats || []).slice(0, 2),
+      ...openingTaskSignals,
       ...(chapterIntent?.conflicts || []).map((item) => item.resolution),
     ], 8),
   };
+}
+
+export async function runGovernanceAgent({
+  provider,
+  chapterPlan,
+  planContext,
+  historyPacket,
+  writerContext,
+  foreshadowingAdvice,
+  researchPacket,
+  referencePacket,
+  openingReferencePacket,
+  styleGuideText,
+  styleGuideSourcePath,
+  factContext = null,
+}) {
+  const fallbackIntent = buildGovernedChapterIntent({
+    chapterPlan,
+    planContext,
+    historyPacket,
+    foreshadowingAdvice,
+    researchPacket,
+    styleGuideText,
+    factContext,
+  });
+  const fallbackContextPackage = buildContextPackage({
+    chapterPlan,
+    planContext,
+    historyPacket,
+    writerContext,
+    researchPacket,
+    referencePacket,
+    openingReferencePacket,
+    factContext,
+  });
+  const fallbackRuleStack = buildRuleStack({
+    chapterPlan,
+    chapterIntent: fallbackIntent,
+    planContext,
+    historyPacket,
+    researchPacket,
+    referencePacket,
+    openingReferencePacket,
+    factContext,
+  });
+
+  const packet = await generateStructuredObject(provider, {
+    label: "GovernanceAgent",
+    instructions:
+      "你是 Novelex 的 GovernanceAgent。你的职责是把写作主路径需要的 chapter_intent、context_package 和 rule_stack 统一整理成一份可执行治理包。必须只基于给定上下文做取舍，不要发明新剧情。chapter_intent 负责本章目标与禁区，context_package 负责最值得引用的来源，rule_stack 负责 hardFacts / softGoals / deferRules / currentTask。只输出 JSON。",
+    input: [
+      `当前章节：${chapterPlan?.chapterId || ""} ${chapterPlan?.title || ""}`,
+      `计划侧上下文：\n${planContext?.briefingMarkdown || planContext?.summaryText || "无"}`,
+      `历史侧上下文：\n${historyPacket?.briefingMarkdown || historyPacket?.contextSummary || "无"}`,
+      `Writer 上下文：\n${writerContext?.briefingMarkdown || writerContext?.summaryText || "无"}`,
+      `研究资料包：\n${researchPacket?.briefingMarkdown || researchPacket?.summary || "无"}`,
+      `范文参考包：\n${referencePacket?.briefingMarkdown || referencePacket?.summary || "无"}`,
+      `黄金三章参考包：\n${openingReferencePacket?.briefingMarkdown || openingReferencePacket?.summary || "无"}`,
+      `风格指南：\n${styleGuideText || "无"}`,
+      `伏笔建议：\n${JSON.stringify(foreshadowingAdvice || [], null, 2)}`,
+      `Canon facts：\n${JSON.stringify(factContext || {}, null, 2)}`,
+      `参考输出骨架：
+${JSON.stringify({
+  chapterIntent: fallbackIntent,
+  contextPackage: fallbackContextPackage,
+  ruleStack: fallbackRuleStack,
+}, null, 2)}`,
+      `请输出 JSON：
+{
+  "chapterIntent": {
+    "goal": "一句话目标",
+    "mustKeep": ["硬性保留项"],
+    "mustAvoid": ["禁止项"],
+    "styleEmphasis": ["文风强调"],
+    "conflicts": [{"source": "source", "resolution": "怎么处理冲突"}],
+    "hookAgenda": {
+      "mustAdvance": ["id"],
+      "eligibleResolve": ["id"],
+      "staleDebt": ["id"],
+      "avoidNewHookFamilies": ["家族名"]
+    }
+  },
+  "contextPackage": {
+    "selectedContext": [
+      {"source": "path", "reason": "为什么要看", "excerpt": "摘录"}
+    ]
+  },
+  "ruleStack": {
+    "precedence": ["hardFacts", "softGoals", "deferRules", "currentTask"],
+    "hardFacts": ["..."],
+    "softGoals": ["..."],
+    "deferRules": ["..."],
+    "currentTask": ["..."]
+  }
+}`,
+    ].join("\n\n"),
+    useReviewModel: true,
+    metadata: {
+      feature: "input_governance",
+      chapterId: chapterPlan?.chapterId || "",
+    },
+    normalize(parsed) {
+      const rawIntent = parsed.chapterIntent && typeof parsed.chapterIntent === "object"
+        ? parsed.chapterIntent
+        : {};
+      const hookAgenda = rawIntent.hookAgenda && typeof rawIntent.hookAgenda === "object"
+        ? rawIntent.hookAgenda
+        : {};
+      const chapterIntent = {
+        ...fallbackIntent,
+        goal: String(rawIntent.goal || fallbackIntent.goal || "").trim(),
+        mustKeep: normalizeList(rawIntent.mustKeep, 14),
+        mustAvoid: normalizeList(rawIntent.mustAvoid, 14),
+        styleEmphasis: normalizeList(rawIntent.styleEmphasis, 6),
+        conflicts: (Array.isArray(rawIntent.conflicts) ? rawIntent.conflicts : [])
+          .map((item) => ({
+            source: String(item?.source || "").trim(),
+            field: String(item?.field || "").trim(),
+            value: String(item?.value || "").trim(),
+            reason: String(item?.reason || "").trim(),
+            resolution: String(item?.resolution || "").trim(),
+          }))
+          .filter((item) => item.resolution),
+        hookAgenda: {
+          mustAdvance: normalizeList(hookAgenda.mustAdvance, 6),
+          eligibleResolve: normalizeList(hookAgenda.eligibleResolve, 6),
+          staleDebt: normalizeList(hookAgenda.staleDebt, 6),
+          avoidNewHookFamilies: normalizeList(hookAgenda.avoidNewHookFamilies, 6),
+        },
+      };
+
+      const rawContextPackage = parsed.contextPackage && typeof parsed.contextPackage === "object"
+        ? parsed.contextPackage
+        : {};
+      const contextPackage = {
+        chapter: Number(chapterPlan?.chapterNumber || 0),
+        chapterId: String(chapterPlan?.chapterId || "").trim(),
+        selectedContext: mergeContextSources([
+          Array.isArray(rawContextPackage.selectedContext) ? rawContextPackage.selectedContext : [],
+          fallbackContextPackage.selectedContext || [],
+        ], 16),
+      };
+
+      const rawRuleStack = parsed.ruleStack && typeof parsed.ruleStack === "object"
+        ? parsed.ruleStack
+        : {};
+      const ruleStack = {
+        chapter: Number(chapterPlan?.chapterNumber || 0),
+        chapterId: String(chapterPlan?.chapterId || "").trim(),
+        precedence: RULE_PRECEDENCE,
+        hardFacts: normalizeList(rawRuleStack.hardFacts, 18),
+        softGoals: normalizeList(rawRuleStack.softGoals, 18),
+        deferRules: normalizeList(rawRuleStack.deferRules, 14),
+        currentTask: normalizeList(rawRuleStack.currentTask, 8),
+      };
+
+      if (!chapterIntent.mustKeep.length) {
+        chapterIntent.mustKeep = fallbackIntent.mustKeep || [];
+      }
+      if (!ruleStack.hardFacts.length) {
+        ruleStack.hardFacts = fallbackRuleStack.hardFacts || [];
+      }
+      if (!ruleStack.softGoals.length) {
+        ruleStack.softGoals = fallbackRuleStack.softGoals || [];
+      }
+
+      const contextTrace = buildContextTrace({
+        chapterPlan,
+        chapterIntent,
+        contextPackage,
+        ruleStack,
+        writerContext,
+        historyPacket,
+        researchPacket,
+        referencePacket,
+        openingReferencePacket,
+        styleGuideText,
+        styleGuideSourcePath,
+      });
+
+      return {
+        chapterIntent,
+        contextPackage,
+        ruleStack,
+        contextTrace,
+      };
+    },
+  });
+
+  return packet;
 }
 
 export function buildGovernedInputContract({

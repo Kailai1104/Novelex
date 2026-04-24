@@ -1,5 +1,6 @@
 import path from "node:path";
 
+import { requiredCharactersConstraint } from "../core/character-presence.js";
 import { createContextSource, mergeContextSources } from "../core/input-governance.js";
 import {
   buildFactContextMarkdown,
@@ -205,19 +206,26 @@ function buildProjectSummary(project) {
 }
 
 function buildChapterPlanSummary(chapterPlan) {
+  const charactersPresent = normalizeStringArray(chapterPlan?.charactersPresent, 12);
+  const keyEvents = normalizeStringArray(chapterPlan?.keyEvents, 8);
+  const scenes = Array.isArray(chapterPlan?.scenes) ? chapterPlan.scenes : [];
+  const arcContribution = normalizeStringArray(chapterPlan?.arcContribution, 8);
+  const continuityAnchors = normalizeStringArray(chapterPlan?.continuityAnchors, 8);
+
   return [
     `章节：${chapterPlan.chapterId} ${chapterPlan.title}`,
     `阶段：${chapterPlan.stage}`,
     `时间：${chapterPlan.timeInStory}`,
     `地点：${chapterPlan.location}`,
     `POV：${chapterPlan.povCharacter}`,
-    `登场角色：${chapterPlan.charactersPresent.join("、")}`,
-    `硬性事件：\n- ${chapterPlan.keyEvents.join("\n- ")}`,
-    `场景规划：\n- ${chapterPlan.scenes.map((scene) => `${scene.label}｜${scene.focus}｜${scene.tension}`).join("\n- ")}`,
-    `弧光推进：\n- ${chapterPlan.arcContribution.join("\n- ")}`,
-    `章末牵引：${chapterPlan.nextHook}`,
-    `连续性锚点：\n- ${chapterPlan.continuityAnchors.join("\n- ")}`,
-  ].join("\n\n");
+    `登场角色：${charactersPresent.join("、") || "无"}`,
+    requiredCharactersConstraint(chapterPlan),
+    `硬性事件：\n- ${keyEvents.join("\n- ") || "无"}`,
+    `场景规划：\n- ${scenes.map((scene) => `${scene.label}｜${scene.focus}｜${scene.tension}｜出场:${(scene.characters || []).join("、") || "未标注"}`).join("\n- ") || "无"}`,
+    `弧光推进：\n- ${arcContribution.join("\n- ") || "无"}`,
+    `章末牵引：${chapterPlan.nextHook || "无"}`,
+    `连续性锚点：\n- ${continuityAnchors.join("\n- ") || "无"}`,
+  ].filter(Boolean).join("\n\n");
 }
 
 function buildStageSummary(stage, structureData, chapterPlan) {
@@ -489,8 +497,66 @@ function buildHistoryContextMarkdown(chapterPlan, historyContext) {
   ].join("\n");
 }
 
+export function renderWriterContextMarkdown(writerContext = {}) {
+  const selectedSources = Array.isArray(writerContext?.selectedSources)
+    ? writerContext.selectedSources
+    : [];
+  const sourceLines = selectedSources
+    .slice(0, 10)
+    .map((item) => `- ${item.source}｜${item.reason}｜${item.excerpt || "无摘录"}`)
+    .join("\n");
+  const sections = [
+    `# ${writerContext?.chapterId || "chapter"} Writer 上下文包`,
+    "",
+    "## 优先落实",
+    `- ${((writerContext?.priorities || []).join("\n- ")) || "无"}`,
+    "",
+    "## 连续性风险",
+    `- ${((writerContext?.risks || []).join("\n- ")) || "无"}`,
+  ];
+
+  if (writerContext?.factSummary) {
+    sections.push(
+      "",
+      "## 既定事实与开放张力",
+      `- ${writerContext.factSummary}`,
+    );
+  }
+
+  if ((writerContext?.referenceSignals || []).length) {
+    sections.push(
+      "",
+      "## 范文信号",
+      `- ${writerContext.referenceSignals.join("\n- ")}`,
+    );
+  }
+
+  if ((writerContext?.openingSignals || []).length) {
+    sections.push(
+      "",
+      "## 黄金三章抽象信号",
+      `- ${writerContext.openingSignals.join("\n- ")}`,
+    );
+  }
+
+  sections.push(
+    "",
+    "## 计划摘要",
+    `- ${writerContext?.planContextSummary || "无"}`,
+    "",
+    "## 历史摘要",
+    `- ${writerContext?.historyContextSummary || "无"}`,
+    "",
+    "## 可追溯来源",
+    sourceLines || "- 无",
+  );
+
+  return sections.join("\n");
+}
+
 function buildWriterContextPacket(chapterPlan, planContext, historyContext, factContext = null) {
   const priorities = normalizeStringArray([
+    requiredCharactersConstraint(chapterPlan),
     ...(planContext?.outline?.chapterObligations || []),
     ...(planContext?.world?.foreshadowingTasks || []),
     ...(planContext?.characters?.writerReminders || []),
@@ -514,33 +580,7 @@ function buildWriterContextPacket(chapterPlan, planContext, historyContext, fact
     planContext?.selectedSources || [],
     historyContext?.selectedSources || [],
   ], 12);
-  const sourceLines = selectedSources
-    .map((item) => `- ${item.source}｜${item.reason}｜${item.excerpt || "无摘录"}`)
-    .join("\n");
-  const factBlock = factContext?.briefingMarkdown
-    ? ["## 既定事实与开放张力", factContext.briefingMarkdown]
-    : [];
-  const markdown = [
-    `# ${chapterPlan.chapterId} Writer 上下文包`,
-    "",
-    "## 优先落实",
-    `- ${priorities.join("\n- ") || "无"}`,
-    "",
-    "## 连续性风险",
-    `- ${risks.join("\n- ") || "无"}`,
-    ...factBlock,
-    "",
-    "## 计划侧摘要",
-    planContext?.briefingMarkdown || "无",
-    "",
-    "## 历史侧摘要",
-    historyContext?.briefingMarkdown || "无",
-    "",
-    "## 可追溯来源",
-    sourceLines || "- 无",
-  ].join("\n");
-
-  return {
+  const packet = {
     chapterId: chapterPlan.chapterId,
     generatedAt: nowIso(),
     priorities,
@@ -548,8 +588,16 @@ function buildWriterContextPacket(chapterPlan, planContext, historyContext, fact
     generationNotes,
     usedFallback: generationNotes.length > 0,
     selectedSources,
-    planContextSummary: createExcerpt(planContext?.briefingMarkdown || "", 280),
-    historyContextSummary: createExcerpt(historyContext?.briefingMarkdown || "", 280),
+    planContextSummary: createExcerpt(planContext?.briefingMarkdown || "", 220),
+    historyContextSummary: createExcerpt(historyContext?.briefingMarkdown || "", 220),
+    factSummary: createExcerpt(factContext?.briefingMarkdown || "", 240),
+    referenceSignals: [],
+    openingSignals: [],
+  };
+  const markdown = renderWriterContextMarkdown(packet);
+
+  return {
+    ...packet,
     summaryText: createExcerpt(markdown, 320),
     briefingMarkdown: markdown,
   };
@@ -887,39 +935,22 @@ export async function buildPlanContextPacket({
   const worldbuildingText = await store.readText(path.join(store.paths.novelStateDir, "worldbuilding.md"), "");
   const worldState = bundle?.worldState || await store.readJson(path.join(store.paths.novelStateDir, "world_state.json"), null);
 
-  let outline;
-  let characters;
-  let world;
-  const warnings = [];
-
-  try {
-    outline = await runOutlineContextAgent({
+  const [outline, characters, world] = await Promise.all([
+    runOutlineContextAgent({
       provider,
       project,
       bundle,
       chapterPlan,
       outlineMarkdown,
-    });
-  } catch (error) {
-    outline = fallbackOutlineContext({ bundle, chapterPlan });
-    warnings.push(`OutlineContextAgent 失败，已回退到规则摘要：${errorMessage(error)}`);
-  }
-
-  try {
-    characters = await runCharacterContextAgent({
+    }),
+    runCharacterContextAgent({
       provider,
       project,
       bundle,
       chapterPlan,
       characterStates,
-    });
-  } catch (error) {
-    characters = fallbackCharacterContext({ bundle, chapterPlan, characterStates });
-    warnings.push(`CharacterContextAgent 失败，已回退到角色资料摘要：${errorMessage(error)}`);
-  }
-
-  try {
-    world = await runWorldContextAgent({
+    }),
+    runWorldContextAgent({
       provider,
       project,
       bundle,
@@ -929,18 +960,8 @@ export async function buildPlanContextPacket({
       foreshadowingAdvice,
       styleGuideText,
       researchPacket,
-    });
-  } catch (error) {
-    world = fallbackWorldContext({
-      chapterPlan,
-      worldbuildingText,
-      worldState,
-      foreshadowingAdvice,
-      styleGuideText,
-      researchPacket,
-    });
-    warnings.push(`WorldContextAgent 失败，已回退到世界约束摘要：${errorMessage(error)}`);
-  }
+    }),
+  ]);
 
   const briefingMarkdown = buildPlanContextMarkdown(chapterPlan, outline, characters, world);
   const selectedSources = buildPlanSelectedSources({
@@ -959,8 +980,8 @@ export async function buildPlanContextPacket({
     outline,
     characters,
     world,
-    warnings,
-    usedFallback: warnings.length > 0,
+    warnings: [],
+    usedFallback: false,
     selectedSources,
     briefingMarkdown,
     summaryText: createExcerpt(briefingMarkdown, 320),
@@ -1015,21 +1036,14 @@ export async function buildHistoryContextPacket({
     };
   }
 
-  let selected;
-  let selectionSource = "agent";
   const warnings = [];
-  try {
-    selected = await runHistorySelectorAgent({
-      provider,
-      project,
-      chapterPlan,
-      candidates,
-    });
-  } catch (error) {
-    selected = fallbackHistorySelection(candidates);
-    selectionSource = "fallback";
-    warnings.push(`HistorySelectorAgent 失败，已回退到最近章节筛选：${errorMessage(error)}`);
-  }
+  const selected = await runHistorySelectorAgent({
+    provider,
+    project,
+    chapterPlan,
+    candidates,
+  });
+  const selectionSource = "agent";
 
   const selectedCandidates = selected
     .map((item) => {
@@ -1085,23 +1099,13 @@ export async function buildHistoryContextPacket({
     };
   }
 
-  let digest;
-  let digestSource = "agent";
-  try {
-    digest = await runHistoryDigestAgent({
-      provider,
-      project,
-      chapterPlan,
-      selectedCandidates,
-    });
-  } catch (error) {
-    digest = fallbackHistoryDigest({
-      chapterPlan,
-      selectedCandidates,
-    });
-    digestSource = "fallback";
-    warnings.push(`HistoryContextAgent 失败，已回退到摘要式历史衔接：${errorMessage(error)}`);
-  }
+  const digest = await runHistoryDigestAgent({
+    provider,
+    project,
+    chapterPlan,
+    selectedCandidates,
+  });
+  const digestSource = "agent";
 
   const briefingMarkdown = buildHistoryContextMarkdown(chapterPlan, digest);
   const selectedSources = buildHistorySelectedSources(selectedCandidates);

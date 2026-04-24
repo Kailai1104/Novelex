@@ -19,6 +19,7 @@ function buildFixture() {
       "沈砚发现税卡盘剥背后牵动军饷链。",
       "港口各方对是否立刻翻账意见分裂。",
     ],
+    charactersPresent: ["沈砚", "郑芝龙", "众船工"],
     arcContribution: [
       "主角第一次意识到局部贪腐背后连着更大的军政结构。",
     ],
@@ -183,6 +184,7 @@ test("governance artifacts capture hook pressure, rule stack, and traceable sour
   assert.equal(chapterIntent.chapter, 12);
   assert.match(chapterIntent.goal, /税卡|军饷链/);
   assert.ok(chapterIntent.mustKeep.includes("POV稳定在 沈砚"));
+  assert.ok(chapterIntent.mustKeep.some((item) => item.includes("沈砚、郑芝龙")));
   assert.ok(chapterIntent.mustAvoid.some((item) => item.includes("不要提前兑现")));
   assert.deepEqual(chapterIntent.hookAgenda.mustAdvance, ["fsh_002"]);
   assert.deepEqual(chapterIntent.hookAgenda.eligibleResolve, ["fsh_003"]);
@@ -208,6 +210,7 @@ test("governance artifacts capture hook pressure, rule stack, and traceable sour
   });
   assert.deepEqual(ruleStack.precedence, ["hardFacts", "softGoals", "deferRules", "currentTask"]);
   assert.ok(ruleStack.hardFacts.some((item) => item.includes("POV稳定在")));
+  assert.ok(ruleStack.hardFacts.some((item) => item.includes("本章必须让以下具名角色")));
   assert.ok(ruleStack.softGoals.some((item) => item.includes("本章必须推进伏笔 fsh_002")));
   assert.ok(ruleStack.deferRules.some((item) => item.includes("旧伏笔 fsh_001")));
 

@@ -449,6 +449,18 @@ api_key = "YOUR_MINIMAX_API_KEY"
 max_concurrency = 1
 request_timeout_ms = 300000
 overload_retry_window_ms = 1800000
+
+[model_providers.Gemini]
+name = "Gemini"
+base_url = "https://us.novaiapi.com/v1"
+wire_api = "chat_completions"
+response_model = "gemini-3.1-pro-preview"
+review_model = "gemini-3.1-pro-preview"
+codex_model = "gemini-3.1-pro-preview"
+api_key = "YOUR_NOVAI_API_KEY"
+max_concurrency = 1
+request_timeout_ms = 300000
+overload_retry_window_ms = 1800000
 ```
 
 ### 关键字段说明
@@ -478,6 +490,8 @@ overload_retry_window_ms = 1800000
 - `OPENAI_BASE_URL`
 - `MINIMAX_API_KEY`
 - `MINIMAX_BASE_URL`
+- `GEMINI_API_KEY` / `NOVAI_API_KEY`
+- `GEMINI_BASE_URL` / `NOVAI_BASE_URL`
 - `ZHIPU_API_KEY`
 
 如果你定义了自定义 provider，默认也会尝试读取：

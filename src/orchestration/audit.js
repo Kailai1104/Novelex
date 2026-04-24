@@ -1,29 +1,22 @@
 import path from "node:path";
 
+import { requiredCharactersConstraint } from "../core/character-presence.js";
 import {
   getAuditDimension,
   legacyBucketForDimension,
   resolveAuditDimensions,
 } from "../core/audit-dimensions.js";
-import { runAuditHeuristics } from "../core/audit-heuristics.js";
 import {
   chapterNumberFromId,
   createExcerpt,
-  extractJsonObject,
-  safeJsonParse,
   unique,
 } from "../core/text.js";
+import { generateStructuredObject } from "../llm/structured.js";
 
 const SEVERITY_RANK = {
   info: 1,
   warning: 2,
   critical: 3,
-};
-
-const SCORE_PENALTY = {
-  critical: 22,
-  warning: 8,
-  info: 3,
 };
 
 const LEGACY_BUCKET_LABELS = {
@@ -204,11 +197,6 @@ function buildCounts(issues = []) {
   });
 }
 
-function computeScore(issues = []) {
-  const penalty = issues.reduce((sum, issue) => sum + (SCORE_PENALTY[issue.severity] || 0), 0);
-  return Math.max(0, 100 - penalty);
-}
-
 function defaultDimensionSummary(dimension, issues = []) {
   if (!issues.length) {
     return `${dimension.category}检查通过。`;
@@ -300,7 +288,6 @@ function buildSemanticAuditInput({
   researchPacket,
   styleGuideText,
   activeDimensions,
-  heuristics,
   recentChapters,
   characterBoundaryLines,
   factContext,
@@ -323,8 +310,9 @@ function buildSemanticAuditInput({
     `章节：${chapterPlan.chapterId} ${chapterPlan.title}`,
     `POV：${chapterPlan.povCharacter}`,
     `地点：${chapterPlan.location}`,
+    `必须出场：${requiredCharactersConstraint(chapterPlan) || "无"}`,
     `硬性事件：\n- ${chapterPlan.keyEvents.join("\n- ")}`,
-    `场景规划：\n- ${chapterPlan.scenes.map((scene) => `${scene.label}｜${scene.focus}｜${scene.tension}`).join("\n- ")}`,
+    `场景规划：\n- ${chapterPlan.scenes.map((scene) => `${scene.label}｜${scene.focus}｜${scene.tension}｜出场:${(scene.characters || []).join("、") || "未标注"}`).join("\n- ")}`,
     `章末钩子：${chapterPlan.nextHook}`,
     `本章伏笔任务：\n- ${(chapterPlan.foreshadowingActions || []).map((item) => `${item.id}｜${item.action}｜${item.description}`).join("\n- ") || "无"}`,
     `历史不可冲突点：\n- ${(historyPacket?.mustNotContradict || historyPacket?.continuityAnchors || []).join("\n- ") || "无"}`,
@@ -333,9 +321,7 @@ function buildSemanticAuditInput({
     `研究资料包：\n${researchPacket?.briefingMarkdown || "无"}`,
     `风格指南：\n${styleGuideText || "无"}`,
     `启用维度：\n${renderActiveDimensions(activeDimensions)}`,
-    `启发式结果：\n${renderHeuristicIssues(heuristics.issues)}`,
     `最近章节序列：\n${renderRecentChapters(recentChapters)}`,
-    `序列特征快照：\n${renderSequenceSnapshot(heuristics.sequenceSnapshot)}`,
     `正文全文：\n${chapterDraft.markdown}`,
   ].filter(Boolean).join("\n\n");
 }
@@ -350,7 +336,6 @@ async function runSemanticAudit({
   researchPacket,
   styleGuideText,
   activeDimensions,
-  heuristics,
   recentChapters,
   characterStates,
   factContext,
@@ -365,20 +350,21 @@ async function runSemanticAudit({
     researchPacket,
     styleGuideText,
     activeDimensions,
-    heuristics,
     recentChapters,
     characterBoundaryLines,
     factContext,
   });
 
-  const result = await provider.generateText({
+  return generateStructuredObject(provider, {
+    label: "AuditAnalyzerAgent",
     instructions:
-      "你是 Novelex 的 AuditOrchestrator。你不是四个投票 Agent，而是一个维度驱动审计器。请只对启用维度做审计，区分 critical / warning / info。critical 代表不修会直接伤到章节成稿质量或连续性；warning 代表提醒但不必卡死；info 只做记录。不要因为措辞与提纲不同就误判。若启发式已经命中问题，你可以沿用，但不要机械重复同一句。只输出 JSON，不要解释。",
+      "你是 Novelex 的 AuditAnalyzerAgent。你负责对章节做单一路径语义审计，不依赖启发式兜底。请只对启用维度做审计，区分 critical / warning / info。critical 代表不修会直接伤到章节成稿质量或连续性；warning 代表提醒但不必卡死；info 只做记录。不要因为措辞与提纲不同就误判。只输出 JSON，不要解释。",
     input: [
       input,
       `请输出 JSON：
 {
   "summary": "一句话概括本章审计结果",
+  "score": 87,
   "issues": [
     {
       "id": "knowledge_boundary",
@@ -392,7 +378,14 @@ async function runSemanticAudit({
   "dimensionSummaries": {
     "outline_drift": "该维度的一句结论",
     "character_plausibility": "该维度的一句结论"
-  }
+  },
+  "sequenceSnapshot": [
+    {"chapterId": "ch010", "openingType": "direct_resume", "endingType": "pressure_handoff", "toneType": "tense"}
+  ],
+  "staleForeshadowings": [
+    {"id": "fsh_001", "description": "旧伏笔说明", "chaptersSinceTouch": 3}
+  ],
+  "nextChapterGuardrails": ["下一章最该避免的偏移1", "偏移2"]
 }`,
     ].join("\n\n"),
     useReviewModel: true,
@@ -400,26 +393,42 @@ async function runSemanticAudit({
       feature: "chapter_audit",
       chapterId: chapterPlan.chapterId,
     },
+    normalize(parsed) {
+      const allowedIds = new Set(activeDimensions.map((dimension) => dimension.id));
+      const semanticIssues = (Array.isArray(parsed.issues) ? parsed.issues : [])
+        .map((issue) => normalizeIssue(issue, allowedIds, "semantic"))
+        .filter(Boolean);
+
+      return {
+        summary: String(parsed.summary || "").trim(),
+        score: Math.max(0, Math.min(100, Math.round(Number(parsed.score) || 0))),
+        issues: semanticIssues,
+        dimensionSummaries:
+          parsed.dimensionSummaries && typeof parsed.dimensionSummaries === "object"
+            ? parsed.dimensionSummaries
+            : {},
+        sequenceSnapshot: (Array.isArray(parsed.sequenceSnapshot) ? parsed.sequenceSnapshot : [])
+          .map((item) => ({
+            chapterId: String(item?.chapterId || "").trim(),
+            openingType: String(item?.openingType || "").trim(),
+            endingType: String(item?.endingType || "").trim(),
+            toneType: String(item?.toneType || "").trim(),
+          }))
+          .filter((item) => item.chapterId || item.openingType || item.endingType || item.toneType)
+          .slice(0, 6),
+        staleForeshadowings: (Array.isArray(parsed.staleForeshadowings) ? parsed.staleForeshadowings : [])
+          .map((item) => ({
+            id: String(item?.id || "").trim(),
+            description: String(item?.description || "").trim(),
+            chaptersSinceTouch: Math.max(0, Math.round(Number(item?.chaptersSinceTouch) || 0)),
+          }))
+          .filter((item) => item.id),
+        nextChapterGuardrails: unique((Array.isArray(parsed.nextChapterGuardrails) ? parsed.nextChapterGuardrails : [])
+          .map((item) => String(item || "").trim())
+          .filter(Boolean)).slice(0, 6),
+      };
+    },
   });
-
-  const parsed = safeJsonParse(extractJsonObject(result.text), null);
-  if (!parsed || typeof parsed !== "object") {
-    throw new Error(`AuditOrchestrator 返回了无法解析的结果：${createExcerpt(result.text, 180)}`);
-  }
-
-  const allowedIds = new Set(activeDimensions.map((dimension) => dimension.id));
-  const semanticIssues = (Array.isArray(parsed.issues) ? parsed.issues : [])
-    .map((issue) => normalizeIssue(issue, allowedIds, "semantic"))
-    .filter(Boolean);
-
-  return {
-    summary: String(parsed.summary || "").trim(),
-    issues: semanticIssues,
-    dimensionSummaries:
-      parsed.dimensionSummaries && typeof parsed.dimensionSummaries === "object"
-        ? parsed.dimensionSummaries
-        : {},
-  };
 }
 
 async function runSemanticAuditWithRetry(input, attempts = 2) {
@@ -438,14 +447,7 @@ async function runSemanticAuditWithRetry(input, attempts = 2) {
     }
   }
 
-  return {
-    summary: "",
-    issues: [],
-    dimensionSummaries: {},
-    source: "heuristics_only",
-    error: errorMessage(lastError),
-    attempts,
-  };
+  throw new Error(errorMessage(lastError));
 }
 
 function buildAuditSummary(issues = [], score = 100, explicitSummary = "") {
@@ -464,20 +466,17 @@ function buildAuditSummary(issues = [], score = 100, explicitSummary = "") {
 function buildDriftPayload({
   chapterPlan,
   validation,
-  heuristics,
 }) {
   const issues = (validation?.issues || []).filter(
     (issue) => issue.severity === "critical" || issue.severity === "warning",
   );
   const topIssues = issues.slice(0, 4);
   const guardrails = unique([
+    ...(validation?.nextChapterGuardrails || []),
     ...topIssues.map((issue) => issue.suggestion),
-    ...topIssues
-      .filter((issue) => issue.id === "sequence_monotony")
-      .map(() => "下一章主动更换开场或收束模式，不要继续沿用同一钩子模板。"),
   ]).filter(Boolean).slice(0, 4);
-  const staleForeshadowings = Array.isArray(heuristics?.staleForeshadowings)
-    ? heuristics.staleForeshadowings
+  const staleForeshadowings = Array.isArray(validation?.staleForeshadowings)
+    ? validation.staleForeshadowings
     : [];
 
   const markdown = [
@@ -554,7 +553,6 @@ export async function runChapterAudit({
   foreshadowingRegistry = null,
   chapterMetas = null,
   factContext = null,
-  semanticMode = "full",
 }) {
   const metas = Array.isArray(chapterMetas) ? chapterMetas : await store.listChapterMeta();
   const recentChapters = await loadRecentChapters(
@@ -574,45 +572,25 @@ export async function runChapterAudit({
     historyPacket,
     factContext,
   });
-  const heuristics = runAuditHeuristics({
+  const semantic = await runSemanticAuditWithRetry({
+    provider,
     project,
     chapterPlan,
     chapterDraft,
+    historyPacket,
+    foreshadowingAdvice,
     researchPacket,
-    foreshadowingRegistry,
+    styleGuideText,
+    activeDimensions,
     recentChapters,
+    characterStates,
+    factContext,
   });
 
-  const semantic = semanticMode === "heuristics_only"
-    ? {
-      summary: "",
-      issues: [],
-      dimensionSummaries: {},
-      source: "heuristics_only",
-      error: "Semantic audit skipped by caller.",
-      attempts: 0,
-    }
-    : await runSemanticAuditWithRetry({
-      provider,
-      project,
-      chapterPlan,
-      chapterDraft,
-      historyPacket,
-      foreshadowingAdvice,
-      researchPacket,
-      styleGuideText,
-      activeDimensions,
-      heuristics,
-      recentChapters,
-      characterStates,
-      factContext,
-    });
-
-  const issues = dedupeIssues([
-    ...heuristics.issues,
-    ...semantic.issues,
-  ]);
-  const score = computeScore(issues);
+  const issues = dedupeIssues(semantic.issues);
+  const score = Number.isFinite(Number(semantic.score))
+    ? Math.max(0, Math.min(100, Math.round(Number(semantic.score))))
+    : 0;
   const counts = buildCounts(issues);
   const passed = counts.critical === 0;
   const dimensionResults = buildDimensionResults(
@@ -635,12 +613,11 @@ export async function runChapterAudit({
     })),
     issues,
     dimensionResults,
-    heuristics: {
-      metrics: heuristics.metrics,
-      sequenceSnapshot: heuristics.sequenceSnapshot,
-      staleForeshadowings: heuristics.staleForeshadowings,
-    },
-    auditDegraded: semantic.source === "heuristics_only",
+    heuristics: null,
+    sequenceSnapshot: semantic.sequenceSnapshot,
+    staleForeshadowings: semantic.staleForeshadowings,
+    nextChapterGuardrails: semantic.nextChapterGuardrails,
+    auditDegraded: false,
     semanticAudit: {
       source: semantic.source,
       error: semantic.error,
@@ -656,7 +633,6 @@ export async function runChapterAudit({
   const auditDrift = buildDriftPayload({
     chapterPlan,
     validation,
-    heuristics,
   });
 
   return {

@@ -4,13 +4,13 @@ import { PLAN_STATUS, REVIEW_TARGETS, WRITE_STATUS } from "../core/defaults.js";
 import {
   buildCast,
   buildForeshadowingRegistry,
-  buildInitialWorldState,
   buildOutlineData,
   buildOutlineDraft,
   buildStructure,
 } from "../core/generators.js";
 import { createExcerpt, extractJsonObject, nowIso, safeJsonParse } from "../core/text.js";
 import { createProvider } from "../llm/provider.js";
+import { generateStructuredObject } from "../llm/structured.js";
 import { buildOpeningReferencePacket } from "../opening/reference.js";
 
 const CHARACTER_AGENT_CONCURRENCY = 2;
@@ -1200,9 +1200,6 @@ async function critiqueStructureOutputViaProvider(
   chapters = [],
   openingReferencePacket = null,
 ) {
-  const metrics = computeAntiTemplateMetrics(chapters);
-  const heuristicIssues = antiTemplateIssues(metrics);
-
   const result = await provider.generateText({
     instructions:
       "你是 Novelex 的 StructureCriticAgent。请评估当前 StructureAgent 输出是否存在模板化、题材偏离、推进失真、钩子重复、场景空泛、角色驱动不足等问题。优先抓可执行的结构问题。只输出 JSON，不要解释。",
@@ -1214,7 +1211,6 @@ async function critiqueStructureOutputViaProvider(
       `当前阶段：第 ${stageSpec.stageNumber} 阶段｜章节 ${stageSpec.chapterStart}-${stageSpec.chapterEnd}`,
       `阶段蓝图：${JSON.stringify(stageBlueprint, null, 2)}`,
       chapters.length ? `待审章节批次：\n${JSON.stringify(chapters, null, 2)}` : "待审对象：阶段蓝图",
-      chapters.length ? `反模板指标：${JSON.stringify(metrics, null, 2)}` : "",
       finalNotes.length ? `人类修订意见：${finalNotes.join("；")}` : "",
       `请输出 JSON：
 {
@@ -1237,8 +1233,75 @@ async function critiqueStructureOutputViaProvider(
 
   return normalizeStructureCriticResult(
     parseJsonResult(result, "StructureCriticAgent"),
-    heuristicIssues,
+    [],
   );
+}
+
+async function deriveChapterSlotsViaProvider(
+  provider,
+  project,
+  outlineDraft,
+  structureData,
+  foreshadowingRegistry,
+) {
+  return generateStructuredObject(provider, {
+    label: "ChapterSlotDeriverAgent",
+    instructions:
+      "你是 Novelex 的 ChapterSlotDeriverAgent。请基于锁定大纲、结构规划与伏笔注册表，为每一章生成 Writer 可用的 chapter slot。不要使用固定模板句，必须让每章 mission、carryover、escalation 和禁止重演点与实际结构一致。只输出 JSON。",
+    input: [
+      projectSummary(project),
+      `锁定大纲草稿：\n${outlineDraft.outlineMarkdown}`,
+      `结构规划：\n${JSON.stringify(structureData, null, 2)}`,
+      `伏笔注册表：\n${JSON.stringify(foreshadowingRegistry, null, 2)}`,
+      `请输出 JSON：\n{\n  "chapterSlots": [\n    {\n      "chapterId": "ch001",\n      "chapterNumber": 1,\n      "stage": "阶段1",\n      "titleHint": "标题提示",\n      "mission": "本章任务",\n      "locationSeed": "地点种子",\n      "expectedCarryover": "本章应承接什么",\n      "expectedEscalation": "本章应如何升级",\n      "nextHookSeed": "下一章牵引",\n      "forbidReplayBeats": ["不要重演的 beat"],\n      "foreshadowingIds": ["fsh_001"],\n      "freshStart": true,\n      "stageSeed": "阶段种子"\n    }\n  ]\n}`,
+    ].join("\n\n"),
+    useReviewModel: true,
+    metadata: {
+      feature: "chapter_slots",
+    },
+    normalize(parsed) {
+      return (Array.isArray(parsed.chapterSlots) ? parsed.chapterSlots : [])
+        .map((slot) => ({
+          chapterId: String(slot?.chapterId || "").trim(),
+          chapterNumber: Math.max(1, Math.round(Number(slot?.chapterNumber) || 0)),
+          stage: String(slot?.stage || "").trim(),
+          titleHint: String(slot?.titleHint || "").trim(),
+          mission: String(slot?.mission || "").trim(),
+          locationSeed: String(slot?.locationSeed || "").trim(),
+          expectedCarryover: String(slot?.expectedCarryover || "").trim(),
+          expectedEscalation: String(slot?.expectedEscalation || "").trim(),
+          nextHookSeed: String(slot?.nextHookSeed || "").trim(),
+          forbidReplayBeats: normalizeStringList(slot?.forbidReplayBeats, 8),
+          foreshadowingIds: normalizeStringList(slot?.foreshadowingIds, 8),
+          freshStart: Boolean(slot?.freshStart),
+          stageSeed: String(slot?.stageSeed || "").trim(),
+        }))
+        .filter((slot) => slot.chapterId && slot.chapterNumber);
+    },
+  });
+}
+
+async function deriveInitialWorldStateViaProvider(
+  provider,
+  project,
+  outlineDraft,
+  structureData,
+) {
+  return generateStructuredObject(provider, {
+    label: "InitialWorldStateDeriverAgent",
+    instructions:
+      "你是 Novelex 的 InitialWorldStateDeriverAgent。请基于项目设定、锁定大纲与结构规划，生成故事开局时的 world_state。不要用空泛模板，要让 public_knowledge、secret_knowledge、active_plotlines、upcoming_anchors 都与真实结构对应。只输出 JSON。",
+    input: [
+      projectSummary(project),
+      `锁定大纲草稿：\n${outlineDraft.outlineMarkdown}`,
+      `结构规划：\n${JSON.stringify(structureData, null, 2)}`,
+      `请输出 JSON：\n{\n  "current_story_time": "故事时间",\n  "current_primary_location": "主要地点",\n  "active_plotlines": [],\n  "public_knowledge": [],\n  "secret_knowledge": [],\n  "recent_major_events": [],\n  "upcoming_anchors": []\n}`,
+    ].join("\n\n"),
+    useReviewModel: true,
+    metadata: {
+      feature: "initial_world_state",
+    },
+  });
 }
 
 async function generateStructureViaProvider(
@@ -1703,7 +1766,14 @@ async function buildPreApprovalPlanPackage(
     throw error;
   }
 
-  const outlineData = buildOutlineData(project, draftPayload.outlineDraft, structureData, characters);
+  const chapterSlots = await deriveChapterSlotsViaProvider(
+    provider,
+    project,
+    draftPayload.outlineDraft,
+    structureData,
+    foreshadowingRegistry,
+  );
+  const outlineData = buildOutlineData(project, draftPayload.outlineDraft, structureData, characters, chapterSlots);
   let outlineMarkdown;
   try {
     const outlineCacheKey = createPlanFinalCacheKey("outline_final", {
@@ -1753,12 +1823,18 @@ async function buildPreApprovalPlanPackage(
     throw error;
   }
 
-  const worldState = buildInitialWorldState(project, structureData);
+  const worldState = await deriveInitialWorldStateViaProvider(
+    provider,
+    project,
+    draftPayload.outlineDraft,
+    structureData,
+  );
 
   return {
     project,
     expandedCast,
     openingReferencePacket,
+    chapterSlots,
     outlineData,
     outlineMarkdown,
     worldbuildingMarkdown,
@@ -1969,6 +2045,7 @@ async function completePreApprovalPlanRun(store, projectState, provider, run, in
       worldbuildingMarkdown: packageResult.worldbuildingMarkdown,
       structureMarkdown: packageResult.structureData.structureMarkdown,
       structureData: packageResult.structureData,
+      chapterSlots: packageResult.chapterSlots,
       characters: packageResult.characters,
       worldState: packageResult.worldState,
       foreshadowingRegistry: packageResult.foreshadowingRegistry,

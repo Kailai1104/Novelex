@@ -7,6 +7,7 @@ import {
   nowIso,
   unique,
 } from "./text.js";
+import { missingRequiredNamedCharacters } from "./character-presence.js";
 
 const CAST_ROLE_BLUEPRINTS = [
   { roleKey: "protagonist", role: "主角" },
@@ -273,6 +274,122 @@ export function buildForeshadowingRegistry(rawRegistry, totalChapters) {
       };
     }),
   };
+}
+
+function stageSectionForSlot(outlineDraft, stage) {
+  const sections = Array.isArray(outlineDraft?.roughSections) ? outlineDraft.roughSections : [];
+  const stageLabel = String(stage?.label || "").trim();
+  return sections.find((section) => {
+    const sectionLabel = String(section?.stage || "").trim();
+    return sectionLabel && stageLabel && (
+      sectionLabel === stageLabel ||
+      sectionLabel.startsWith(stageLabel) ||
+      stageLabel.startsWith(sectionLabel)
+    );
+  }) || null;
+}
+
+function collectForeshadowingIdsForChapter(registry, chapterNumber) {
+  const chapterId = chapterIdFromNumber(chapterNumber);
+  return unique(
+    (Array.isArray(registry?.foreshadowings) ? registry.foreshadowings : [])
+      .filter((item) => {
+        const plantChapter = String(item?.planned_plant_chapter || "").trim();
+        const payoffChapter = Number(item?.intended_payoff_chapter || 0) || 0;
+        const waterAt = Array.isArray(item?.waterAt) ? item.waterAt.map((chapter) => Number(chapter) || 0) : [];
+        return (
+          plantChapter === chapterId ||
+          payoffChapter === chapterNumber ||
+          waterAt.includes(chapterNumber)
+        );
+      })
+      .map((item) => String(item?.id || "").trim())
+      .filter(Boolean),
+  );
+}
+
+function buildSlotMission(project, stage, chapterNumber, relativeChapterNumber, staticChapter = null) {
+  if (Array.isArray(staticChapter?.keyEvents) && staticChapter.keyEvents.length) {
+    return createExcerpt(staticChapter.keyEvents.join("；"), 140);
+  }
+
+  const stageGoal = String(stage?.stageGoal || stage?.purpose || project?.protagonistGoal || "").trim();
+  if (chapterNumber <= 1) {
+    return createExcerpt(`建立当前故事的第一轮动作压力，并启动${stageGoal || "主线任务"}。`, 140);
+  }
+
+  return createExcerpt(`承接前章结果，推进${stage?.label || "当前阶段"}第${relativeChapterNumber}步：${stageGoal || "把当前压力推成更具体的行动代价"}`, 140);
+}
+
+function buildSlotEscalation(project, stage, chapterNumber, relativeChapterNumber, staticChapter = null) {
+  if (String(staticChapter?.nextHook || "").trim()) {
+    return String(staticChapter.nextHook).trim();
+  }
+
+  const stageConflicts = Array.isArray(stage?.stageConflicts) ? stage.stageConflicts : [];
+  const stageGoal = String(stage?.stageGoal || stage?.purpose || project?.protagonistGoal || "").trim();
+  const selectedConflict = stageConflicts[Math.max(0, Math.min(stageConflicts.length - 1, relativeChapterNumber - 1))] || stageConflicts[0] || stageGoal;
+
+  if (chapterNumber <= 1) {
+    return createExcerpt(`尽快把${selectedConflict || "核心冲突"}从设定说明推进成真实碰撞。`, 120);
+  }
+
+  return createExcerpt(`在上一章结果上继续升级${selectedConflict || "当前冲突"}，不能把本章写回开篇。`, 120);
+}
+
+export function buildChapterSlots(project, outlineDraft, structureData, foreshadowingRegistry = null) {
+  const stages = Array.isArray(structureData?.stages) ? structureData.stages : [];
+  const chapters = Array.isArray(structureData?.chapters) ? structureData.chapters : [];
+  const staticByChapterId = new Map(chapters.map((chapter) => [chapter.chapterId, chapter]));
+
+  return stages.flatMap((stage) => {
+    const range = Array.isArray(stage?.range) ? stage.range : [];
+    const start = Number(range[0] || 0) || 0;
+    const end = Number(range[1] || 0) || start;
+    if (!start || !end || end < start) {
+      return [];
+    }
+
+    const stageSection = stageSectionForSlot(outlineDraft, stage);
+    const stageSeed = createExcerpt(
+      `${String(stageSection?.content || "").trim()} ${String(stage?.stageGoal || stage?.purpose || "").trim()}`,
+      180,
+    );
+
+    return Array.from({ length: end - start + 1 }, (_, offset) => {
+      const chapterNumber = start + offset;
+      const chapterId = chapterIdFromNumber(chapterNumber);
+      const relativeChapterNumber = offset + 1;
+      const staticChapter = staticByChapterId.get(chapterId) || null;
+      const mission = buildSlotMission(project, stage, chapterNumber, relativeChapterNumber, staticChapter);
+      const expectedEscalation = buildSlotEscalation(project, stage, chapterNumber, relativeChapterNumber, staticChapter);
+
+      return {
+        chapterId,
+        chapterNumber,
+        stage: String(stage?.label || "").trim() || `阶段${Math.max(1, relativeChapterNumber)}`,
+        titleHint: String(staticChapter?.title || "").trim() || createExcerpt(`${stage?.label || "阶段"}·第${relativeChapterNumber}步`, 40),
+        mission,
+        locationSeed: String(staticChapter?.location || project?.setting || "").trim() || "主舞台",
+        expectedCarryover: chapterNumber <= 1
+          ? "从故事前提与主角当前压力直接切入，不要先做长篇说明。"
+          : "必须承接上一章已批准正文、锁章细纲与 canon facts 的末尾压力，不重开设定。",
+        expectedEscalation,
+        nextHookSeed: String(staticChapter?.nextHook || "").trim() || expectedEscalation,
+        forbidReplayBeats: chapterNumber <= 1
+          ? ["不要把开篇写成背景说明堆砌。"]
+          : [
+            "不要重新穿越或重新开篇。",
+            "不要惊醒后重新确认身份。",
+            "不要把已经完成的第一次证明写成首次发生。",
+            "不要重演第一章的身体危机型开场。",
+          ],
+        foreshadowingIds: collectForeshadowingIdsForChapter(foreshadowingRegistry, chapterNumber),
+        freshStart: chapterNumber === 1,
+        stageSeed,
+      };
+    });
+  });
 }
 
 function buildForeshadowingActionMap(registry) {
@@ -580,7 +697,7 @@ export function buildCharacterArtifacts(project, cast, structureData) {
   });
 }
 
-export function buildOutlineData(project, outlineDraft, structureData, characters) {
+export function buildOutlineData(project, outlineDraft, structureData, characters, chapterSlots = []) {
   return {
     title: project.title,
     coreHook: outlineDraft.coreHook,
@@ -588,6 +705,7 @@ export function buildOutlineData(project, outlineDraft, structureData, character
     roughSections: outlineDraft.roughSections,
     stages: structureData.stages,
     chapters: Array.isArray(structureData.chapters) ? structureData.chapters : [],
+    chapterSlots: Array.isArray(chapterSlots) ? chapterSlots : [],
     minorCharacters: structureData.minorCharacters || [],
     characterArcs: characters.map((character) => ({
       name: character.name,
@@ -854,6 +972,7 @@ export function runValidations(chapterPlan, chapterDraft, project = null) {
     foreshadowing: [],
     style: [],
   };
+  const plannedCharacters = Array.isArray(chapterPlan?.charactersPresent) ? chapterPlan.charactersPresent : [];
 
   for (const event of chapterPlan.keyEvents) {
     const requiredToken = extractKeywords(event)[0] || event.slice(0, 6);
@@ -862,7 +981,10 @@ export function runValidations(chapterPlan, chapterDraft, project = null) {
     }
   }
 
-  if (!chapterPlan.charactersPresent.some((name) => chapterDraft.markdown.includes(name))) {
+  const missingNamedCharacters = missingRequiredNamedCharacters(chapterPlan, chapterDraft.markdown);
+  if (missingNamedCharacters.length) {
+    issues.plausibility.push(`细纲要求登场的具名角色未在正文中实际出场：${missingNamedCharacters.join("、")}。`);
+  } else if (!plannedCharacters.some((name) => chapterDraft.markdown.includes(name))) {
     issues.plausibility.push("正文里对登场角色的呈现偏弱。");
   }
 

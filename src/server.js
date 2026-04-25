@@ -32,6 +32,8 @@ const CONTENT_TYPES = {
   ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".md": "text/markdown; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".txt": "text/plain; charset=utf-8",
 };
 
 async function readBody(request) {
@@ -334,23 +336,67 @@ async function buildSnapshot(store, projectId) {
   };
 }
 
-async function serveStatic(response, pathname) {
-  const relative = pathname === "/" ? "/index.html" : pathname;
-  const publicDir = path.join(WORKSPACE_ROOT, "public");
-  const filePath = path.join(publicDir, relative);
+async function exists(targetPath) {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function sendFile(response, resolvedPath) {
+  const content = await fs.readFile(resolvedPath);
+  const ext = path.extname(resolvedPath);
+  sendText(response, 200, content, CONTENT_TYPES[ext] || "application/octet-stream");
+}
+
+async function serveStaticFromDirectory(response, rootDir, relativePath) {
+  const normalizedRelative = relativePath.startsWith("/") ? relativePath : `/${relativePath}`;
+  const filePath = path.join(rootDir, normalizedRelative);
   const resolved = path.resolve(filePath);
-  if (!resolved.startsWith(publicDir)) {
+  if (!resolved.startsWith(rootDir)) {
     sendText(response, 403, "Forbidden");
     return;
   }
 
   try {
-    const content = await fs.readFile(resolved);
-    const ext = path.extname(resolved);
-    sendText(response, 200, content, CONTENT_TYPES[ext] || "application/octet-stream");
+    await sendFile(response, resolved);
   } catch {
     sendText(response, 404, "Not Found");
   }
+}
+
+async function serveReactApp(response, pathname) {
+  const reactDistDir = path.join(WORKSPACE_ROOT, "dist", "frontend");
+  const reactIndexPath = path.join(reactDistDir, "index.html");
+
+  if (!(await exists(reactIndexPath))) {
+    sendText(
+      response,
+      503,
+      "React frontend has not been built yet. Run `npm run build:frontend` first.",
+    );
+    return;
+  }
+
+  const relative = pathname === "/" ? "/index.html" : pathname || "/index.html";
+
+  const candidatePath = path.resolve(path.join(reactDistDir, relative));
+  if (!candidatePath.startsWith(reactDistDir)) {
+    sendText(response, 403, "Forbidden");
+    return;
+  }
+
+  if (relative !== "/index.html" && (await exists(candidatePath))) {
+    const stat = await fs.stat(candidatePath);
+    if (stat.isFile()) {
+      await sendFile(response, candidatePath);
+      return;
+    }
+  }
+
+  await sendFile(response, reactIndexPath);
 }
 
 const routes = {
@@ -977,7 +1023,7 @@ const server = http.createServer(async (request, response) => {
     return;
   }
 
-  await serveStatic(response, url.pathname);
+  await serveReactApp(response, url.pathname);
 });
 
 server.listen(PORT, () => {

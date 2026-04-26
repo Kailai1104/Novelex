@@ -670,26 +670,33 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
   }
 
   async function readDocument(relativePath) {
-    const resolved = path.resolve(paths.workspaceRoot, relativePath);
     const allowedRoots = [
       paths.rootDir,
       paths.sharedStyleFingerprintsDir,
       paths.sharedRagCollectionsDir,
       paths.sharedOpeningCollectionsDir,
+    ].map((root) => path.resolve(root));
+    const candidatePaths = [
+      path.resolve(paths.workspaceRoot, relativePath),
+      path.resolve(paths.rootDir, relativePath),
     ];
-    if (!allowedRoots.some((root) => resolved.startsWith(root))) {
-      return null;
+
+    for (const resolved of candidatePaths) {
+      if (!allowedRoots.some((root) => resolved.startsWith(root))) {
+        continue;
+      }
+      if (!(await exists(resolved))) {
+        continue;
+      }
+
+      const content = await readText(resolved, "");
+      return {
+        path: relativePath,
+        content,
+      };
     }
 
-    if (!(await exists(resolved))) {
-      return null;
-    }
-
-    const content = await readText(resolved, "");
-    return {
-      path: relativePath,
-      content,
-    };
+    return null;
   }
 
   function ragCollectionDir(collectionId) {

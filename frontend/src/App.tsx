@@ -10,6 +10,7 @@ import {
   deleteLockedChapter,
   deleteProject,
   generateStyleFingerprint,
+  getDocument,
   getStyleFingerprint,
   getWorkspaceState,
   rebuildOpeningCollection,
@@ -1799,6 +1800,7 @@ export default function App() {
 
               {renderMainContent({
                 activeMainSection,
+                effectiveProjectId,
                 mutationBusy,
                 currentStyle,
                 outlineOptions,
@@ -2089,6 +2091,7 @@ function TimelineItem(props: {
 
 function renderMainContent(props: {
   activeMainSection: MainSection;
+  effectiveProjectId: string | null;
   mutationBusy: (action?: MutationAction | null) => boolean;
   currentStyle: StyleFingerprintSummary | null;
   outlineOptions: OutlineOptions;
@@ -2234,27 +2237,15 @@ function renderMainContent(props: {
         </div>
         <div className="chapter-list">
           {chapters.length ? chapters.map((chapter) => (
-            <SimpleCollapsibleCard
+            <LockedChapterCard
               key={`chapter-${chapter.chapter_id}`}
-              title={<strong>{chapter.chapter_id} · {chapter.title}</strong>}
-            >
-              <div className="chapter-summary-card">
-                <p>{chapter.summary_50}</p>
-              </div>
-              {chapter.chapter_id === latestChapterId ? (
-                <div className="actions" style={{ marginTop: 12 }}>
-                  <button
-                    className="button button-danger"
-                    type="button"
-                    disabled={props.mutationBusy() || writePending}
-                    onClick={() => props.onDeleteLockedChapter(chapter.chapter_id)}
-                  >
-                    {props.mutationBusy("chapter_delete") ? "删除中..." : "删除此章"}
-                  </button>
-                  <small>仅支持依次删除最新锁定章节。</small>
-                </div>
-              ) : null}
-            </SimpleCollapsibleCard>
+              chapter={chapter}
+              isLatest={chapter.chapter_id === latestChapterId}
+              mutationBusy={props.mutationBusy}
+              projectId={props.effectiveProjectId}
+              writePending={writePending}
+              onDeleteLockedChapter={props.onDeleteLockedChapter}
+            />
           )) : <div className="empty">还没有锁定的章节。</div>}
         </div>
       </section>
@@ -2266,25 +2257,6 @@ function renderMainContent(props: {
       <section className="claude-home">
         <h2>{project.title}</h2>
         <p>{project.premise || "从这里进入你的小说工作台，推进大纲、写作与审查流程。"}</p>
-        <div className="claude-home-card">
-          <div className="claude-home-card-head">
-            <span>{nextActionText(props.snapshot)}</span>
-          </div>
-          <div className="claude-home-card-body">
-            <button className="button button-primary" type="button" onClick={() => props.onJumpMainSection(pending ? (pending.target === "chapter" || pending.target === "chapter_outline" ? "write" : "plan") : "plan")}>
-              {pending ? "前往待审节点" : "继续推进流程"}
-            </button>
-            <button className="button button-secondary" type="button" onClick={() => props.onJumpMainSection("write")}>打开写作流程</button>
-            <button className="button button-ghost" type="button" onClick={() => props.onOpenUtilityTab("project")}>项目设置</button>
-          </div>
-        </div>
-        <div className="claude-home-chips">
-          <button className="claude-chip" type="button" onClick={() => props.onJumpMainSection("plan")}>大纲协作</button>
-          <button className="claude-chip" type="button" onClick={() => props.onJumpMainSection("write")}>章节写作</button>
-          <button className="claude-chip" type="button" onClick={() => props.onJumpMainSection("chapters")}>已锁定章节</button>
-          <button className="claude-chip" type="button" onClick={() => props.onOpenUtilityTab("resources")}>资源配置</button>
-          <button className="claude-chip" type="button" onClick={() => props.onOpenUtilityTab("history")}>运行历史</button>
-        </div>
       </section>
       <section className="playground-panel overview-secondary-panel">
         <div className="overview-grid">
@@ -2900,6 +2872,70 @@ function SimpleCollapsibleCard(props: { title: React.ReactNode; meta?: React.Rea
         </button>
       </div>
       <div className="collapsible-content">{props.children}</div>
+    </div>
+  );
+}
+
+function LockedChapterCard(props: {
+  chapter: any;
+  isLatest: boolean;
+  mutationBusy: (action?: MutationAction | null) => boolean;
+  projectId: string | null;
+  writePending: boolean;
+  onDeleteLockedChapter: (chapterId: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const chapterId = String(props.chapter?.chapter_id || "");
+  const chapterTitle = String(props.chapter?.title || "未命名章节");
+
+  const chapterDocumentQuery = useQuery({
+    queryKey: ["locked-chapter-document", props.projectId, chapterId],
+    queryFn: () => getDocument(props.projectId!, `novel_state/chapters/${chapterId}.md`),
+    enabled: open && Boolean(props.projectId && chapterId),
+    staleTime: 60_000,
+  });
+
+  const chapterMarkdown = chapterDocumentQuery.data?.content || "";
+  const chapterBody = splitChapterMarkdownForReview(chapterMarkdown, chapterTitle).body;
+
+  return (
+    <div className={`collapsible-card ${open ? "is-expanded" : "is-collapsed"}`}>
+      <div className="collapsible-header">
+        <div className="collapsible-title-wrap">
+          <strong>{chapterId} · {chapterTitle}</strong>
+        </div>
+        <button className="button button-ghost button-collapse" type="button" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
+          {open ? "隐藏" : "展开"}
+        </button>
+      </div>
+      <div className="collapsible-content">
+        {chapterDocumentQuery.isLoading ? (
+          <div className="chapter-summary-card">
+            <p>章节正文加载中...</p>
+          </div>
+        ) : chapterDocumentQuery.isError ? (
+          <div className="chapter-summary-card">
+            <p>章节正文加载失败。</p>
+          </div>
+        ) : (
+          <div className="chapter-summary-card chapter-body-card">
+            <MarkdownBody value={chapterBody || chapterMarkdown || props.chapter?.summary_50 || ""} />
+          </div>
+        )}
+        {props.isLatest ? (
+          <div className="actions" style={{ marginTop: 12 }}>
+            <button
+              className="button button-danger"
+              type="button"
+              disabled={props.mutationBusy() || props.writePending}
+              onClick={() => props.onDeleteLockedChapter(chapterId)}
+            >
+              {props.mutationBusy("chapter_delete") ? "删除中..." : "删除此章"}
+            </button>
+            <small>仅支持依次删除最新锁定章节。</small>
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }

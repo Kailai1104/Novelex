@@ -1,3 +1,6 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+
 import { loadCodexApiConfig, normalizeCodexConfigData } from "../config/codex-config.js";
 
 const MAX_RECONNECT_ATTEMPTS = 5;
@@ -8,6 +11,19 @@ const DEFAULT_OVERLOAD_BASE_DELAY_MS = 3000;
 const DEFAULT_OVERLOAD_MAX_DELAY_MS = 30000;
 const DEFAULT_OVERLOAD_JITTER_RATIO = 0.2;
 const DEFAULT_MINIMAX_MAX_CONCURRENCY = 2;
+const PROVIDER_ERROR_LOG_FILENAME = "provider-errors.jsonl";
+const PROVIDER_ERROR_LOG_MAX_DEPTH = 5;
+const PROVIDER_ERROR_LOG_MAX_ARRAY_ITEMS = 20;
+const PROVIDER_ERROR_LOG_MAX_OBJECT_KEYS = 40;
+const PROVIDER_ERROR_LOG_MAX_STRING_LENGTH = 4000;
+const STRICT_STRUCTURED_OUTPUT_INSTRUCTION = [
+  "输出格式规则（必须严格遵守）：",
+  "1. 只返回单个合法 JSON 对象。",
+  "2. 回复的首字符必须是 {，最后一个字符必须是 }。",
+  "3. 不要使用 ```、```json、Markdown、注释、前言、后记或任何解释性文字。",
+  "4. 所有字段名必须与给定 schema 完全一致；不要新增字段。",
+  "5. 即使某个字段内容不确定，也必须返回合法 JSON，并使用空字符串、空数组、false 或 null 等占位。",
+].join("\n");
 const providerCooldowns = new Map();
 const providerConcurrencyStates = new Map();
 
@@ -166,6 +182,149 @@ function stringifyInput(value) {
   return String(value || "");
 }
 
+function trimLogString(value, maxLength = PROVIDER_ERROR_LOG_MAX_STRING_LENGTH) {
+  const text = String(value || "");
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, maxLength - 15))}...[truncated]`;
+}
+
+function sanitizeForErrorLog(value, depth = 0) {
+  if (depth >= PROVIDER_ERROR_LOG_MAX_DEPTH) {
+    return "[truncated_depth]";
+  }
+
+  if (typeof value === "string") {
+    return trimLogString(value);
+  }
+
+  if (typeof value === "number" || typeof value === "boolean" || value == null) {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .slice(0, PROVIDER_ERROR_LOG_MAX_ARRAY_ITEMS)
+      .map((item) => sanitizeForErrorLog(item, depth + 1));
+  }
+
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: trimLogString(value.message),
+      stack: trimLogString(value.stack || ""),
+    };
+  }
+
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .slice(0, PROVIDER_ERROR_LOG_MAX_OBJECT_KEYS)
+        .map(([key, entryValue]) => [key, sanitizeForErrorLog(entryValue, depth + 1)]),
+    );
+  }
+
+  return trimLogString(String(value));
+}
+
+function summarizeMessagesForErrorLog(messages = []) {
+  return (Array.isArray(messages) ? messages : [])
+    .slice(0, PROVIDER_ERROR_LOG_MAX_ARRAY_ITEMS)
+    .map((message) => ({
+      role: String(message?.role || "user"),
+      content: trimLogString(stringifyInput(message?.content || "")),
+    }));
+}
+
+function buildProviderErrorLogEntry({
+  url,
+  payload,
+  providerName,
+  providerKey,
+  attempt,
+  responseStatus,
+  errorText,
+  error,
+  errorLogContext = {},
+}) {
+  return {
+    timestamp: new Date().toISOString(),
+    provider: {
+      id: errorLogContext.providerId || "",
+      name: providerName,
+      key: providerKey,
+      apiStyle: errorLogContext.apiStyle || "",
+      slotName: errorLogContext.slotName || "",
+      model: String(payload?.model || errorLogContext.model || "").trim(),
+      url,
+    },
+    agent: {
+      feature: String(errorLogContext.metadata?.feature || "").trim(),
+      chapterId: String(errorLogContext.metadata?.chapterId || "").trim(),
+      complexity: String(errorLogContext.agentComplexity || "").trim(),
+    },
+    request: {
+      instructions: trimLogString(errorLogContext.instructions || ""),
+      input: trimLogString(stringifyInput(errorLogContext.input || "")),
+      messages: summarizeMessagesForErrorLog(errorLogContext.messages),
+      tools: sanitizeForErrorLog(payload?.tools || errorLogContext.tools || []),
+      toolChoice: String(payload?.tool_choice || errorLogContext.toolChoice || "").trim(),
+      include: sanitizeForErrorLog(payload?.include || errorLogContext.include || []),
+      payload: sanitizeForErrorLog(payload),
+    },
+    error: {
+      status: responseStatus ?? error?.status ?? null,
+      attempts: attempt ?? error?.attempts ?? null,
+      message: trimLogString(errorText || error?.message || ""),
+      responseText: trimLogString(errorText || ""),
+      details: sanitizeForErrorLog(error),
+    },
+  };
+}
+
+async function appendProviderErrorLog(rootDir, entry) {
+  if (!rootDir || !entry) {
+    return;
+  }
+
+  try {
+    const logPath = path.join(rootDir, "runtime", PROVIDER_ERROR_LOG_FILENAME);
+    await fs.mkdir(path.dirname(logPath), { recursive: true });
+    await fs.appendFile(logPath, `${JSON.stringify(entry)}\n`, "utf8");
+  } catch {
+    // Logging failures should never mask the original provider error.
+  }
+}
+
+async function logProviderRequestFailure({
+  rootDir,
+  url,
+  payload,
+  providerName,
+  providerKey,
+  attempt,
+  responseStatus,
+  errorText,
+  error,
+  errorLogContext,
+}) {
+  await appendProviderErrorLog(
+    rootDir,
+    buildProviderErrorLogEntry({
+      url,
+      payload,
+      providerName,
+      providerKey,
+      attempt,
+      responseStatus,
+      errorText,
+      error,
+      errorLogContext,
+    }),
+  );
+}
+
 function normalizeMessages({ input, messages }) {
   if (Array.isArray(messages) && messages.length) {
     return messages.map((message) => ({
@@ -250,6 +409,41 @@ function normalizeChatMessages({ instructions, input, messages }) {
   });
 
   return normalized;
+}
+
+function looksLikeStrictStructuredOutput({ instructions, input, messages, metadata } = {}) {
+  if (metadata?.strictStructuredOutput === true) {
+    return true;
+  }
+  if (metadata?.strictStructuredOutput === false) {
+    return false;
+  }
+
+  const instructionText = String(instructions || "");
+  if (/只输出 JSON(?: 对象)?/u.test(instructionText) || /请输出 JSON/u.test(instructionText)) {
+    return true;
+  }
+
+  if (Array.isArray(messages) && messages.some((message) => {
+    const text = stringifyInput(message?.content || "");
+    return /只输出 JSON(?: 对象)?/u.test(text) || /请输出 JSON/u.test(text);
+  })) {
+    return true;
+  }
+
+  const inputText = stringifyInput(input);
+  return /只输出 JSON(?: 对象)?/u.test(inputText) || /请输出 JSON/u.test(inputText);
+}
+
+function strengthenStructuredOutputInstructions(instructions, options = {}) {
+  const base = String(instructions || "").trim();
+  if (!looksLikeStrictStructuredOutput({ ...options, instructions: base })) {
+    return base;
+  }
+  if (base.includes("输出格式规则（必须严格遵守）")) {
+    return base;
+  }
+  return [base, STRICT_STRUCTURED_OUTPUT_INSTRUCTION].filter(Boolean).join("\n\n");
 }
 
 function extractResponseText(payload) {
@@ -955,11 +1149,13 @@ async function requestProviderJson({
   retryPolicy = resolveRetryPolicy(),
   streamFallbackAllowed = true,
   parseStream = null,
+  errorLogContext = {},
 }) {
   let activePayload = payload;
   const startedAt = Date.now();
   let overloadAttempt = 0;
   let attempt = 0;
+  const logRootDir = String(errorLogContext.rootDir || process.cwd()).trim() || process.cwd();
 
   while (true) {
     attempt += 1;
@@ -1009,6 +1205,18 @@ async function requestProviderJson({
             continue;
           }
 
+          await logProviderRequestFailure({
+            rootDir: logRootDir,
+            url,
+            payload: activePayload,
+            providerName,
+            providerKey,
+            attempt,
+            responseStatus: response.status,
+            errorText,
+            errorLogContext,
+          });
+
           throw new ProviderRequestError(
             `${providerName} request failed after ${attempt} attempts: ${response.status} ${errorText}`,
             {
@@ -1024,6 +1232,18 @@ async function requestProviderJson({
           await wait(reconnectDelayMs(attempt));
           continue;
         }
+
+        await logProviderRequestFailure({
+          rootDir: logRootDir,
+          url,
+          payload: activePayload,
+          providerName,
+          providerKey,
+          attempt,
+          responseStatus: response.status,
+          errorText,
+          errorLogContext,
+        });
 
         throw new ProviderRequestError(
           `${providerName} request failed after ${attempt} attempts: ${response.status} ${errorText}`,
@@ -1052,6 +1272,17 @@ async function requestProviderJson({
             }
 
             const message = error instanceof Error ? error.message : String(error || "");
+            await logProviderRequestFailure({
+              rootDir: logRootDir,
+              url,
+              payload: activePayload,
+              providerName,
+              providerKey,
+              attempt,
+              errorText: message,
+              error,
+              errorLogContext,
+            });
             throw new ProviderRequestError(
               `${providerName} request failed after ${attempt} attempts: ${message}`,
               {
@@ -1066,6 +1297,16 @@ async function requestProviderJson({
             await wait(reconnectDelayMs(attempt));
             continue;
           }
+          await logProviderRequestFailure({
+            rootDir: logRootDir,
+            url,
+            payload: activePayload,
+            providerName,
+            providerKey,
+            attempt,
+            error,
+            errorLogContext,
+          });
           throw error;
         }
       }
@@ -1089,6 +1330,17 @@ async function requestProviderJson({
         }
 
         const message = error instanceof Error ? error.message : String(error || "");
+        await logProviderRequestFailure({
+          rootDir: logRootDir,
+          url,
+          payload: activePayload,
+          providerName,
+          providerKey,
+          attempt,
+          errorText: message,
+          error,
+          errorLogContext,
+        });
         throw new ProviderRequestError(
           `${providerName} request failed after ${attempt} attempts: ${message}`,
           {
@@ -1105,6 +1357,17 @@ async function requestProviderJson({
       }
 
       const message = error instanceof Error ? error.message : String(error || "");
+      await logProviderRequestFailure({
+        rootDir: logRootDir,
+        url,
+        payload: activePayload,
+        providerName,
+        providerKey,
+        attempt,
+        errorText: message,
+        error,
+        errorLogContext,
+      });
       throw new ProviderRequestError(
         `${providerName} request failed after ${attempt} attempts: ${message}`,
         {
@@ -1601,6 +1864,7 @@ export function publicProviderSettings(settings) {
 
 function createSingleProviderClient(projectState, options = {}) {
   const outerOptions = options;
+  const requestLogRootDir = String(options.rootDir || process.cwd()).trim() || process.cwd();
   const settings = resolveSingleProviderSettings(projectState, options.rootDir, {
     providerIdOverride: options.providerIdOverride,
     maxConcurrency: options.maxConcurrency,
@@ -1633,7 +1897,7 @@ function createSingleProviderClient(projectState, options = {}) {
     return settings.responseModel;
   }
 
-  async function executeResponsesRequest(payload) {
+  async function executeResponsesRequest(payload, errorLogContext = {}) {
     try {
       return await requestProviderJson({
         url: `${settings.baseUrl}/responses`,
@@ -1643,6 +1907,7 @@ function createSingleProviderClient(projectState, options = {}) {
         maxConcurrency: settings.maxConcurrency,
         retryPolicy,
         payload: buildCompatibleResponsePayload(payload, settings),
+        errorLogContext,
         parseStream: parseResponseEventStream,
       });
     } catch (error) {
@@ -1658,6 +1923,7 @@ function createSingleProviderClient(projectState, options = {}) {
         maxConcurrency: settings.maxConcurrency,
         retryPolicy,
         payload: buildLeanResponseRetryPayload(payload),
+        errorLogContext,
         streamFallbackAllowed: false,
         parseStream: parseResponseEventStream,
       });
@@ -1677,9 +1943,27 @@ function createSingleProviderClient(projectState, options = {}) {
     reasoningEffort,
     metadata,
     temperature,
+    agentComplexity,
+    agentSlot,
   }) {
+    const resolvedModel = pickModel({ useCodexModel, useReviewModel, model });
+    const errorLogContext = {
+      rootDir: requestLogRootDir,
+      providerId: settings.providerId,
+      apiStyle: settings.apiStyle,
+      instructions,
+      input,
+      messages,
+      tools,
+      toolChoice,
+      include,
+      metadata,
+      agentComplexity,
+      slotName: agentSlot,
+      model: resolvedModel,
+    };
     const payload = {
-      model: pickModel({ useCodexModel, useReviewModel, model }),
+      model: resolvedModel,
       instructions,
       input: normalizeMessages({ input, messages }),
       store: !settings.disableResponseStorage,
@@ -1714,7 +1998,7 @@ function createSingleProviderClient(projectState, options = {}) {
 
     let response;
     try {
-      response = await executeResponsesRequest(payload);
+      response = await executeResponsesRequest(payload, errorLogContext);
     } catch (error) {
       if (!Object.prototype.hasOwnProperty.call(payload, "temperature") || !shouldRetryWithoutTemperature(error)) {
         throw error;
@@ -1724,7 +2008,7 @@ function createSingleProviderClient(projectState, options = {}) {
         ...payload,
       };
       delete payloadWithoutTemperature.temperature;
-      response = await executeResponsesRequest(payloadWithoutTemperature);
+      response = await executeResponsesRequest(payloadWithoutTemperature, errorLogContext);
     }
 
     return {
@@ -1735,7 +2019,7 @@ function createSingleProviderClient(projectState, options = {}) {
     };
   }
 
-  async function executeChatCompletionsRequest(payload) {
+  async function executeChatCompletionsRequest(payload, errorLogContext = {}) {
     return requestProviderJson({
       url: `${settings.baseUrl}/chat/completions`,
       apiKey: settings.apiKey,
@@ -1744,6 +2028,7 @@ function createSingleProviderClient(projectState, options = {}) {
       maxConcurrency: settings.maxConcurrency,
       retryPolicy,
       payload,
+      errorLogContext,
       streamFallbackAllowed: false,
       parseStream: payload.stream ? parseChatCompletionEventStream : null,
     });
@@ -1759,10 +2044,14 @@ function createSingleProviderClient(projectState, options = {}) {
     temperature,
     tools,
     toolChoice,
+    metadata,
+    agentComplexity,
+    agentSlot,
     extraBody = {},
   }) {
+    const resolvedModel = pickModel({ useCodexModel, useReviewModel, model });
     const payload = {
-      model: pickModel({ useCodexModel, useReviewModel, model }),
+      model: resolvedModel,
       messages: normalizeChatMessages({ instructions, input, messages }),
       ...(extraBody || {}),
     };
@@ -1777,26 +2066,42 @@ function createSingleProviderClient(projectState, options = {}) {
       payload.tool_choice = toolChoice;
     }
 
-    return payload;
+    return {
+      payload,
+      errorLogContext: {
+        rootDir: requestLogRootDir,
+        providerId: settings.providerId,
+        apiStyle: settings.apiStyle,
+        instructions,
+        input,
+        messages,
+        tools,
+        toolChoice,
+        metadata,
+        agentComplexity,
+        slotName: agentSlot,
+        model: resolvedModel,
+      },
+    };
   }
 
   async function executeChatCompletionWithRetry(buildPayload) {
-    let payload = buildPayload(false);
+    let { payload, errorLogContext } = buildPayload(false);
 
     try {
       return {
         payload,
-        response: await executeChatCompletionsRequest(payload),
+        response: await executeChatCompletionsRequest(payload, errorLogContext),
       };
     } catch (error) {
       if (!Object.prototype.hasOwnProperty.call(payload, "temperature") || !shouldRetryWithoutTemperature(error)) {
         throw error;
       }
 
-      payload = buildPayload(true);
+      ({ payload, errorLogContext } = buildPayload(true));
       return {
         payload,
-        response: await executeChatCompletionsRequest(payload),
+        response: await executeChatCompletionsRequest(payload, errorLogContext),
       };
     }
   }
@@ -1811,6 +2116,9 @@ function createSingleProviderClient(projectState, options = {}) {
     temperature,
     tools,
     toolChoice,
+    metadata,
+    agentComplexity,
+    agentSlot,
     extraBody,
   }) {
     const { payload, response } = await executeChatCompletionWithRetry((omitTemperature = false) =>
@@ -1824,6 +2132,9 @@ function createSingleProviderClient(projectState, options = {}) {
         temperature: omitTemperature ? undefined : temperature,
         tools,
         toolChoice,
+        metadata,
+        agentComplexity,
+        agentSlot,
         extraBody,
       }));
 
@@ -1944,8 +2255,15 @@ function slotNameForAgentComplexity(settings, agentComplexity = "complex") {
   return settings?.agentRouting?.complex || "primary";
 }
 
-function slotConfigForAgentComplexity(settings, agentComplexity = "complex") {
-  const slotName = slotNameForAgentComplexity(settings, agentComplexity);
+function slotNameForRequest(settings, options = {}) {
+  if (looksLikeStrictStructuredOutput(options)) {
+    return settings?.agentRouting?.complex || "primary";
+  }
+  return slotNameForAgentComplexity(settings, options.agentComplexity);
+}
+
+function slotConfigForRequest(settings, options = {}) {
+  const slotName = slotNameForRequest(settings, options);
   return {
     slotName,
     slotConfig: settings?.agentModels?.[slotName] || settings?.agentModels?.primary || null,
@@ -1970,20 +2288,29 @@ export function createProvider(projectState, options = {}) {
   return {
     settings,
     resolveAgentModel(agentComplexity = "complex") {
-      return slotConfigForAgentComplexity(settings, agentComplexity).slotConfig;
+      return slotConfigForRequest(settings, { agentComplexity }).slotConfig;
     },
     async generateText(rawOptions = {}) {
       const optionsWithDefaults = {
         ...(rawOptions || {}),
       };
-      const { slotName, slotConfig } = slotConfigForAgentComplexity(
+      const normalizedInstructions = strengthenStructuredOutputInstructions(
+        optionsWithDefaults.instructions,
+        optionsWithDefaults,
+      );
+      const normalizedOptions = {
+        ...optionsWithDefaults,
+        instructions: normalizedInstructions,
+      };
+      const { slotName, slotConfig } = slotConfigForRequest(
         settings,
-        optionsWithDefaults.agentComplexity,
+        normalizedOptions,
       );
       const targetClient = slotName === "secondary" ? secondaryClient : primaryClient;
       const routedOptions = {
-        ...optionsWithDefaults,
-        model: optionsWithDefaults.model || slotConfig?.model || primaryClient.settings.responseModel,
+        ...normalizedOptions,
+        model: normalizedOptions.model || slotConfig?.model || primaryClient.settings.responseModel,
+        agentSlot: slotName,
       };
       return targetClient.generateText(routedOptions);
     },

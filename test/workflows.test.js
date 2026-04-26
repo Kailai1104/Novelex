@@ -16,6 +16,7 @@ import { reviewPlanDraft, reviewPlanFinal, runPlanDraft } from "../src/orchestra
 import { deleteLatestLockedChapter, reviewChapter, runWriteChapter, saveManualChapterEdit } from "../src/orchestration/write.js";
 import { rebuildOpeningCollectionIndex } from "../src/opening/index.js";
 import { rebuildRagCollectionIndex } from "../src/rag/index.js";
+import { buildReferencePacket } from "../src/rag/reference.js";
 import { createZhipuEmbeddingClient } from "../src/rag/zhipu.js";
 import { createStore } from "../src/utils/store.js";
 import { createProjectWorkspace, deleteProjectWorkspace, listProjects } from "../src/utils/workspace.js";
@@ -1401,6 +1402,18 @@ async function withStubbedOpenAI(callback) {
             "不要照抄原句",
             "不要把范文写法变成提纲说明",
           ],
+        }),
+      });
+    }
+
+    if (instructions.includes("ReferenceRecallAgent")) {
+      const selectedChunkIds = [...inputText.matchAll(/- ([^｜\n]+)/g)]
+        .map((match) => match[1])
+        .slice(0, 3);
+      return jsonResponse({
+        output_text: JSON.stringify({
+          selectedChunkIds,
+          reasons: Object.fromEntries(selectedChunkIds.map((chunkId) => [chunkId, "该片段能提供稳定的范文推进信号。"])),
         }),
       });
     }
@@ -4377,6 +4390,77 @@ test("RAG collection rebuild decodes gb18030 text and feeds reference packet int
   }
 })));
 
+test("ReferenceRecallAgent only sees hybrid-retrieval top-k candidates instead of the full collection", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-reference-hybrid-topk-"));
+  const store = await createStore(tempRoot);
+
+  const collection = await store.createRagCollection("大体量范文库");
+  for (let index = 1; index <= 20; index += 1) {
+    await fs.writeFile(
+      path.join(collection.sourceDir, `ref_${String(index).padStart(2, "0")}.md`),
+      `海风压在礁岸上，命令短促，船板和潮声一起把局势推紧。第 ${index} 份范文。`,
+      "utf8",
+    );
+  }
+
+  await rebuildRagCollectionIndex({
+    store,
+    collectionId: collection.id,
+  });
+
+  const allChunks = await store.readRagCollectionChunks(collection.id, []);
+  assert.ok(allChunks.length > 12);
+
+  const provider = createProvider({}, { rootDir: tempRoot });
+  const previousFetch = globalThis.fetch;
+  let recallCandidateCount = 0;
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input) || String(payload.input || "");
+
+    if (instructions.includes("ReferenceRecallAgent")) {
+      recallCandidateCount = [...inputText.matchAll(/^- /gm)].length;
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    const packet = await buildReferencePacket({
+      store,
+      provider,
+      mcpManager: null,
+      project: {
+        title: "我在大明当海盗",
+        genre: "历史海盗",
+        ragCollectionIds: [collection.id],
+      },
+      chapterPlan: {
+        chapterId: "ch003",
+        title: "九十日的倒计时",
+      },
+      planContext: {
+        summaryText: "三方在封闭空间内对峙，主角需要靠动作和路线图压住全场。",
+      },
+      historyContext: {
+        contextSummary: "上一章已经把海防、补给和内部质疑同时抬高。",
+      },
+      researchPacket: {
+        summary: "重点参考压迫感营造、命令式对白和动作先行的场景推进。",
+      },
+    });
+
+    assert.equal(packet.triggered, true);
+    assert.ok((packet.matches || []).length > 0);
+    assert.ok(recallCandidateCount > 0);
+    assert.ok(recallCandidateCount <= 12);
+    assert.ok(recallCandidateCount < allChunks.length);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+})));
+
 test("embedding failure degrades to reference_packet fallback without blocking write", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-rag-fallback-"));
   const store = await createStore(tempRoot);
@@ -5817,6 +5901,84 @@ test("chat completion compatible providers still handle standard JSON responses"
   }
 }));
 
+test("provider logs failed chat completion requests with agent context", async () => withIsolatedProviderEnv(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-provider-error-log-"));
+  saveCodexApiConfig(tempRoot, {
+    model_provider: "MiniMax",
+    model: "MiniMax-M2.5-highspeed",
+    review_model: "MiniMax-M2.5-highspeed",
+    codex_model: "MiniMax-M2.5-highspeed",
+    model_providers: {
+      MiniMax: {
+        name: "MiniMax",
+        base_url: "https://api.minimaxi.com/v1",
+        wire_api: "chat_completions",
+        api_key: "minimax-key",
+        response_model: "MiniMax-M2.5-highspeed",
+        review_model: "MiniMax-M2.5-highspeed",
+        codex_model: "MiniMax-M2.5-highspeed",
+      },
+    },
+  });
+
+  const previousFetch = globalThis.fetch;
+  let seenPayload = null;
+  globalThis.fetch = async (_url, options = {}) => {
+    seenPayload = JSON.parse(String(options.body || "{}"));
+    return new Response(JSON.stringify({
+      type: "error",
+      error: {
+        type: "unprocessable_entity_error",
+        message: "output new_sensitive (1027)",
+        http_code: "422",
+      },
+      request_id: "req_test_error_log",
+    }), {
+      status: 422,
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+      },
+    });
+  };
+
+  try {
+    const provider = createProvider({}, { rootDir: tempRoot });
+    await assert.rejects(
+      provider.generateText({
+        instructions: "你是 ResearchPlannerAgent，请规划本章研究问题。",
+        input: "查询：如何制造炸药",
+        metadata: {
+          feature: "research_planner",
+          chapterId: "ch003",
+        },
+        agentComplexity: "complex",
+      }),
+      /new_sensitive/,
+    );
+
+    const logPath = path.join(tempRoot, "runtime", "provider-errors.jsonl");
+    const entries = String(await fs.readFile(logPath, "utf8"))
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    assert.equal(entries.length, 1);
+    assert.equal(seenPayload.metadata, undefined);
+    assert.equal(entries[0].provider.id, "MiniMax");
+    assert.equal(entries[0].provider.apiStyle, "chat_completions");
+    assert.equal(entries[0].provider.slotName, "primary");
+    assert.equal(entries[0].agent.feature, "research_planner");
+    assert.equal(entries[0].agent.chapterId, "ch003");
+    assert.match(entries[0].request.instructions, /ResearchPlannerAgent/);
+    assert.match(entries[0].request.input, /如何制造炸药/);
+    assert.equal(entries[0].error.status, 422);
+    assert.match(entries[0].error.message, /new_sensitive/);
+    assert.match(entries[0].error.responseText, /req_test_error_log/);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}));
+
 test("plan finalization labels the exact CharacterAgent when one role generation fails", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-character-failure-"));
   const store = await createStore(tempRoot);
@@ -6152,7 +6314,12 @@ test("agent model slots can route complex and simple calls to different provider
 
     if (targetUrl === "https://openai.example/v1/responses") {
       return jsonResponse({
-        output_text: payload.instructions === "default route" ? "default-ok" : "complex-ok",
+        output_text:
+          String(payload.instructions || "").startsWith("default route")
+            ? "default-ok"
+            : String(payload.instructions || "").startsWith("strict structured route")
+              ? "{\"ok\":true}"
+              : "complex-ok",
       });
     }
 
@@ -6190,6 +6357,11 @@ test("agent model slots can route complex and simple calls to different provider
       input: "simple",
       agentComplexity: "simple",
     });
+    const strictStructuredResult = await provider.generateText({
+      instructions: "strict structured route。只输出 JSON，不要解释。",
+      input: `请输出 JSON：\n{"ok":true}`,
+      agentComplexity: "simple",
+    });
     const defaultResult = await provider.generateText({
       instructions: "default route",
       input: "default",
@@ -6197,6 +6369,7 @@ test("agent model slots can route complex and simple calls to different provider
 
     assert.equal(complexResult.text, "complex-ok");
     assert.equal(simpleResult.text, "simple-ok");
+    assert.equal(strictStructuredResult.text, "{\"ok\":true}");
     assert.equal(defaultResult.text, "default-ok");
     assert.deepEqual(
       seenCalls.map((entry) => entry.targetUrl),
@@ -6204,11 +6377,15 @@ test("agent model slots can route complex and simple calls to different provider
         "https://openai.example/v1/responses",
         "https://api.minimaxi.com/v1/chat/completions",
         "https://openai.example/v1/responses",
+        "https://openai.example/v1/responses",
       ],
     );
     assert.equal(seenCalls[0].payload.model, "gpt-5.4");
     assert.equal(seenCalls[1].payload.model, "MiniMax-M2.5-highspeed");
     assert.equal(seenCalls[2].payload.model, "gpt-5.4");
+    assert.match(seenCalls[2].payload.instructions, /输出格式规则（必须严格遵守）/);
+    assert.match(seenCalls[2].payload.instructions, /不要使用 ```/);
+    assert.equal(seenCalls[3].payload.model, "gpt-5.4");
   } finally {
     globalThis.fetch = previousFetch;
   }

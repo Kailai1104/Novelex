@@ -789,6 +789,7 @@ pre {
 .overview-list {
   display: grid;
   gap: 12px;
+  margin-top: 24px;
 }
 
 .overview-list-item {
@@ -1163,6 +1164,11 @@ pre {
   margin: 0;
 }
 
+.chapter-body-card {
+  max-height: 70vh;
+  overflow: auto;
+}
+
 .artifact-block {
   border-radius: var(--radius-md);
   border: 1px solid rgba(74, 53, 36, 0.1);
@@ -1196,6 +1202,13 @@ pre {
 .review-body {
   display: grid;
   gap: 14px;
+}
+
+.review-body textarea,
+.compose-card textarea {
+  display: block;
+  width: 100%;
+  max-width: 100%;
 }
 
 .candidate-card,

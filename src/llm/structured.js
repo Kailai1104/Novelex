@@ -42,7 +42,10 @@ export async function generateStructuredObject(provider, {
     toolChoice,
     include,
     reasoningEffort,
-    metadata,
+    metadata: {
+      ...(metadata || {}),
+      strictStructuredOutput: true,
+    },
     temperature,
   });
   const parsed = parseStructuredObject(result, label);

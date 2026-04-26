@@ -16,6 +16,21 @@ const CHARACTER_DOC_EXCERPT_LIMIT = 1000;
 const HISTORY_MARKDOWN_EXCERPT_LIMIT = 2200;
 const HISTORY_CANDIDATE_EXCERPT_LIMIT = 220;
 const MAX_HISTORY_SELECTION = 4;
+const STRICT_JSON_OUTPUT_RULES = [
+  "硬性输出规则：",
+  "1. 最终回复必须且只能是一个合法 JSON 对象。",
+  "2. 不要输出 Markdown 代码块，不要输出 ```json，不要输出任何解释、标题、前言、后记或注释。",
+  "3. 第一字符必须是 {，最后一个字符必须是 }。",
+  "4. 所有 key 必须使用双引号；所有字符串 value 必须是 JSON 字符串，并正确转义内部双引号与换行。",
+  "5. 不允许出现尾逗号、注释、NaN、undefined、... 或任何非 JSON 内容。",
+  "6. 必须完整返回要求的全部字段；如果暂无内容，使用空字符串或空数组，不要省略字段。",
+  "7. 数组项必须直接是字符串或对象，不要在数组里再包解释文字。",
+].join("\n");
+const SINGLE_LINE_JSON_TEXT_RULES = [
+  "补充字段约束：",
+  "1. 所有文本字段都必须是单行纯文本短句，不要换行，不要分点，不要写 1. / ① / - 等列表标记。",
+  "2. 不要在字符串里再嵌套 JSON、Markdown、括号提纲或角色小剧场。",
+].join("\n");
 
 function stringifyJson(value) {
   return JSON.stringify(value, null, 2);
@@ -31,6 +46,14 @@ function parseAgentJson(result, label) {
 
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error || "Unknown error");
+}
+
+function withStrictJsonInstructions(baseInstructions, extraRules = "") {
+  return [
+    baseInstructions,
+    STRICT_JSON_OUTPUT_RULES,
+    String(extraRules || "").trim(),
+  ].filter(Boolean).join("\n\n");
 }
 
 function normalizeStringArray(values, limit = 8) {
@@ -614,8 +637,9 @@ async function runOutlineContextAgent({
   const stage = stageForChapter(structureData, chapterPlan);
   const result = await provider.generateText({
     agentComplexity: "simple",
-    instructions:
+    instructions: withStrictJsonInstructions(
       "你是 Novelex 的 OutlineContextAgent。你负责从已锁定的大纲包里，为当前章节筛选真正会影响写作的总纲、阶段与章节上下文。不要复述全书，只保留当前章节必须兑现、必须保留、必须延后、最容易写偏的内容。只输出 JSON。",
+    ),
     input: [
       buildProjectSummary(project),
       `当前章节：\n${buildChapterPlanSummary(chapterPlan)}`,
@@ -690,13 +714,16 @@ async function runCharacterContextAgent({
   }).join("\n\n");
 
   const result = await provider.generateText({
-    agentComplexity: "simple",
-    instructions:
+    agentComplexity: "complex",
+    instructions: withStrictJsonInstructions(
       "你是 Novelex 的 CharacterContextAgent。你负责根据当前章节，从角色资料里筛选 Writer 真正需要的角色写法约束。重点只看：当前诉求、知识边界、人物声音、关系张力、这章最容易写崩的地方。只输出 JSON。",
+      SINGLE_LINE_JSON_TEXT_RULES,
+    ),
     input: [
       buildProjectSummary(project),
       `当前章节：\n${buildChapterPlanSummary(chapterPlan)}`,
       `角色资料包：\n${characterPackets || "本章无可用角色资料。"}`,
+      "额外提醒：characters 数组中的每个对象都必须保留 name、onStageRole、currentNeed、voiceNote、knowledgeBoundary、relationshipPressure、hiddenPressure 这 7 个字段；每个字段都写成单行短句，不要写成长段分析。",
       `请输出 JSON：
 {
   "characters": [
@@ -744,8 +771,9 @@ async function runWorldContextAgent({
 }) {
   const result = await provider.generateText({
     agentComplexity: "simple",
-    instructions:
+    instructions: withStrictJsonInstructions(
       "你是 Novelex 的 WorldContextAgent。你负责从世界观、世界状态、伏笔注册表与风格指南中，筛出当前章节真正需要的世界约束。重点只保留会影响这一章写法的时代细节、世界规则、伏笔任务、风格禁忌与连续性提醒。只输出 JSON。",
+    ),
     input: [
       buildProjectSummary(project),
       `当前章节：\n${buildChapterPlanSummary(chapterPlan)}`,

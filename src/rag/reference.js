@@ -3,7 +3,9 @@ import path from "node:path";
 import { createContextSource, mergeContextSources } from "../core/input-governance.js";
 import { createExcerpt, extractJsonObject, safeJsonParse, unique } from "../core/text.js";
 import { renderWriterContextMarkdown } from "../retrieval/writer-context.js";
-import { loadCollectionChunks } from "./index.js";
+import { loadCollectionChunks, runHybridRetrieval } from "./index.js";
+
+const REFERENCE_RECALL_CANDIDATE_LIMIT = 12;
 
 function normalizeList(values, limit = 8) {
   return unique((Array.isArray(values) ? values : [])
@@ -354,12 +356,52 @@ export async function buildReferencePacket({
     historyContext,
     researchPacket,
   });
+  const retrievalQueries = planner.queries.length ? planner.queries : planner.focusAspects;
+  let recallCandidates = [];
+  try {
+    recallCandidates = await runHybridRetrieval({
+      queries: retrievalQueries,
+      chunks,
+      limit: REFERENCE_RECALL_CANDIDATE_LIMIT,
+      rootDir: store?.paths?.configRootDir || store?.paths?.workspaceRoot || process.cwd(),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error || "Unknown error");
+    const fallbackPacket = createEmptyReferencePacket({
+      triggered: true,
+      mode: "embedding_failed",
+      collectionIds,
+      queries: planner.queries,
+      focusAspects: planner.focusAspects,
+      mustAvoid: planner.mustAvoid,
+      summary: `范文检索失败：${message}`,
+      warnings: ["向量检索失败，已跳过范文参考包。"],
+    });
+    fallbackPacket.briefingMarkdown = buildReferenceMarkdown(fallbackPacket);
+    return fallbackPacket;
+  }
+
+  if (!recallCandidates.length) {
+    const emptyPacket = createEmptyReferencePacket({
+      triggered: true,
+      mode: "llm_retrieval",
+      collectionIds,
+      queries: planner.queries,
+      focusAspects: planner.focusAspects,
+      mustAvoid: planner.mustAvoid,
+      summary: "已执行混合检索，但没有命中可供精读的候选片段。",
+      warnings,
+    });
+    emptyPacket.briefingMarkdown = buildReferenceMarkdown(emptyPacket);
+    return emptyPacket;
+  }
+
   const matches = await runReferenceRecallAgent({
     provider,
     project,
     chapterPlan,
     planner,
-    chunks,
+    chunks: recallCandidates,
   });
 
   if (!matches.length) {

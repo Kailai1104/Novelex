@@ -3482,9 +3482,9 @@ test("chapter review supports saving direct human edits to the staged chapter bo
   const previousFetch = globalThis.fetch;
   let manualEditFetchCalls = 0;
 
-  globalThis.fetch = async (...args) => {
+  globalThis.fetch = async (url, options = {}) => {
     manualEditFetchCalls += 1;
-    return previousFetch(...args);
+    return previousFetch(url, options);
   };
 
   try {
@@ -3501,7 +3501,8 @@ test("chapter review supports saving direct human edits to the staged chapter bo
     assert.match(savedDraft.chapterMarkdown, /李凡把最后一句压得更稳/);
     assert.equal(savedDraft.reviewState.mode, "manual_edit");
     assert.equal(savedDraft.reviewState.feedbackSupervisionPassed, true);
-    assert.equal(savedDraft.validation.semanticAudit.source, "heuristics_only");
+    assert.equal(savedDraft.validation.semanticAudit.source, "skipped");
+    assert.equal(savedDraft.validation.semanticAudit.reason, "manual_direct_edit_no_validation");
     assert.equal(savedDraft.rewriteHistory.at(-1)?.mode, "manual_edit");
   } finally {
     globalThis.fetch = previousFetch;

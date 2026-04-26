@@ -1371,9 +1371,16 @@ function renderChapterReviewBody(pending = null) {
   const manualReviewRequired = Boolean(reviewState.manualReviewRequired);
   const feedbackSupervisionPassed = reviewState.feedbackSupervisionPassed !== false;
   const approvalOverrideRequired = manualReviewRequired || validation?.overallPassed === false || !feedbackSupervisionPassed;
+  const semanticAuditSource = validation?.semanticAudit?.source;
+  const semanticAuditReason = validation?.semanticAudit?.reason;
+  const noAutomatedReview = semanticAuditSource === "skipped" && semanticAuditReason === "manual_direct_edit_no_validation";
   const auditMode = manualReviewRequired
     ? "人工复审中"
-    : (reviewState.auditDegraded || validation.auditDegraded || validation?.semanticAudit?.source === "heuristics_only")
+    : noAutomatedReview
+      ? "未自动审查"
+      : semanticAuditSource === "skipped"
+      ? "已跳过语义审查"
+      : (reviewState.auditDegraded || validation.auditDegraded || semanticAuditSource === "heuristics_only")
       ? "降级审查（heuristics only）"
       : "正常审查";
   const blockingFeedbackIssues = (reviewState.blockingFeedbackIssues || []).filter(Boolean).slice(0, 4);
@@ -1384,17 +1391,33 @@ function renderChapterReviewBody(pending = null) {
   const workbench = partialRevisionWorkbenchFor(chapterId, pending);
   const selectionPreview = selectionPreviewText(workbench);
   const approveLabel = approvalOverrideRequired ? "仍然锁章（未通过审计）" : "批准";
+  const auditFlagTone = noAutomatedReview
+    ? "is-warning"
+    : approvalOverrideRequired
+      ? "is-danger"
+      : issueCounts.warning
+        ? "is-warning"
+        : "is-success";
+  const auditFlagHeadline = noAutomatedReview
+    ? "当前章节未自动审查，请人工确认后决定是否锁章"
+    : approvalOverrideRequired
+      ? "当前章节尚未通过反馈监督或审计"
+      : issueCounts.warning
+        ? "当前章节可批准，但仍有 warning"
+        : "当前没有阻止通过的 critical 问题";
 
   return `
     <div class="review-body">
       <p>${escapeHtml(directEditActive
         ? "当前正在直接编辑正文。请先保存或取消本次手动修改，再继续批准、整章重写或局部修订。"
+        : noAutomatedReview
+          ? "当前章节在人工直接修改后未自动审查；请人工确认内容是否可锁章，或继续重写。"
         : approvalOverrideRequired
           ? "当前章节仍有未解决问题；你可以继续重写，也可以在显式确认风险后仍然锁章。"
           : "通过后会锁章；如果不满意，你既可以按反馈重写整章，也可以先在上面的正文 body 中框选一个连续片段，只改那一段。")}</p>
       ${wordCount ? `<p><small>当前待审章节字数：${escapeHtml(String(wordCount))} 字</small></p>` : ""}
-      <div class="audit-flag ${approvalOverrideRequired ? "is-danger" : issueCounts.warning ? "is-warning" : "is-success"}">
-        <strong>${escapeHtml(approvalOverrideRequired ? "当前章节尚未通过反馈监督或审计" : issueCounts.warning ? "当前章节可批准，但仍有 warning" : "当前没有阻止通过的 critical 问题")}</strong>
+      <div class="audit-flag ${auditFlagTone}">
+        <strong>${escapeHtml(auditFlagHeadline)}</strong>
         <p><small>审查模式：${escapeHtml(auditMode)}｜critical ${issueCounts.critical || 0} / warning ${issueCounts.warning || 0} / info ${issueCounts.info || 0}｜manualReviewRequired=${manualReviewRequired ? "true" : "false"}</small></p>
         ${feedbackSummary ? `<p><small>反馈监督：${escapeHtml(feedbackSummary)}</small></p>` : ""}
         ${blockingFeedbackIssues.length ? `<p><small>未落实反馈：${escapeHtml(blockingFeedbackIssues.join("；"))}</small></p>` : ""}

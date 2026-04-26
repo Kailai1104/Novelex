@@ -8,6 +8,7 @@ import {
 } from "../core/defaults.js";
 import {
   analyzeCharacterPresence,
+  realizedCharactersPresent,
   requiredCharactersConstraint,
 } from "../core/character-presence.js";
 import { buildContextTrace } from "../core/context-trace.js";
@@ -19,6 +20,7 @@ import {
   chapterNumberFromId,
   chapterIdFromNumber,
   composeChapterMarkdown,
+  countWordsApprox,
   createExcerpt,
   extractJsonObject,
   locateSelectedText,
@@ -3706,6 +3708,134 @@ async function resolveStyleBaseline(store, provider, project, chapterPlan) {
   };
 }
 
+function createManualEditValidationSnapshot() {
+  return {
+    passed: null,
+    overallPassed: null,
+    score: null,
+    summary: "人工直接修改正文后未自动审查，章节保持待审状态。",
+    issueCounts: {
+      critical: 0,
+      warning: 0,
+      info: 0,
+    },
+    activeDimensions: [],
+    issues: [],
+    dimensionResults: {},
+    heuristics: null,
+    sequenceSnapshot: [],
+    staleForeshadowings: [],
+    nextChapterGuardrails: [],
+    auditDegraded: false,
+    semanticAudit: {
+      source: "skipped",
+      reason: "manual_direct_edit_no_validation",
+      error: null,
+      attempts: 0,
+    },
+    auditDrift: null,
+    consistency: null,
+    plausibility: null,
+    foreshadowing: null,
+    style: null,
+  };
+}
+
+function buildManualEditDerivedState({
+  draftBundle,
+  chapterPlan,
+  chapterDraft,
+  fallbackCharacterStates = [],
+  fallbackWorldState = null,
+  fallbackForeshadowingRegistry = null,
+}) {
+  const realizedCharacters = realizedCharactersPresent(chapterPlan, chapterDraft?.markdown || "");
+  const previousMeta = draftBundle?.chapterMeta && typeof draftBundle.chapterMeta === "object"
+    ? draftBundle.chapterMeta
+    : {};
+  const chapterMeta = {
+    ...previousMeta,
+    chapter_id: String(
+      previousMeta.chapter_id ||
+      previousMeta.chapterId ||
+      chapterPlan?.chapterId ||
+      "",
+    ).trim(),
+    chapterId: String(
+      previousMeta.chapterId ||
+      previousMeta.chapter_id ||
+      chapterPlan?.chapterId ||
+      "",
+    ).trim(),
+    title: String(previousMeta.title || chapterPlan?.title || "").trim(),
+    stage: String(previousMeta.stage || chapterPlan?.stage || "").trim(),
+    time_in_story: String(
+      previousMeta.time_in_story ||
+      previousMeta.timeInStory ||
+      chapterPlan?.timeInStory ||
+      "",
+    ).trim(),
+    pov_character: String(
+      previousMeta.pov_character ||
+      previousMeta.povCharacter ||
+      chapterPlan?.povCharacter ||
+      "",
+    ).trim(),
+    location: String(previousMeta.location || chapterPlan?.location || "").trim(),
+    next_hook: String(
+      previousMeta.next_hook ||
+      previousMeta.nextHook ||
+      chapterPlan?.nextHook ||
+      "",
+    ).trim(),
+    summary_50: String(
+      previousMeta.summary_50 ||
+      createExcerpt((chapterPlan?.keyEvents || []).join("；"), 50),
+    ).trim(),
+    summary_200: String(
+      previousMeta.summary_200 ||
+      createExcerpt(`${(chapterPlan?.keyEvents || []).join("；")} ${chapterPlan?.nextHook || ""}`, 200),
+    ).trim(),
+    key_events: Array.isArray(previousMeta.key_events)
+      ? previousMeta.key_events
+      : Array.isArray(previousMeta.keyEvents)
+        ? previousMeta.keyEvents
+        : (chapterPlan?.keyEvents || []),
+    characters_present: realizedCharacters,
+    emotional_tone: String(
+      previousMeta.emotional_tone ||
+      previousMeta.emotionalTone ||
+      chapterPlan?.emotionalTone ||
+      "",
+    ).trim(),
+    foreshadowing_planted: Array.isArray(previousMeta.foreshadowing_planted)
+      ? previousMeta.foreshadowing_planted
+      : (chapterPlan?.foreshadowingActions || [])
+        .filter((item) => item.action === "plant")
+        .map((item) => item.id),
+    foreshadowing_resolved: Array.isArray(previousMeta.foreshadowing_resolved)
+      ? previousMeta.foreshadowing_resolved
+      : (chapterPlan?.foreshadowingActions || [])
+        .filter((item) => item.action === "resolve")
+        .map((item) => item.id),
+    continuity_anchors: Array.isArray(previousMeta.continuity_anchors)
+      ? previousMeta.continuity_anchors
+      : Array.isArray(previousMeta.continuityAnchors)
+        ? previousMeta.continuityAnchors
+        : (chapterPlan?.continuityAnchors || []),
+    word_count: countWordsApprox(chapterDraft?.markdown || ""),
+  };
+
+  return {
+    chapterMeta,
+    characterStates: Array.isArray(draftBundle?.characterStates)
+      ? draftBundle.characterStates
+      : fallbackCharacterStates,
+    worldState: draftBundle?.worldState || fallbackWorldState || null,
+    foreshadowingRegistry: draftBundle?.foreshadowingRegistry || fallbackForeshadowingRegistry || null,
+  };
+}
+
 function buildCharacterDossiers(bundle, chapterPlan, characterStates) {
   const stateByName = new Map(characterStates.map((state) => [state.name, state]));
 
@@ -6848,7 +6978,6 @@ export async function saveManualChapterEdit(
   } = {},
 ) {
   const projectState = await store.loadProject();
-  const provider = createProvider(projectState, { rootDir: store.paths.configRootDir });
   const pending = projectState.phase.write.pendingReview;
   if (!pending?.chapterId) {
     throw new Error("当前没有待审章节。");
@@ -6890,44 +7019,26 @@ export async function saveManualChapterEdit(
     composeChapterMarkdown(originalParts.title || chapterPlanBase.title, normalizedBody),
   );
   const currentCharacterStates = await loadCurrentCharacterStates(store, bundle);
-  const historyPacket = historyContextFromDraft(draftBundle);
-  const writerContext = writerContextFromDraft(draftBundle);
-  const governance = governanceFromDraft(draftBundle, chapterPlanBase);
-  const foreshadowingAdvice = collectForeshadowingAdvice(bundle.foreshadowingRegistry, chapterPlanBase);
   const researchPacket = researchPacketFromDraft(draftBundle);
   const referencePacket = referencePacketFromDraft(draftBundle);
   const openingReferencePacket = openingReferencePacketFromDraft(draftBundle);
-  const { styleGuideText } = await resolveStyleBaseline(store, provider, projectState.project, chapterPlanBase);
-  const chapterMetas = await store.listChapterMeta();
+  const historyPacket = historyContextFromDraft(draftBundle);
+  const writerContext = writerContextFromDraft(draftBundle);
+  const governance = governanceFromDraft(draftBundle, chapterPlanBase);
   const factContext = draftBundle?.factContext || null;
-  const validation = await runChapterAudit({
-    store,
-    provider,
-    project: projectState.project,
+  const validation = createManualEditValidationSnapshot();
+  const rewrittenState = buildManualEditDerivedState({
+    draftBundle,
     chapterPlan: chapterPlanBase,
     chapterDraft: rewrittenDraft,
-    historyPacket,
-    foreshadowingAdvice,
-    researchPacket,
-    styleGuideText,
-    characterStates: currentCharacterStates,
-    foreshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
-    chapterMetas,
-    factContext,
+    fallbackCharacterStates: currentCharacterStates,
+    fallbackWorldState: bundle.worldState,
+    fallbackForeshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
   });
-  const rewrittenState = await buildDerivedChapterStateArtifacts({
-    provider,
-    currentCharacterStates,
-    chapterPlan: chapterPlanBase,
-    project: projectState.project,
-    chapterDraft: rewrittenDraft,
-    worldStateBase: bundle.worldState,
-    structureData: bundle.structureData,
-    foreshadowingRegistryBase: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
-  });
-  const { canonFactIssues, blockingAuditIssues } = buildBlockingAuditReviewPayload(validation, factContext);
-  const manualReviewRequired = !validation?.overallPassed;
-  const manualReviewStrategy = manualReviewRequired ? manualReviewStrategyFromValidation(validation) : "";
+  const canonFactIssues = [];
+  const blockingAuditIssues = [];
+  const manualReviewRequired = false;
+  const manualReviewStrategy = "";
   const rewriteHistory = [
     ...(draftBundle.rewriteHistory || []),
     {
@@ -6939,7 +7050,7 @@ export async function saveManualChapterEdit(
       sceneOrder: [],
       selectionPreview: "",
       feedbackSupervisionPassed: true,
-      feedbackSupervisionSummary: "人工直接修改正文后已完成语义审查，并回写待审草稿。",
+      feedbackSupervisionSummary: "人工直接修改正文后未自动审查，已直接回写待审草稿。",
       feedbackSupervisionAttempts: 0,
       blockingFeedbackIssues: [],
     },
@@ -6971,7 +7082,7 @@ export async function saveManualChapterEdit(
     factContext,
     auditDegraded: Boolean(validation?.auditDegraded),
     repairHistory: draftBundle?.repairHistory || [],
-    lastUnresolvedCriticals: unresolvedCriticalIssueSummaries(validation),
+    lastUnresolvedCriticals: [],
     reviewState: {
       mode: "manual_edit",
       strategy: manualReviewRequired ? manualReviewStrategy : "human_direct_edit",
@@ -6980,14 +7091,14 @@ export async function saveManualChapterEdit(
       manualReviewStrategy,
       auditDegraded: Boolean(validation?.auditDegraded),
       feedbackSupervisionPassed: true,
-      feedbackSupervisionSummary: "人工直接修改正文后已完成语义审查，并回写待审草稿。",
+      feedbackSupervisionSummary: "人工直接修改正文后未自动审查，已直接回写待审草稿。",
       feedbackSupervisionAttempts: 0,
       feedbackSupervisionHistory: [],
       blockingFeedbackIssues: [],
       blockingAuditIssues,
       canonFactIssues,
       repairHistory: draftBundle?.repairHistory || [],
-      lastUnresolvedCriticals: unresolvedCriticalIssueSummaries(validation),
+      lastUnresolvedCriticals: [],
       repairStagnated: false,
     },
     rewriteHistory,
@@ -7000,9 +7111,7 @@ export async function saveManualChapterEdit(
     finishedAt: nowIso(),
     target: REVIEW_TARGETS.CHAPTER,
     chapterId: pending.chapterId,
-    summary: manualReviewRequired
-      ? `${pending.chapterId} 的人工正文修改已保存，并已完成语义审查；当前仍有问题需要继续人工复审。`
-      : `${pending.chapterId} 的人工正文修改已保存，并已完成语义审查，章节保持待审状态。`,
+    summary: `${pending.chapterId} 的人工正文修改已保存，未自动审查，章节保持待审状态。`,
     steps: [
       step(
         "manual_edit_save",
@@ -7015,14 +7124,11 @@ export async function saveManualChapterEdit(
       ),
       step(
         "manual_edit_validation",
-        "AuditAnalyzerAgent",
+        "ManualReviewQueue",
         "write",
-        validationSummary(validation),
+        "人工直接修改正文后未自动审查，章节保持待审状态。",
         {
-          preview: createExcerpt(
-            blockingAuditIssues.join("；") || "人工修改后的章节已完成语义审查。",
-            160,
-          ),
+          preview: "未自动审查；请在待审界面继续人工确认或重写。",
         },
       ),
     ],
@@ -7037,7 +7143,7 @@ export async function saveManualChapterEdit(
       requestedAt: nowIso(),
       runId: saveRun.id,
     },
-    rejectionNotes: manualReviewRequired ? blockingAuditIssues : [],
+    rejectionNotes: [],
     rewriteHistory,
   };
   const savedProject = await store.saveProject(projectState);
@@ -7045,9 +7151,7 @@ export async function saveManualChapterEdit(
   return {
     project: savedProject,
     run: saveRun,
-    summary: manualReviewRequired
-      ? `${pending.chapterId} 的人工修改已保存，并已完成语义审查；当前仍有问题需要继续人工复审。`
-      : `${pending.chapterId} 的人工修改已保存，并已完成语义审查。`,
+    summary: `${pending.chapterId} 的人工修改已保存，未自动审查。`,
   };
 }
 

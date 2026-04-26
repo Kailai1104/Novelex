@@ -6,6 +6,7 @@ import {
   legacyBucketForDimension,
   resolveAuditDimensions,
 } from "../core/audit-dimensions.js";
+import { runAuditHeuristics } from "../core/audit-heuristics.js";
 import {
   chapterNumberFromId,
   createExcerpt,
@@ -463,6 +464,14 @@ function buildAuditSummary(issues = [], score = 100, explicitSummary = "") {
   return `审计发现 critical ${counts.critical} 条、warning ${counts.warning} 条、info ${counts.info} 条，主要集中在${topCategories.join("、")}。score=${score}。`;
 }
 
+function heuristicScore(issues = []) {
+  const counts = buildCounts(issues);
+  return Math.max(0, Math.min(
+    100,
+    100 - counts.critical * 25 - counts.warning * 8 - counts.info * 3,
+  ));
+}
+
 function buildDriftPayload({
   chapterPlan,
   validation,
@@ -553,6 +562,9 @@ export async function runChapterAudit({
   foreshadowingRegistry = null,
   chapterMetas = null,
   factContext = null,
+  skipSemanticAudit = false,
+  skippedSemanticSummary = "",
+  semanticSkipReason = "",
 }) {
   const metas = Array.isArray(chapterMetas) ? chapterMetas : await store.listChapterMeta();
   const recentChapters = await loadRecentChapters(
@@ -572,25 +584,56 @@ export async function runChapterAudit({
     historyPacket,
     factContext,
   });
-  const semantic = await runSemanticAuditWithRetry({
-    provider,
-    project,
-    chapterPlan,
-    chapterDraft,
-    historyPacket,
-    foreshadowingAdvice,
-    researchPacket,
-    styleGuideText,
-    activeDimensions,
-    recentChapters,
-    characterStates,
-    factContext,
-  });
+  const allowedIds = new Set(activeDimensions.map((dimension) => dimension.id));
+
+  const semantic = skipSemanticAudit
+    ? (() => {
+      const heuristics = runAuditHeuristics({
+        project,
+        chapterPlan,
+        chapterDraft,
+        researchPacket,
+        foreshadowingRegistry,
+        recentChapters,
+      });
+      const heuristicIssues = dedupeIssues((heuristics.issues || []).filter((issue) => allowedIds.has(issue.id)));
+      return {
+        summary: String(skippedSemanticSummary || "").trim() || "已跳过语义审查，仅执行启发式校验。",
+        score: heuristicScore(heuristicIssues),
+        issues: heuristicIssues,
+        dimensionSummaries: {},
+        sequenceSnapshot: heuristics.sequenceSnapshot || [],
+        staleForeshadowings: heuristics.staleForeshadowings || [],
+        nextChapterGuardrails: unique(heuristicIssues
+          .filter((issue) => issue.severity === "critical" || issue.severity === "warning")
+          .map((issue) => issue.suggestion)
+          .filter(Boolean)).slice(0, 6),
+        heuristics,
+        source: "skipped",
+        reason: String(semanticSkipReason || "").trim(),
+        error: null,
+        attempts: 0,
+      };
+    })()
+    : await runSemanticAuditWithRetry({
+      provider,
+      project,
+      chapterPlan,
+      chapterDraft,
+      historyPacket,
+      foreshadowingAdvice,
+      researchPacket,
+      styleGuideText,
+      activeDimensions,
+      recentChapters,
+      characterStates,
+      factContext,
+    });
 
   const issues = dedupeIssues(semantic.issues);
   const score = Number.isFinite(Number(semantic.score))
     ? Math.max(0, Math.min(100, Math.round(Number(semantic.score))))
-    : 0;
+    : heuristicScore(issues);
   const counts = buildCounts(issues);
   const passed = counts.critical === 0;
   const dimensionResults = buildDimensionResults(
@@ -613,13 +656,14 @@ export async function runChapterAudit({
     })),
     issues,
     dimensionResults,
-    heuristics: null,
+    heuristics: semantic.heuristics || null,
     sequenceSnapshot: semantic.sequenceSnapshot,
     staleForeshadowings: semantic.staleForeshadowings,
     nextChapterGuardrails: semantic.nextChapterGuardrails,
     auditDegraded: false,
     semanticAudit: {
       source: semantic.source,
+      reason: semantic.reason || "",
       error: semantic.error,
       attempts: semantic.attempts || 0,
     },

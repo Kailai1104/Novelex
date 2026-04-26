@@ -59,6 +59,19 @@ max_concurrency = 1
 request_timeout_ms = 300000
 overload_retry_window_ms = 1800000
 
+[model_providers.DeepSeek]
+name = "DeepSeek"
+base_url = "https://api.deepseek.com"
+wire_api = "chat_completions"
+response_model = "deepseek-v4-pro"
+review_model = "deepseek-v4-pro"
+codex_model = "deepseek-v4-pro"
+api_key = "YOUR_DEEPSEEK_API_KEY"
+request_timeout_ms = 300000
+overload_retry_window_ms = 1800000
+# Set any model slot to "deepseek-v4-pro-thinking" to enable DeepSeek thinking mode.
+# Plain "deepseek-v4-pro" does not add the thinking request parameter.
+
 [model_providers.Gemini]
 name = "Gemini"
 base_url = "https://us.novaiapi.com/v1"

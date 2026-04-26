@@ -259,6 +259,24 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
     }
   }
 
+  async function removeRunsByChapterId(chapterId) {
+    const normalizedChapterId = String(chapterId || "").trim();
+    if (!normalizedChapterId) {
+      return;
+    }
+
+    const files = await listFilesRecursive(paths.runsDir);
+    for (const filePath of files) {
+      if (!filePath.endsWith(".json")) {
+        continue;
+      }
+      const run = await readJson(filePath, null);
+      if (String(run?.chapterId || "").trim() === normalizedChapterId) {
+        await removeIfExists(filePath);
+      }
+    }
+  }
+
   async function removeReviewsByTargets(targets = []) {
     const targetSet = new Set(
       (Array.isArray(targets) ? targets : [])
@@ -276,6 +294,24 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
       }
       const review = await readJson(filePath, null);
       if (targetSet.has(String(review?.target || "").trim())) {
+        await removeIfExists(filePath);
+      }
+    }
+  }
+
+  async function removeReviewsByChapterId(chapterId) {
+    const normalizedChapterId = String(chapterId || "").trim();
+    if (!normalizedChapterId) {
+      return;
+    }
+
+    const files = await listFilesRecursive(paths.reviewsDir);
+    for (const filePath of files) {
+      if (!filePath.endsWith(".json")) {
+        continue;
+      }
+      const review = await readJson(filePath, null);
+      if (String(review?.chapterId || "").trim() === normalizedChapterId) {
         await removeIfExists(filePath);
       }
     }
@@ -379,6 +415,7 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
     const writerPromptPacket = payload.writerPromptPacket || null;
     const auditDrift = payload.auditDrift || {};
     const factContext = payload.factContext || {};
+    const timelineContext = payload.timelineContext || {};
     await ensureDir(chapterDir);
     await writeJson(path.join(chapterDir, "bundle.json"), payload);
     await writeText(path.join(chapterDir, `${payload.chapterId}.md`), payload.chapterMarkdown || "");
@@ -423,6 +460,8 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
     await writeText(path.join(chapterDir, "audit_drift.md"), auditDrift.markdown || "");
     await writeJson(path.join(chapterDir, "fact_context.json"), factContext);
     await writeText(path.join(chapterDir, "fact_context.md"), factContext.briefingMarkdown || "");
+    await writeJson(path.join(chapterDir, "timeline_context.json"), timelineContext);
+    await writeText(path.join(chapterDir, "timeline_context.md"), timelineContext.briefingMarkdown || "");
     await writeJson(
       path.join(chapterDir, "foreshadowing_registry.json"),
       payload.foreshadowingRegistry || null,
@@ -495,6 +534,7 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
       path.join(paths.chaptersDir, `${chapterId}_audit_drift.json`),
       path.join(paths.chaptersDir, `${chapterId}_audit_drift.md`),
       path.join(paths.chaptersDir, `${chapterId}_facts.json`),
+      path.join(paths.chaptersDir, `${chapterId}_timeline.json`),
     ];
 
     await Promise.all(chapterFiles.map((filePath) => removeIfExists(filePath)));
@@ -1036,7 +1076,9 @@ export async function createStore(rootDir = process.cwd(), options = {}) {
     listRuns,
     saveReview,
     removeRunsByPhase,
+    removeRunsByChapterId,
     removeReviewsByTargets,
+    removeReviewsByChapterId,
     stagePlanDraft,
     loadPlanDraft,
     stagePlanFinalCacheEntry,

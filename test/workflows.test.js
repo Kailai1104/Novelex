@@ -37,6 +37,8 @@ async function withIsolatedProviderEnv(callback) {
     "MOONSHOT_BASE_URL",
     "MINIMAX_API_KEY",
     "MINIMAX_BASE_URL",
+    "DEEPSEEK_API_KEY",
+    "DEEPSEEK_BASE_URL",
     "GEMINI_API_KEY",
     "GEMINI_BASE_URL",
     "NOVAI_API_KEY",
@@ -1661,6 +1663,72 @@ async function withStubbedOpenAI(callback) {
       });
     }
 
+    if (instructions.includes("TemporalPlanningAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          recommendedTransition: "承接上一章留下的压力；如短跳，必须交代期间资源与敌情没有被清空。",
+          skipAllowed: true,
+          allowedSkipType: "direct_resume_or_short_skip",
+          allowedElapsed: "可短跳到同一压力继续发酵后的下一执行时刻。",
+          skipRationale: "时间跳跃服务场景推进，但不能绕开上一章交给本章的代价。",
+          mustCarryThrough: ["上一章章末压力", "资源消耗", "外部试探"],
+          offscreenChangesToMention: ["跳过期间人手已经按命令动起来"],
+          mustNotDo: ["不要用时间跳跃消除倒计时或伤势代价"],
+          timelineRisks: ["短跳后仍需让压力留在场内"],
+        }),
+      });
+    }
+
+    if (instructions.includes("TimelineAuditAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: "时间承接成立，未发现阻断问题。",
+          issues: [],
+          nextChapterGuardrails: ["下一章继续继承当前章末时间压力。"],
+        }),
+      });
+    }
+
+    if (instructions.includes("TimelineExtractionAgent")) {
+      const chapterId = inputText.match(/章节：(ch\d+)/)?.[1] || "ch001";
+      return jsonResponse({
+        output_text: JSON.stringify({
+          chapterTimeline: {
+            timeLabel: "本章发生在上一章压力之后的同一阶段。",
+            startState: "承接上一章章末压力。",
+            endState: "压力被推进到下一步执行窗口。",
+            timeTransition: "直接承接或短跳到后续执行时刻。",
+            skipType: "short_skip",
+            skipJustification: "跳过的是执行间隙，不跳过关键选择。",
+            offscreenChanges: ["相关人手已初步执行命令"],
+            activeDeadlines: ["上一章倒计时仍有效"],
+            resourceClockChanges: ["资源压力继续累积"],
+            unresolvedTemporalQuestions: ["下一章仍需承接外部试探"],
+            evidence: ["压力仍在场内"],
+          },
+          current: {
+            storyTime: "本章结束后的执行窗口",
+            primaryLocation: "赤屿内港",
+            temporalPressure: "下一轮试探正在逼近。",
+          },
+          deadlines: [
+            {
+              id: "deadline_main",
+              label: "外部试探窗口",
+              status: "active",
+              firstEstablishedChapter: chapterId,
+              latestMentionChapter: chapterId,
+              latestStatement: "下一轮试探正在逼近。",
+              narrativeMeaning: "后续章节不能无代价跳过。",
+              evidence: "下一轮更硬的条件已经在夜色里摆到门口。",
+            },
+          ],
+          warnings: [],
+          openTemporalQuestions: ["下一章仍需承接外部试探"],
+        }),
+      });
+    }
+
     if (instructions.includes("AuditAnalyzerAgent")) {
       return jsonResponse({
         output_text: JSON.stringify({
@@ -2368,6 +2436,38 @@ test("deleteLatestLockedChapter removes the latest committed chapter and restore
 
   const rerun = await runWriteChapter(store);
   assert.equal(rerun.project.phase.write.pendingReview?.chapterId, "ch001");
+})));
+
+test("deleteLatestLockedChapter clears deleted chapter runs and falls back to previous run", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-delete-latest-runs-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanFinal(store, {
+    approved: true,
+    feedback: "",
+  });
+
+  await lockNextChapter(store);
+  await lockNextChapter(store);
+
+  const beforeDeleteRuns = await store.listRuns("write", 20);
+  assert.ok(beforeDeleteRuns.some((run) => run.chapterId === "ch002"));
+
+  const deleted = await deleteLatestLockedChapter(store, { chapterId: "ch002" });
+  assert.equal(deleted.project.phase.write.currentChapterNumber, 1);
+  assert.equal(deleted.project.phase.write.pendingReview, null);
+
+  const afterDeleteRuns = await store.listRuns("write", 20);
+  assert.ok(afterDeleteRuns.length);
+  assert.equal(afterDeleteRuns[0].chapterId, "ch001");
+  assert.equal(deleted.project.phase.write.lastRunId, afterDeleteRuns[0].id);
+  assert.ok(afterDeleteRuns.every((run) => run.chapterId !== "ch002"));
+  assert.ok(
+    deleted.project.history.reviews.every((review) => review.chapterId !== "ch002"),
+  );
+  assert.equal(await store.loadChapterDraft("ch002"), null);
+  await assert.rejects(fs.access(path.join(tempRoot, "novel_state", "chapters", "ch002.md")));
 })));
 
 test("deleteLatestLockedChapter rejects deleting a non-latest committed chapter", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
@@ -3395,9 +3495,10 @@ test("chapter review supports partial rewrite with revision agent context and se
   const originalTitle = originalDraft.chapterMarkdown.split("\n")[0];
   const originalBody = originalDraft.chapterMarkdown.replace(/^#.+\n\n/u, "");
   const originalLines = originalBody.split("\n");
-  const selectedText = originalLines[1];
-  const prefixContext = `${originalLines[0]}\n`;
-  const suffixContext = `\n${originalLines.slice(2).join("\n")}`;
+  const selectedLineIndex = originalLines.findIndex((line) => line.trim());
+  const selectedText = originalLines[selectedLineIndex];
+  const prefixContext = originalLines.slice(0, selectedLineIndex).join("\n");
+  const suffixContext = originalLines.slice(selectedLineIndex + 1).join("\n");
 
   const previousFetch = globalThis.fetch;
   let sawRevisionPrompt = false;
@@ -3413,9 +3514,9 @@ test("chapter review supports partial rewrite with revision agent context and se
       assert.match(inputText, /原文全文：/);
       assert.match(inputText, /只允许改写的原文片段：/);
       assert.match(inputText, /作者修改要求：把这一段压得更紧，增加试探感。/);
-      assert.match(inputText, /风格指南：/);
-      assert.match(inputText, /整理后的写前上下文：/);
-      assert.match(inputText, /历史衔接摘要：/);
+      assert.match(inputText, /## 风格执行摘要/);
+      assert.match(inputText, /## 本章任务/);
+      assert.match(inputText, /## 时间合同/);
       assert.match(inputText, /输出要求：只输出替换片段本身/);
       return jsonResponse({
         output_text: "替换片段：李凡把话压得更低，先试出对方的底，再把下一步逼近眼前。",
@@ -3454,16 +3555,20 @@ test("chapter review supports partial rewrite with revision agent context and se
   assert.equal(sawRevisionPrompt, true);
   assert.equal(writerCallsAfterSelection, 0);
   assert.equal(rewrittenDraft.chapterMarkdown.split("\n")[0], originalTitle);
-  assert.equal(rewrittenLines[0], originalLines[0]);
-  assert.equal(rewrittenLines[2], originalLines[2]);
+  if (selectedLineIndex > 0) {
+    assert.equal(rewrittenLines[selectedLineIndex - 1], originalLines[selectedLineIndex - 1]);
+  }
+  if (selectedLineIndex + 1 < originalLines.length) {
+    assert.equal(rewrittenLines[selectedLineIndex + 1], originalLines[selectedLineIndex + 1]);
+  }
   assert.equal(rewrittenDraft.reviewState.mode, "partial_rewrite");
   assert.equal(rewrittenDraft.reviewState.strategy, "selection_patch");
   assert.equal(rewrittenDraft.reviewState.feedbackSupervisionPassed, true);
   assert.equal(rewrittenDraft.rewriteHistory.length, 1);
   assert.equal(rewrittenDraft.rewriteHistory[0].mode, "partial_rewrite");
   assert.equal(rewrittenDraft.rewriteHistory[0].feedbackSupervisionPassed, true);
-  assert.match(rewrittenLines[1], /李凡把话压得更低/);
-  assert.doesNotMatch(rewrittenLines[1], new RegExp(selectedText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(rewrittenLines[selectedLineIndex], /李凡把话压得更低/);
+  assert.doesNotMatch(rewrittenLines[selectedLineIndex], new RegExp(selectedText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 })));
 
 test("chapter review supports saving direct human edits to the staged chapter body", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
@@ -3521,9 +3626,10 @@ test("partial rewrite retries when the first revision is a no-op", async () => w
   const originalDraft = await store.loadChapterDraft("ch001");
   const originalBody = originalDraft.chapterMarkdown.replace(/^#.+\n\n/u, "");
   const originalLines = originalBody.split("\n");
-  const selectedText = originalLines[1];
-  const prefixContext = `${originalLines[0]}\n`;
-  const suffixContext = `\n${originalLines.slice(2).join("\n")}`;
+  const selectedLineIndex = originalLines.findIndex((line) => line.trim());
+  const selectedText = originalLines[selectedLineIndex];
+  const prefixContext = originalLines.slice(0, selectedLineIndex).join("\n");
+  const suffixContext = originalLines.slice(selectedLineIndex + 1).join("\n");
 
   const previousFetch = globalThis.fetch;
   let revisionCalls = 0;
@@ -3652,9 +3758,10 @@ test("partial rewrite stops at feedback manual review when supervision says the 
   const originalDraft = await store.loadChapterDraft("ch001");
   const originalBody = originalDraft.chapterMarkdown.replace(/^#.+\n\n/u, "");
   const originalLines = originalBody.split("\n");
-  const selectedText = originalLines[1];
-  const prefixContext = `${originalLines[0]}\n`;
-  const suffixContext = `\n${originalLines.slice(2).join("\n")}`;
+  const selectedLineIndex = originalLines.findIndex((line) => line.trim());
+  const selectedText = originalLines[selectedLineIndex];
+  const prefixContext = originalLines.slice(0, selectedLineIndex).join("\n");
+  const suffixContext = originalLines.slice(selectedLineIndex + 1).join("\n");
 
   const previousFetch = globalThis.fetch;
 
@@ -5902,6 +6009,146 @@ test("chat completion compatible providers still handle standard JSON responses"
   }
 }));
 
+test("chat completion providers ignore non-stream reasoning_content and keep final content only", async () => withIsolatedProviderEnv(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-chat-provider-reasoning-json-"));
+  const previousFetch = globalThis.fetch;
+
+  saveCodexApiConfig(tempRoot, {
+    model_provider: "DeepSeek",
+    model: "deepseek-v4-pro",
+    review_model: "deepseek-v4-pro",
+    codex_model: "deepseek-v4-pro",
+    model_providers: {
+      DeepSeek: {
+        api_key: "deepseek-key",
+      },
+    },
+  });
+
+  globalThis.fetch = async () => jsonResponse({
+    choices: [
+      {
+        message: {
+          role: "assistant",
+          reasoning_content: "hidden chain of thought",
+          content: "final-visible-answer",
+        },
+      },
+    ],
+  });
+
+  try {
+    const provider = createProvider({}, { rootDir: tempRoot });
+    const result = await provider.generateText({
+      instructions: "测试忽略非流式 reasoning_content",
+      input: "hello",
+    });
+
+    assert.equal(result.text, "final-visible-answer");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}));
+
+test("DeepSeek V4 Pro chat completions omit thinking mode by default", async () => withIsolatedProviderEnv(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-deepseek-chat-provider-plain-"));
+  const previousFetch = globalThis.fetch;
+
+  saveCodexApiConfig(tempRoot, {
+    model_provider: "DeepSeek",
+    model: "deepseek-v4-pro",
+    review_model: "deepseek-v4-pro",
+    codex_model: "deepseek-v4-pro",
+    model_reasoning_effort: "xhigh",
+    model_providers: {
+      DeepSeek: {
+        api_key: "deepseek-key",
+      },
+    },
+  });
+
+  let seenPayload = null;
+  globalThis.fetch = async (url, options = {}) => {
+    seenPayload = JSON.parse(String(options.body || "{}"));
+    return jsonResponse({
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: "DeepSeek says hello",
+          },
+        },
+      ],
+    });
+  };
+
+  try {
+    const provider = createProvider({}, { rootDir: tempRoot });
+    const result = await provider.generateText({
+      instructions: "测试 DeepSeek V4 Pro 非 thinking",
+      input: "hello",
+    });
+
+    assert.equal(result.text, "DeepSeek says hello");
+    assert.equal(seenPayload.model, "deepseek-v4-pro");
+    assert.equal("thinking" in seenPayload, false);
+    assert.equal("reasoning_effort" in seenPayload, false);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}));
+
+test("DeepSeek V4 Pro Thinking chat completions include thinking mode and mapped reasoning effort", async () => withIsolatedProviderEnv(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-deepseek-chat-provider-"));
+  const previousFetch = globalThis.fetch;
+
+  saveCodexApiConfig(tempRoot, {
+    model_provider: "DeepSeek",
+    model: "deepseek-v4-pro-thinking",
+    review_model: "deepseek-v4-pro-thinking",
+    codex_model: "deepseek-v4-pro-thinking",
+    model_reasoning_effort: "xhigh",
+    model_providers: {
+      DeepSeek: {
+        api_key: "deepseek-key",
+      },
+    },
+  });
+
+  let seenUrl = "";
+  let seenPayload = null;
+  globalThis.fetch = async (url, options = {}) => {
+    seenUrl = String(url || "");
+    seenPayload = JSON.parse(String(options.body || "{}"));
+    return jsonResponse({
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: "DeepSeek says hello",
+          },
+        },
+      ],
+    });
+  };
+
+  try {
+    const provider = createProvider({}, { rootDir: tempRoot });
+    const result = await provider.generateText({
+      instructions: "测试 DeepSeek V4 thinking",
+      input: "hello",
+    });
+
+    assert.equal(result.text, "DeepSeek says hello");
+    assert.equal(seenUrl, "https://api.deepseek.com/chat/completions");
+    assert.equal(seenPayload.model, "deepseek-v4-pro");
+    assert.deepEqual(seenPayload.thinking, { type: "enabled" });
+    assert.equal(seenPayload.reasoning_effort, "max");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}));
+
 test("provider logs failed chat completion requests with agent context", async () => withIsolatedProviderEnv(async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-provider-error-log-"));
   saveCodexApiConfig(tempRoot, {
@@ -6471,6 +6718,32 @@ test("Gemini provider settings use NovAI chat completions defaults", async () =>
   assert.equal(settings.reviewModel, "gemini-3.1-pro-preview");
   assert.equal(settings.codexResponseModel, "gemini-3.1-pro-preview");
   assert.equal(settings.maxConcurrency, 1);
+  assert.equal(settings.requestTimeoutMs, 300000);
+  assert.equal(settings.overloadRetryWindowMs, 1800000);
+  assert.equal(settings.hasApiKey, true);
+}));
+
+test("DeepSeek provider settings use official chat completions defaults", async () => withIsolatedProviderEnv(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-deepseek-provider-config-"));
+  saveCodexApiConfig(tempRoot, {
+    model_provider: "DeepSeek",
+    model_providers: {
+      DeepSeek: {
+        api_key: "deepseek-key",
+      },
+    },
+  });
+
+  const settings = resolveProviderSettings({}, tempRoot);
+  assert.equal(settings.providerId, "DeepSeek");
+  assert.equal(settings.providerName, "DeepSeek");
+  assert.equal(settings.configuredMode, "openai-chat-completions");
+  assert.equal(settings.effectiveMode, "openai-chat-completions");
+  assert.equal(settings.apiStyle, "chat_completions");
+  assert.equal(settings.baseUrl, "https://api.deepseek.com");
+  assert.equal(settings.responseModel, "deepseek-v4-pro");
+  assert.equal(settings.reviewModel, "deepseek-v4-pro");
+  assert.equal(settings.codexResponseModel, "deepseek-v4-pro");
   assert.equal(settings.requestTimeoutMs, 300000);
   assert.equal(settings.overloadRetryWindowMs, 1800000);
   assert.equal(settings.hasApiKey, true);

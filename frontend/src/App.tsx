@@ -294,6 +294,31 @@ function latestRun(snapshot: WorkspaceSnapshot | null, phase: "plan" | "write") 
   return snapshot?.runs?.[phase]?.[0] || null;
 }
 
+function chapterIdFromNumberValue(value?: number | string | null) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number) || number <= 0) {
+    return "";
+  }
+  return `ch${String(Math.trunc(number)).padStart(3, "0")}`;
+}
+
+function activeWriteChapterId(snapshot: WorkspaceSnapshot | null, pending: any) {
+  return (
+    pending?.chapterPlan?.chapterId ||
+    pending?.chapterId ||
+    chapterIdFromNumberValue(snapshot?.project?.phase?.write?.currentChapterNumber)
+  );
+}
+
+function latestWriteRunForChapter(snapshot: WorkspaceSnapshot | null, chapterId: string) {
+  if (!chapterId) {
+    return null;
+  }
+  return (snapshot?.runs?.write || []).find((run: any) =>
+    String(run?.chapterId || "").trim() === chapterId
+  ) || null;
+}
+
 function pendingReview(snapshot: WorkspaceSnapshot | null) {
   return snapshot?.project?.phase?.plan?.pendingReview || snapshot?.project?.phase?.write?.pendingReview || null;
 }
@@ -1496,12 +1521,12 @@ export default function App() {
 
   const buildWriteTimelineItems = (): TimelineItemType[] => {
     const write = snapshot?.project?.phase?.write;
-    const run = latestRun(snapshot, "write");
     const chapterParts = pending?.chapterMarkdown
       ? splitChapterMarkdownForReview(pending.chapterMarkdown, pending?.chapterPlan?.title || "")
       : null;
     const items: TimelineItemType[] = [];
-    const chapterId = pending?.chapterPlan?.chapterId || pending?.chapterId || "";
+    const chapterId = activeWriteChapterId(snapshot, pending);
+    const run = latestWriteRunForChapter(snapshot, chapterId);
     const directEditMode = Boolean(directEditWorkbenchState[chapterId]?.isEditing);
 
     if (run?.steps?.length) {

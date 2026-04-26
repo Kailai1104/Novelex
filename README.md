@@ -107,9 +107,12 @@ npm run dev:frontend
 
 - `OpenAI`
 - `MiniMax`
+- `DeepSeek`
 - `Gemini`
 - `web_search` MCP
 - `local_rag` MCP
+
+DeepSeek 的 `deepseek-v4-pro` 默认不附加 thinking 参数；如需开启 thinking 模式，可在模型槽位中填写 `deepseek-v4-pro-thinking`。
 
 是否实际可用取决于你填写的密钥、Base URL 和本地命令环境。
 

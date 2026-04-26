@@ -342,6 +342,31 @@ function latestRun(phase) {
   return snapshot?.runs?.[phase]?.[0] || null;
 }
 
+function chapterIdFromNumberValue(value = 0) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number) || number <= 0) {
+    return "";
+  }
+  return `ch${String(Math.trunc(number)).padStart(3, "0")}`;
+}
+
+function activeWriteChapterId(pending = null) {
+  return (
+    pending?.chapterPlan?.chapterId ||
+    pending?.chapterId ||
+    chapterIdFromNumberValue(snapshot?.project?.phase?.write?.currentChapterNumber)
+  );
+}
+
+function latestWriteRunForChapter(chapterId = "") {
+  if (!chapterId) {
+    return null;
+  }
+  return (snapshot?.runs?.write || []).find((run) =>
+    String(run?.chapterId || "").trim() === chapterId
+  ) || null;
+}
+
 function pendingReview() {
   return snapshot?.project?.phase?.plan?.pendingReview || snapshot?.project?.phase?.write?.pendingReview || null;
 }
@@ -1449,8 +1474,8 @@ function buildWriteTimelineItems() {
     ? splitChapterMarkdownForReview(pending.chapterMarkdown, pending?.chapterPlan?.title || "")
     : null;
   const items = [];
-  const run = latestRun("write");
-  const pendingChapterId = pending?.chapterPlan?.chapterId || pending?.chapterId || "";
+  const pendingChapterId = activeWriteChapterId(pending);
+  const run = latestWriteRunForChapter(pendingChapterId);
   const directEditWorkbench = pendingChapterId ? directEditWorkbenchFor(pendingChapterId, pending) : null;
   const directEditMode = Boolean(directEditWorkbench?.isEditing);
 

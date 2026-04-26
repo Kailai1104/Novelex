@@ -1623,6 +1623,33 @@ function providerSupportsNativeWebSearch(settings) {
   return settings.providerId === "MiniMax";
 }
 
+function providerUsesDeepSeekV4Thinking(settings = {}, model = "") {
+  if (String(settings.providerId || "").trim() !== "DeepSeek") {
+    return false;
+  }
+
+  return String(model || "").trim().toLowerCase() === "deepseek-v4-pro-thinking";
+}
+
+function resolveProviderWireModel(settings = {}, model = "") {
+  const normalizedModel = String(model || "").trim();
+  if (providerUsesDeepSeekV4Thinking(settings, normalizedModel)) {
+    return "deepseek-v4-pro";
+  }
+  return normalizedModel;
+}
+
+function mapDeepSeekReasoningEffort(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "max" || normalized === "high") {
+    return normalized;
+  }
+  if (normalized === "xhigh") {
+    return "max";
+  }
+  return "high";
+}
+
 function resolveSingleProviderSettings(projectState, rootDir = process.cwd(), options = {}) {
   const codexConfig = loadCodexApiConfig(rootDir);
   const providerConfig = {
@@ -2041,6 +2068,7 @@ function createSingleProviderClient(projectState, options = {}) {
     useCodexModel = false,
     useReviewModel = false,
     model,
+    reasoningEffort,
     temperature,
     tools,
     toolChoice,
@@ -2051,10 +2079,15 @@ function createSingleProviderClient(projectState, options = {}) {
   }) {
     const resolvedModel = pickModel({ useCodexModel, useReviewModel, model });
     const payload = {
-      model: resolvedModel,
+      model: resolveProviderWireModel(settings, resolvedModel),
       messages: normalizeChatMessages({ instructions, input, messages }),
       ...(extraBody || {}),
     };
+
+    if (providerUsesDeepSeekV4Thinking(settings, resolvedModel)) {
+      payload.thinking = { type: "enabled" };
+      payload.reasoning_effort = mapDeepSeekReasoningEffort(reasoningEffort || settings.reasoningEffort);
+    }
 
     if (Number.isFinite(Number(temperature))) {
       payload.temperature = Number(temperature);
@@ -2113,6 +2146,7 @@ function createSingleProviderClient(projectState, options = {}) {
     useCodexModel = false,
     useReviewModel = false,
     model,
+    reasoningEffort,
     temperature,
     tools,
     toolChoice,
@@ -2129,6 +2163,7 @@ function createSingleProviderClient(projectState, options = {}) {
         useCodexModel,
         useReviewModel,
         model,
+        reasoningEffort,
         temperature: omitTemperature ? undefined : temperature,
         tools,
         toolChoice,

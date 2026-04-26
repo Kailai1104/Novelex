@@ -236,12 +236,49 @@ test("compact writer prompt excludes raw context markdown and includes pacing co
   });
 
   assert.match(promptPacket.markdown, /目标篇幅约 4000 字/u);
+  assert.match(promptPacket.markdown, /## 时间合同/u);
   assert.match(promptPacket.markdown, /每场只兑现一个主要新增变化/u);
   assert.match(promptPacket.markdown, /1≈2000字/u);
   assert.match(promptPacket.markdown, /- 必须出场：李凡、林定海、马会魁/u);
   assert.match(promptPacket.markdown, /本章必须让以下具名角色在正文中实际出场或被直接点名：李凡、林定海、马会魁/u);
   assert.match(promptPacket.markdown, /检查舵链｜任务:让李凡用具体动作完成第一次技术判断｜出场:李凡、林定海、众水手/u);
   assert.equal(/HISTORY_RAW_MARKER|WRITER_RAW_MARKER|RESEARCH_RAW_MARKER|REFERENCE_RAW_MARKER|OPENING_RAW_MARKER/u.test(promptPacket.markdown), false);
+});
+
+test("writer prompt includes timeline skip contract when provided", () => {
+  const promptPacket = buildWriterPromptPacket({
+    project: baseProject(),
+    chapterPlan: baseChapterPlan(),
+    historyPacket: baseHistoryPacket(),
+    writerContextPacket: baseWriterContext(),
+    governance: baseGovernance(),
+    timelineContext: {
+      temporalPlanning: {
+        source: "agent",
+        recommendedTransition: "短跳到天亮前，但压力仍在场内。",
+        skipAllowed: true,
+        allowedSkipType: "short_skip",
+        allowedElapsed: "数个时辰",
+        skipRationale: "跳过重复赶路，保留资源消耗。",
+        mustCarryThrough: ["船体半残", "追兵压力"],
+        offscreenChangesToMention: ["水手轮值修补"],
+        mustNotDo: ["不能让追兵凭空消失"],
+      },
+      timelineState: {
+        deadlines: [
+          {
+            label: "天亮返航",
+            latestStatement: "追兵天亮后会返航",
+          },
+        ],
+      },
+    },
+  });
+
+  assert.match(promptPacket.markdown, /## 时间合同/u);
+  assert.match(promptPacket.markdown, /短跳到天亮前/u);
+  assert.match(promptPacket.markdown, /跳过后仍必须保留：船体半残/u);
+  assert.match(promptPacket.markdown, /有效倒计时：天亮返航/u);
 });
 
 test("project-2 ch002 fixture produces compact writer prompt without polluted names or object noise", async (t) => {

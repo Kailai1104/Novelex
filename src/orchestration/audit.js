@@ -7,6 +7,7 @@ import {
   resolveAuditDimensions,
 } from "../core/audit-dimensions.js";
 import { runAuditHeuristics } from "../core/audit-heuristics.js";
+import { runTimelineAuditAgent } from "../core/timeline.js";
 import {
   chapterNumberFromId,
   createExcerpt,
@@ -292,6 +293,7 @@ function buildSemanticAuditInput({
   recentChapters,
   characterBoundaryLines,
   factContext,
+  timelineContext,
 }) {
   const establishedFacts = (factContext?.establishedFacts || []);
   const openTensions = (factContext?.openTensions || []);
@@ -319,6 +321,7 @@ function buildSemanticAuditInput({
     `历史不可冲突点：\n- ${(historyPacket?.mustNotContradict || historyPacket?.continuityAnchors || []).join("\n- ") || "无"}`,
     `角色知识边界：\n- ${characterBoundaryLines.join("\n- ") || "无明确边界说明"}`,
     factBlock ? factBlock : "",
+    `时间线上下文：\n${timelineContext?.briefingMarkdown || "无"}`,
     `研究资料包：\n${researchPacket?.briefingMarkdown || "无"}`,
     `风格指南：\n${styleGuideText || "无"}`,
     `启用维度：\n${renderActiveDimensions(activeDimensions)}`,
@@ -340,6 +343,7 @@ async function runSemanticAudit({
   recentChapters,
   characterStates,
   factContext,
+  timelineContext,
 }) {
   const characterBoundaryLines = characterBoundaryNotes(characterStates, chapterPlan);
   const input = buildSemanticAuditInput({
@@ -354,6 +358,7 @@ async function runSemanticAudit({
     recentChapters,
     characterBoundaryLines,
     factContext,
+    timelineContext,
   });
 
   return generateStructuredObject(provider, {
@@ -562,6 +567,7 @@ export async function runChapterAudit({
   foreshadowingRegistry = null,
   chapterMetas = null,
   factContext = null,
+  timelineContext = null,
   skipSemanticAudit = false,
   skippedSemanticSummary = "",
   semanticSkipReason = "",
@@ -583,6 +589,7 @@ export async function runChapterAudit({
     foreshadowingRegistry,
     historyPacket,
     factContext,
+    timelineContext,
   });
   const allowedIds = new Set(activeDimensions.map((dimension) => dimension.id));
 
@@ -628,9 +635,34 @@ export async function runChapterAudit({
       recentChapters,
       characterStates,
       factContext,
+      timelineContext,
     });
 
-  const issues = dedupeIssues(semantic.issues);
+  let timelineAudit = null;
+  const timelineDimensionActive = activeDimensions.some((dimension) => dimension.id === "timeline_continuity");
+  if (!skipSemanticAudit && timelineDimensionActive) {
+    try {
+      timelineAudit = await runTimelineAuditAgent({
+        provider,
+        project,
+        chapterPlan,
+        chapterDraft,
+        timelineContext,
+      });
+    } catch (error) {
+      timelineAudit = {
+        summary: "",
+        issues: [],
+        nextChapterGuardrails: [],
+        error: error instanceof Error ? error.message : String(error || "Unknown timeline audit error"),
+      };
+    }
+  }
+
+  const issues = dedupeIssues([
+    ...(semantic.issues || []),
+    ...(timelineAudit?.issues || []),
+  ]);
   const score = Number.isFinite(Number(semantic.score))
     ? Math.max(0, Math.min(100, Math.round(Number(semantic.score))))
     : heuristicScore(issues);
@@ -659,7 +691,10 @@ export async function runChapterAudit({
     heuristics: semantic.heuristics || null,
     sequenceSnapshot: semantic.sequenceSnapshot,
     staleForeshadowings: semantic.staleForeshadowings,
-    nextChapterGuardrails: semantic.nextChapterGuardrails,
+    nextChapterGuardrails: unique([
+      ...(semantic.nextChapterGuardrails || []),
+      ...(timelineAudit?.nextChapterGuardrails || []),
+    ]).slice(0, 8),
     auditDegraded: false,
     semanticAudit: {
       source: semantic.source,
@@ -667,6 +702,7 @@ export async function runChapterAudit({
       error: semantic.error,
       attempts: semantic.attempts || 0,
     },
+    timelineAudit,
   };
 
   validation.consistency = buildLegacyBucket(activeDimensions, dimensionResults, issues, "consistency");

@@ -59,6 +59,13 @@ import {
   saveChapterFacts,
 } from "../core/facts.js";
 import {
+  buildTimelineContextPacket,
+  loadTimelineState,
+  runTemporalPlanningAgent,
+  runTimelineExtractionAgent,
+  updateTimelineStateAfterChapter,
+} from "../core/timeline.js";
+import {
   collectAuditRepairNotes,
   needsAuditStyleRepair,
   runChapterAudit,
@@ -735,7 +742,7 @@ function resolveOutlineContexts({
   };
 }
 
-function auditChapterOutlineCandidate(candidate, contract = {}, chapterSlot = null) {
+function auditChapterOutlineCandidate(candidate, contract = {}, chapterSlot = null, characterKnowledgeBoundary = null) {
   const firstScene = candidate?.chapterPlan?.scenes?.[0] || null;
   const firstSceneText = stringifyForGovernance({
     entryLink: candidate?.chapterPlan?.entryLink,
@@ -746,19 +753,34 @@ function auditChapterOutlineCandidate(candidate, contract = {}, chapterSlot = nu
     outcome: firstScene?.outcome,
     tension: firstScene?.tension,
   });
+  const deterministicIssues = [];
+  if (contract?.forbidRestartOpening && RESTART_OPENING_PATTERN.test(firstSceneText)) {
+    deterministicIssues.push("第一场含有惊醒/醒来/穿越式重开开篇元素，违反 forbidRestartOpening。");
+  }
+  if (IDENTITY_RECONFIRM_PATTERN.test(firstSceneText)) {
+    deterministicIssues.push("第一场重新确认身份或自己是谁，和已定稿连续性冲突。");
+  }
+  if (REPLAY_FIRST_CHAPTER_PATTERN.test(firstSceneText)) {
+    deterministicIssues.push("第一场把已完成的开篇立威/证明重写成首次发生。");
+  }
+  const knowledgeBoundaryIssues = collectUnsupportedCharacterKnowledgeClaims(candidate, characterKnowledgeBoundary);
+  const issues = normalizeStringList([
+    ...deterministicIssues,
+    ...knowledgeBoundaryIssues,
+  ], 12);
   return {
     proposalId: candidate?.proposalId || "",
-    passed: true,
-    score: 100,
-    issues: [],
+    passed: issues.length === 0,
+    score: issues.length ? Math.max(0, 100 - (issues.length * 35)) : 100,
+    issues,
     warnings: [],
     firstSceneText: createExcerpt(firstSceneText, 320),
   };
 }
 
-function auditChapterOutlineCandidates(candidates = [], contract = {}, chapterSlot = null) {
+function auditChapterOutlineCandidates(candidates = [], contract = {}, chapterSlot = null, characterKnowledgeBoundary = null) {
   const audits = (Array.isArray(candidates) ? candidates : []).map((candidate) =>
-    auditChapterOutlineCandidate(candidate, contract, chapterSlot));
+    auditChapterOutlineCandidate(candidate, contract, chapterSlot, characterKnowledgeBoundary));
   const acceptedIds = new Set(audits.filter((item) => item.passed).map((item) => item.proposalId));
   const accepted = candidates.filter((candidate) => acceptedIds.has(candidate.proposalId));
   return {
@@ -808,6 +830,9 @@ function normalizeOutlineConsistencyIssue(rawIssue, index = 0, source = "semanti
 }
 
 function deterministicOutlineIssueId(text = "") {
+  if (/角色知识边界|情报来源边界|缺少证据支持其知道/u.test(text)) {
+    return "outline_character_knowledge_boundary";
+  }
   if (/首次证明|首次立威/u.test(text)) {
     return "outline_replay_first_chapter_conflict";
   }
@@ -824,6 +849,9 @@ function deterministicOutlineIssueId(text = "") {
 }
 
 function deterministicOutlineSuggestion(text = "", severity = "critical") {
+  if (/角色知识边界|情报来源边界|缺少证据支持其知道/u.test(text)) {
+    return "删除由该角色供出/掌握的无证据情报；改用已出场账册、旁证、许三娘或李凡已有判断推进，或保留为未证实疑问。";
+  }
   if (/首次证明|首次立威/u.test(text)) {
     return "改写成上一章结果上的更高风险下一步，不要把已完成事件重写成首次发生。";
   }
@@ -1100,6 +1128,8 @@ function buildOutlineConsistencyAuditInput({
   historyPlanning,
   continuityPlanning,
   factContext,
+  timelineContext = null,
+  characterKnowledgeBoundary = null,
   committedOutlines = [],
   candidates = [],
 }) {
@@ -1132,6 +1162,8 @@ function buildOutlineConsistencyAuditInput({
     `章节衔接规划：入口=${continuityPlanning?.entryLink || "无"}｜主承接线程=${continuityPlanning?.dominantCarryoverThread || "无"}｜必须推进到=${continuityPlanning?.mustAdvanceThisChapter || "无"}｜章末递交压力=${continuityPlanning?.exitPressureToNextChapter || "无"}`,
     `必须继承的已定事实：${factSections.establishedFactsLine}`,
     `可以继续发酵但不能改写底层结论的开放张力：${factSections.openTensionsLine}`,
+    `时间线合同：\n${timelineContext?.briefingMarkdown || "无"}`,
+    `角色知识边界：\n${renderCharacterKnowledgeBoundary(characterKnowledgeBoundary)}`,
     `上一章锁定细纲：\n${previousOutline ? [
       `- 章节：${previousOutline.chapterId} ${previousOutline.title}`,
       `- 主线：${previousOutline.dominantThread || "无"}`,
@@ -1160,6 +1192,8 @@ async function runChapterOutlineConsistencyAuditAgent({
   historyPlanning,
   continuityPlanning,
   factContext,
+  timelineContext = null,
+  characterKnowledgeBoundary = null,
   committedOutlines = [],
   candidates = [],
 }) {
@@ -1177,6 +1211,8 @@ async function runChapterOutlineConsistencyAuditAgent({
         historyPlanning,
         continuityPlanning,
         factContext,
+        timelineContext,
+        characterKnowledgeBoundary,
         committedOutlines,
         candidates,
       }),
@@ -1294,6 +1330,8 @@ async function runChapterOutlineRepairAgent({
       `章节衔接：入口=${resources.chapterOutlineContext?.continuityPlanning?.entryLink || "无"}｜主承接线程=${resources.chapterOutlineContext?.continuityPlanning?.dominantCarryoverThread || "无"}｜章末递交压力=${resources.chapterOutlineContext?.continuityPlanning?.exitPressureToNextChapter || "无"}`,
       `必须继承的已定事实：${factSections.establishedFactsLine}`,
       `可以继续发酵但不能改写底层结论的开放张力：${factSections.openTensionsLine}`,
+      `时间线合同：\n${resources.timelineContext?.briefingMarkdown || resources.chapterOutlineContext?.timelineContext?.briefingMarkdown || "无"}`,
+      `角色知识边界：\n${renderCharacterKnowledgeBoundary(resources.characterKnowledgeBoundary || resources.chapterOutlineContext?.characterKnowledgeBoundary || null)}`,
       authorFeedback ? `作者补充要求：${authorFeedback}` : "",
       `待修候选数量：${(Array.isArray(candidates) ? candidates : []).length}。必须为每个待修候选返回且仅返回一个修复后 proposal；优先保留原 proposalId，且不得合并或省略候选。`,
       `待修候选 proposalId：${(Array.isArray(candidates) ? candidates : []).map((candidate) => candidate.proposalId).join("、") || "无"}`,
@@ -1470,6 +1508,7 @@ async function runChapterOutlineConsistencyLoop({
       currentCandidates,
       resources.outlineGenerationContract,
       resources.chapterSlot,
+      resources.characterKnowledgeBoundary || resources.chapterOutlineContext?.characterKnowledgeBoundary || null,
     );
     const semanticCandidates = deterministic.accepted;
     const semantic = semanticCandidates.length
@@ -1483,6 +1522,8 @@ async function runChapterOutlineConsistencyLoop({
         historyPlanning: resources.chapterOutlineContext.historyPlanning,
         continuityPlanning: resources.chapterOutlineContext.continuityPlanning,
         factContext: resources.factContext,
+        timelineContext: resources.timelineContext || resources.chapterOutlineContext?.timelineContext || null,
+        characterKnowledgeBoundary: resources.characterKnowledgeBoundary || resources.chapterOutlineContext?.characterKnowledgeBoundary || null,
         committedOutlines: resources.committedOutlines || [],
         candidates: semanticCandidates,
       })
@@ -2945,6 +2986,7 @@ async function applyTargetedPartialRepair({
     selection,
     currentDraftMarkdown: chapterDraft.markdown,
     factContext: rewriteContext.factContext || null,
+    timelineContext: rewriteContext.timelineContext || null,
     promptTelemetry: rewriteContext.promptTelemetry || null,
   });
   if (!replacementFragment || !fragmentChanged(selection.selectedText, replacementFragment)) {
@@ -3382,6 +3424,181 @@ function buildFactPromptSections(factContext = null) {
     openTensionsLine: formatFactPromptList(factContext?.openTensions || []) || "无",
     selectionRationale: String(factContext?.selectionRationale || "").trim() || "无",
   };
+}
+
+const CHARACTER_KNOWLEDGE_AUDIT_TERMS = [
+  "孙掌柜",
+  "月港",
+  "海澄",
+  "水寨",
+  "兑票",
+  "欠票",
+  "账册",
+  "若昂",
+  "陈德科",
+  "澳门",
+  "马尼拉",
+  "唐家",
+  "唐鹞",
+  "巡船",
+  "巡哨船",
+  "七星礁",
+  "官军",
+  "封锁",
+  "船由",
+  "商引",
+  "布防",
+  "换防",
+  "设伏",
+  "眼线",
+  "追踪",
+  "望远镜",
+  "外室",
+  "货栈",
+  "暗门",
+  "茶肆",
+  "悬赏",
+];
+const CHARACTER_KNOWLEDGE_CLAIM_PATTERN =
+  /知道|知晓|掌握|清楚|吐露|透露|交代|供出|说出|招认|问出|套出|追问|审问|审讯|逼问|提审|盘问|拷问|隐瞒|藏着|藏住|压着|说漏/u;
+const NEGATED_KNOWLEDGE_CLAIM_PATTERN = /不知|不知道|并不知道|无从知道|没有证据|缺乏证据|不支持|不能写成|不得写成|禁止/u;
+
+function escapeRegExp(value = "") {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function buildCharacterKnowledgeBoundary({ characterStates = [], factContext = null } = {}) {
+  const states = Array.isArray(characterStates) ? characterStates : [];
+  if (!states.length) {
+    return null;
+  }
+
+  const facts = [
+    ...(factContext?.establishedFacts || []),
+    ...(factContext?.openTensions || []),
+  ];
+
+  const characters = states
+    .map((state) => {
+      const name = String(state?.name || "").trim();
+      if (!name) {
+        return null;
+      }
+      const relationshipText = Object.values(state?.relationships || {})
+        .map((relationship) => [
+          relationship?.dynamic,
+          relationship?.last_interaction_summary,
+        ].filter(Boolean).join("；"))
+        .join("；");
+      const relevantFacts = facts.filter((fact) => stringifyForGovernance({
+        subject: fact?.subject,
+        assertion: fact?.assertion,
+        evidence: fact?.evidence,
+      }).includes(name));
+      const corpus = [
+        name,
+        ...(state?.knowledge?.knows || []),
+        ...(state?.knowledge?.does_not_know || []),
+        ...(state?.psychological?.key_beliefs || []),
+        state?.psychological?.current_goal,
+        state?.arc_progress?.arc_note,
+        relationshipText,
+        ...relevantFacts.map((fact) => `${fact?.subject || ""}｜${fact?.assertion || ""}｜${fact?.evidence || ""}`),
+      ].filter(Boolean).join("；");
+      const supportedTerms = CHARACTER_KNOWLEDGE_AUDIT_TERMS.filter((term) => corpus.includes(term));
+      return {
+        name,
+        supportedTerms: normalizeStringList(supportedTerms, 20),
+        knows: normalizeStringList(state?.knowledge?.knows || [], 8),
+        doesNotKnow: normalizeStringList(state?.knowledge?.does_not_know || [], 8),
+      };
+    })
+    .filter(Boolean);
+
+  return {
+    generatedAt: nowIso(),
+    rule: "角色只能吐露、被审出或主动运用其状态与相关事实中已有证据支持的信息；不得把全局粗纲信息自动视为该角色已知。",
+    auditTerms: CHARACTER_KNOWLEDGE_AUDIT_TERMS,
+    characters,
+  };
+}
+
+function renderCharacterKnowledgeBoundary(characterKnowledgeBoundary = null) {
+  const characters = Array.isArray(characterKnowledgeBoundary?.characters)
+    ? characterKnowledgeBoundary.characters
+    : [];
+  if (!characters.length) {
+    return "无角色知识边界包。";
+  }
+  return [
+    characterKnowledgeBoundary.rule ||
+      "角色只能吐露、被审出或主动运用其状态与相关事实中已有证据支持的信息。",
+    "硬规则：若某角色的 supportedTerms 中没有某个专名/地点/组织/制度，不得写成该角色知道、吐露、被审出或隐瞒该信息；需要推进时改用账册、旁证、许三娘/李凡已有判断，或写成未证实疑问。",
+    ...characters.map((character) => [
+      `- ${character.name}`,
+      `  supportedTerms：${(character.supportedTerms || []).join("；") || "无"}`,
+      `  knows：${(character.knows || []).join("；") || "无"}`,
+      `  doesNotKnow：${(character.doesNotKnow || []).join("；") || "无"}`,
+    ].join("\n")),
+  ].join("\n");
+}
+
+function windowSuggestsCharacterKnowledgeClaim(windowText = "", name = "", term = "") {
+  const escapedName = escapeRegExp(name);
+  const escapedTerm = escapeRegExp(term);
+  const nameThenKnowledge = new RegExp(
+    `${escapedName}.{0,80}(?:知道|知晓|掌握|清楚|吐露|透露|交代|供出|说出|招认|隐瞒|藏着|藏住|压着|说漏|被审|被问|被逼).{0,80}${escapedTerm}`,
+    "u",
+  );
+  const interrogateCharacterForTerm = new RegExp(
+    `(?:审问|审讯|逼问|追问|提审|盘问|拷问|问出|套出).{0,40}${escapedName}.{0,100}${escapedTerm}|${escapedName}.{0,40}(?:审问|审讯|逼问|追问|提审|盘问|拷问|问出|套出).{0,100}${escapedTerm}`,
+    "u",
+  );
+  return nameThenKnowledge.test(windowText) || interrogateCharacterForTerm.test(windowText);
+}
+
+function collectUnsupportedCharacterKnowledgeClaims(value, characterKnowledgeBoundary = null) {
+  const text = stringifyForGovernance(value);
+  const characters = Array.isArray(characterKnowledgeBoundary?.characters)
+    ? characterKnowledgeBoundary.characters
+    : [];
+  if (!text || !characters.length) {
+    return [];
+  }
+
+  const issues = [];
+  for (const character of characters) {
+    const name = String(character?.name || "").trim();
+    if (!name || !text.includes(name)) {
+      continue;
+    }
+    const supported = new Set(character?.supportedTerms || []);
+    let searchFrom = 0;
+    while (searchFrom < text.length) {
+      const index = text.indexOf(name, searchFrom);
+      if (index === -1) {
+        break;
+      }
+      const windowText = text.slice(Math.max(0, index - 90), Math.min(text.length, index + name.length + 120));
+      searchFrom = index + name.length;
+      if (NEGATED_KNOWLEDGE_CLAIM_PATTERN.test(windowText) || !CHARACTER_KNOWLEDGE_CLAIM_PATTERN.test(windowText)) {
+        continue;
+      }
+      const unsupportedTerms = normalizeStringList(
+        CHARACTER_KNOWLEDGE_AUDIT_TERMS.filter((term) =>
+          windowText.includes(term) &&
+          !supported.has(term) &&
+          windowSuggestsCharacterKnowledgeClaim(windowText, name, term)),
+        8,
+      );
+      if (!unsupportedTerms.length) {
+        continue;
+      }
+      issues.push(`角色知识边界：${name} 缺少证据支持其知道、吐露、被审出或隐瞒「${unsupportedTerms.join("、")}」；不要把这些内容写成由${name}供出或掌握。`);
+    }
+  }
+
+  return normalizeStringList(issues, 12);
 }
 
 async function selectFactContextForChapter({
@@ -4017,6 +4234,7 @@ export function buildWriterPromptPacket({
   revisionNotes = [],
   mode = "draft",
   factContext = null,
+  timelineContext = null,
 }) {
   const povCharacter = chapterPlan?.povCharacter || project?.protagonistName || "主角";
   const targetWords = Number(project?.targetWordsPerChapter || 0);
@@ -4026,6 +4244,18 @@ export function buildWriterPromptPacket({
     ...buildHardConstraintLines(governance, factContext),
   ], 12);
   const openTensions = buildOpenTensionLines(factContext);
+  const temporalPlanning = timelineContext?.temporalPlanning || null;
+  const timelineContract = normalizeStringList([
+    temporalPlanning?.recommendedTransition ? `开场时间承接：${temporalPlanning.recommendedTransition}` : "",
+    temporalPlanning ? `时间跳跃：${temporalPlanning.skipAllowed ? "允许，但必须交代逻辑与代价" : "不建议主动跳时"}` : "",
+    temporalPlanning?.allowedSkipType ? `允许跳跃方式：${temporalPlanning.allowedSkipType}` : "",
+    temporalPlanning?.allowedElapsed ? `可跳过范围：${temporalPlanning.allowedElapsed}` : "",
+    temporalPlanning?.skipRationale ? `跳时理由：${temporalPlanning.skipRationale}` : "",
+    ...(temporalPlanning?.mustCarryThrough || []).map((item) => `跳过后仍必须保留：${item}`),
+    ...(temporalPlanning?.offscreenChangesToMention || []).map((item) => `离屏变化需要交代：${item}`),
+    ...(temporalPlanning?.mustNotDo || []).map((item) => `禁止时间处理：${item}`),
+    ...((timelineContext?.timelineState?.deadlines || []).slice(0, 4).map((item) => `有效倒计时：${item.label}｜${item.latestStatement || item.narrativeMeaning || item.status}`)),
+  ], 12);
   const currentTask = normalizeStringList(governance?.ruleStack?.currentTask || [], 6);
   const deferRules = normalizeStringList(governance?.ruleStack?.deferRules || [], 6);
   const executionReminders = normalizeStringList([
@@ -4072,6 +4302,9 @@ export function buildWriterPromptPacket({
     `- 必须落地：${(chapterPlan.keyEvents || []).join("；") || "无"}`,
     `- 伏笔任务：${foreshadowingSummary || "无"}`,
     `- 连续性锚点：${continuityAnchors.join("；") || "无"}`,
+    "",
+    "## 时间合同",
+    `- ${timelineContract.join("\n- ") || "无"}`,
     "",
     "## 节奏合同",
     `- ${pacingContract.join("\n- ") || "无"}`,
@@ -4154,6 +4387,7 @@ function chapterPromptInput({
   revisionNotes = [],
   mode = "draft",
   factContext = null,
+  timelineContext = null,
 }) {
   return buildWriterPromptPacket({
     project,
@@ -4172,6 +4406,7 @@ function chapterPromptInput({
     revisionNotes,
     mode,
     factContext,
+    timelineContext,
   }).markdown;
 }
 
@@ -4231,6 +4466,7 @@ function partialRevisionPromptInput({
   selection = null,
   currentDraftMarkdown = "",
   factContext = null,
+  timelineContext = null,
   promptPacket = null,
 }) {
   const normalizedSelection = normalizeChapterSelection(selection);
@@ -4251,6 +4487,7 @@ function partialRevisionPromptInput({
     revisionNotes: [feedback].filter(Boolean),
     mode: "partial_rewrite",
     factContext,
+    timelineContext,
   });
   return [
     writerPromptPacket.markdown,
@@ -4284,6 +4521,7 @@ async function generateChapterPartialRevisionText({
   selection = null,
   currentDraftMarkdown = "",
   factContext = null,
+  timelineContext = null,
   promptTelemetry = null,
 }) {
   const writerPromptPacket = buildWriterPromptPacket({
@@ -4303,6 +4541,7 @@ async function generateChapterPartialRevisionText({
     revisionNotes: [feedback].filter(Boolean),
     mode: "partial_rewrite",
     factContext,
+    timelineContext,
   });
   if (promptTelemetry && typeof promptTelemetry === "object") {
     promptTelemetry.writerPromptPacket = writerPromptPacket;
@@ -4328,6 +4567,7 @@ async function generateChapterPartialRevisionText({
       selection,
       currentDraftMarkdown,
       factContext,
+      timelineContext,
       promptPacket: writerPromptPacket,
     }),
     metadata: {
@@ -4358,6 +4598,7 @@ async function generateChapterDraftText({
   mode = "draft",
   currentDraft = null,
   factContext = null,
+  timelineContext = null,
   promptTelemetry = null,
 }) {
   const targetedRepairMode = mode === "targeted_repair";
@@ -4387,6 +4628,7 @@ async function generateChapterDraftText({
     revisionNotes,
     mode,
     factContext,
+    timelineContext,
   });
   if (promptTelemetry && typeof promptTelemetry === "object") {
     promptTelemetry.writerPromptPacket = writerPromptPacket;
@@ -4507,6 +4749,8 @@ function buildOutlineContextMarkdown({
   contextConflicts,
   outlineGenerationContract,
   factContext,
+  timelineContext,
+  characterKnowledgeBoundary,
   outlineOptions,
   foreshadowingActions,
   legacyPlan,
@@ -4575,6 +4819,12 @@ function buildOutlineContextMarkdown({
     `- 必须继承的已定事实：${factSections.establishedFactsLine}`,
     `- 可以继续发酵但不能改写底层结论的开放张力：${factSections.openTensionsLine}`,
     `- 筛选理由：${factSections.selectionRationale}`,
+    "",
+    "## 时间线合同",
+    timelineContext?.briefingMarkdown || "无",
+    "",
+    "## 角色知识边界",
+    renderCharacterKnowledgeBoundary(characterKnowledgeBoundary),
     "",
     "## 章节衔接",
     `- Entry Mode：${continuityPlanning.entryMode || "direct_resume"}`,
@@ -5089,11 +5339,13 @@ async function runStagePlanningContextAgent({
   legacyPlan,
   committedOutlines = [],
   factContext = null,
+  timelineContext = null,
   continuityGuard = null,
+  characterKnowledgeBoundary = null,
 }) {
   const factSections = buildFactPromptSections(factContext);
   const result = await provider.generateText({
-    agentComplexity: "simple",
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 StagePlanningContextAgent。你负责把当前章节在全书粗纲与当前阶段中的任务提炼出来，供后续章节细纲候选生成使用。必须服从章节锚点、已定稿历史与连续性护栏；chN>1 默认承接前章，不能重开第一章。不要写正文，不要写章节方案，只输出当前章节的义务、延后项、冲突轴和标题信号。只输出 JSON。",
     input: [
@@ -5112,6 +5364,8 @@ async function runStagePlanningContextAgent({
       `已定稿历史摘要：\n${summarizeCommittedHistoryForPrompt(committedOutlines).slice(0, 2400) || "无已定稿历史"}`,
       `必须继承的已定事实：${factSections.establishedFactsLine}`,
       `可以继续发酵但不能改写底层结论的开放张力：${factSections.openTensionsLine}`,
+      `时间线合同：\n${timelineContext?.briefingMarkdown || "无"}`,
+      `角色知识边界：\n${renderCharacterKnowledgeBoundary(characterKnowledgeBoundary)}`,
       `连续性护栏：允许入口=${(continuityGuard?.allowedEntryModes || []).join("；") || "无"}｜禁止重开=${(continuityGuard?.forbiddenRestartTerms || []).join("；") || "无"}｜上章压力=${continuityGuard?.resumeFrom || "无"}`,
       `伏笔任务：${foreshadowingActions.length ? foreshadowingActions.map((item) => `${item.action}:${item.id}:${item.description}`).join("；") : "无"}`,
       legacyPlan ? `旧版章卡参考：${legacyPlan.title}｜${legacyPlan.keyEvents.join("；")}｜${legacyPlan.nextHook}` : "旧版章卡参考：无",
@@ -5282,13 +5536,15 @@ async function runChapterContinuityAgent({
   chapterSlot = null,
   continuityGuard = null,
   factContext = null,
+  timelineContext = null,
+  characterKnowledgeBoundary = null,
   previousOutline,
   nextLegacyPlan = null,
 }) {
   const previousPlan = previousOutline?.chapterPlan || null;
   const factSections = buildFactPromptSections(factContext);
   const result = await provider.generateText({
-    agentComplexity: "simple",
+    agentComplexity: "complex",
     instructions:
       "你是 Novelex 的 ChapterContinuityAgent。你专门负责章节之间的细粒度衔接：上一章怎么接进来、当前章主承接哪条线、哪些副线只能轻触、以及本章结尾要把什么压力递交给下一章。你只能在提供的证据范围内组织承接方式，不允许自由脑补失去意识、惊醒、重新确认身份等桥段。不要做全书语义总结，不要生成细纲或正文，只输出 JSON。",
     input: [
@@ -5304,6 +5560,8 @@ async function runChapterContinuityAgent({
       `历史优先线程：${(historyPlanning.priorityThreads || []).join("；") || "无"}`,
       `必须继承的已定事实：${factSections.establishedFactsLine}`,
       `可以继续发酵但不能改写底层结论的开放张力：${factSections.openTensionsLine}`,
+      `时间线合同：\n${timelineContext?.briefingMarkdown || "无"}`,
+      `角色知识边界：\n${renderCharacterKnowledgeBoundary(characterKnowledgeBoundary)}`,
       `连续性护栏：默认入口=${continuityGuard?.defaultEntryMode || "direct_resume"}｜允许入口=${(continuityGuard?.allowedEntryModes || []).join("；") || "无"}｜上章压力=${continuityGuard?.resumeFrom || "无"}｜证据引用=${(continuityGuard?.mandatoryEvidenceRefs || []).join("；") || "无"}`,
       `上一章定稿细纲：\n${previousPlan ? [
         `- 章节：${previousPlan.chapterId} ${previousPlan.title}`,
@@ -5415,6 +5673,8 @@ function buildChapterOutlineVariantInput({
   outlineGenerationContract = null,
   contextConflicts = null,
   factContext = null,
+  timelineContext = null,
+  characterKnowledgeBoundary = null,
   foreshadowingActions = [],
   styleGuideText,
   openingReferencePacket = null,
@@ -5442,6 +5702,8 @@ function buildChapterOutlineVariantInput({
     `关系压力：${(characterPlanning.relationshipPressures || []).join("；") || "无"}`,
     `必须继承的已定事实：${factSections.establishedFactsLine}`,
     `可以继续发酵但不能改写底层结论的开放张力：${factSections.openTensionsLine}`,
+    `时间线合同：\n${timelineContext?.briefingMarkdown || "无"}`,
+    `角色知识边界：\n${renderCharacterKnowledgeBoundary(characterKnowledgeBoundary)}`,
     `历史承接：事实=${(historyPlanning.carryOverFacts || []).join("；") || "无"}｜优先线程=${(historyPlanning.priorityThreads || []).join("；") || "无"}｜背景线程=${(historyPlanning.backgroundThreads || []).join("；") || "无"}｜压低线程=${(historyPlanning.suppressedThreads || []).join("；") || "无"}｜余波=${historyPlanning.lastEnding || "无"}`,
     `连续性护栏：默认入口=${continuityGuard?.defaultEntryMode || "direct_resume"}｜允许入口=${(continuityGuard?.allowedEntryModes || []).join("；") || "无"}｜必须引用=${(outlineGenerationContract?.mandatoryEvidenceRefs || []).join("；") || "无"}｜上章压力=${continuityGuard?.resumeFrom || "无"}`,
     `章节衔接：开场承接=${continuityPlanning.entryLink || "无"}｜入口模式=${continuityPlanning.entryMode || "direct_resume"}｜主承接线程=${continuityPlanning.dominantCarryoverThread || "无"}｜必须推进到=${continuityPlanning.mustAdvanceThisChapter || "无"}｜章末递交压力=${continuityPlanning.exitPressureToNextChapter || "无"}｜连贯性风险=${(continuityPlanning.continuityRisks || []).join("；") || "无"}｜不支持声明=${(continuityPlanning.unsupportedClaims || []).join("；") || "无"}`,
@@ -5465,7 +5727,7 @@ function buildChapterOutlineVariantInput({
     `冲突轴：${variantBrief.conflictAxis}`,
     `人物焦点：${variantBrief.characterBias}`,
     `章末压力偏向：${variantBrief.endingPressure}`,
-    "生成要求：先判断本章是 single_spine / dual_spine / braided。若是 single_spine，大多数 scenes 必须服务同一条主线，后一场必须承接前一场的结果、信息或压力；若是 dual_spine 或 braided，每个 scene 必须标明 threadId，并让切线有明确因果，不要机械切场。第一场必须响应“开场承接”，末场必须落到“章末递交压力”。每个 scene 都要说明它承接了什么、产出了什么、把什么问题交给下一场。",
+    "生成要求：先判断本章是 single_spine / dual_spine / braided。若是 single_spine，大多数 scenes 必须服务同一条主线，后一场必须承接前一场的结果、信息或压力；若是 dual_spine 或 braided，每个 scene 必须标明 threadId，并让切线有明确因果，不要机械切场。第一场必须响应“开场承接”和“时间线合同”，末场必须落到“章末递交压力”。如果使用时间跳跃，必须在 timeInStory、entryLink、continuityAnchors 与第一场 inheritsFromPrevious 中说明跳过的故事时间、跳过期间保留的代价和未解决压力；不要为了跳时清空资源、伤势、敌情或倒计时。",
     "硬规则：当 forbidRestartOpening=true 时，第一场不得出现惊醒/醒来/重新确认身份/重新穿越；只有证据允许时才可使用 wake_after_unconsciousness。",
     `请输出 JSON：
 {
@@ -5690,6 +5952,10 @@ async function prepareChapterOutlineResources({
   if (factContextWarning) {
     warnings.push(factContextWarning);
   }
+  const characterKnowledgeBoundary = buildCharacterKnowledgeBoundary({
+    characterStates: currentCharacterStates,
+    factContext,
+  });
 
   const continuityGuard = await buildDeterministicContinuityGuard({
     provider,
@@ -5704,6 +5970,28 @@ async function prepareChapterOutlineResources({
     chapterSlot,
     continuityGuard,
   });
+  const timelineState = await loadTimelineState(store);
+  const previousChapterId = chapterNumber > 1 ? chapterIdFromNumber(chapterNumber - 1) : "";
+  const previousChapterTail = previousChapterId
+    ? createExcerpt(
+      await store.readText(path.join(store.paths.chaptersDir, `${previousChapterId}.md`), ""),
+      900,
+    )
+    : "";
+  const temporalPlanning = await runTemporalPlanningAgent({
+    provider,
+    project,
+    chapterPlan: chapterBase,
+    timelineState,
+    previousOutline: committedOutlines.at(-1) || null,
+    previousChapterTail,
+    factContext,
+  });
+  const timelineContext = buildTimelineContextPacket({
+    chapterPlan: chapterBase,
+    timelineState,
+    temporalPlanning,
+  });
 
   stagePlanning = await runStagePlanningContextAgent({
     provider,
@@ -5716,7 +6004,9 @@ async function prepareChapterOutlineResources({
     legacyPlan,
     committedOutlines,
     factContext,
+    timelineContext,
     continuityGuard,
+    characterKnowledgeBoundary,
   });
 
   characterPlanning = await runCharacterPlanningContextAgent({
@@ -5744,6 +6034,8 @@ async function prepareChapterOutlineResources({
     chapterSlot,
     continuityGuard,
     factContext,
+    timelineContext,
+    characterKnowledgeBoundary,
     previousOutline: committedOutlines.at(-1)?.chapterPlan ? committedOutlines.at(-1) : null,
     nextLegacyPlan,
   });
@@ -5793,6 +6085,8 @@ async function prepareChapterOutlineResources({
     contextConflicts,
     outlineGenerationContract,
     factContext,
+    timelineContext,
+    characterKnowledgeBoundary,
     outlineOptions: normalizedOutlineOptions,
     foreshadowingActions,
     legacyPlan,
@@ -5810,6 +6104,8 @@ async function prepareChapterOutlineResources({
     contextConflicts,
     outlineGenerationContract,
     factContext,
+    timelineContext,
+    characterKnowledgeBoundary,
     outlineOptions: normalizedOutlineOptions,
     warnings,
     briefingMarkdown,
@@ -5835,6 +6131,8 @@ async function prepareChapterOutlineResources({
     openingReferencePacket,
     outlineOptions: normalizedOutlineOptions,
     factContext,
+    timelineContext,
+    characterKnowledgeBoundary,
     chapterOutlineContext,
   };
 }
@@ -5851,6 +6149,15 @@ function buildChapterOutlineResourcesFromDraft({
     (bundle?.structureData?.chapters || []).find((item) => Number(item.chapterNumber || 0) === Number(chapterNumber || 0)) ||
     {};
   const chapterOutlineContext = draftBundle?.chapterOutlineContext || {};
+  const factContext = draftBundle?.factContext || chapterOutlineContext?.factContext || null;
+  const timelineContext = draftBundle?.timelineContext || chapterOutlineContext?.timelineContext || null;
+  const characterKnowledgeBoundary =
+    draftBundle?.characterKnowledgeBoundary ||
+    chapterOutlineContext?.characterKnowledgeBoundary ||
+    buildCharacterKnowledgeBoundary({
+      characterStates: draftBundle?.characterStates || [],
+      factContext,
+    });
   return {
     chapterBase,
     chapterSlot: draftBundle?.chapterSlot || null,
@@ -5868,7 +6175,9 @@ function buildChapterOutlineResourcesFromDraft({
     outlineGenerationContract: draftBundle?.outlineGenerationContract || chapterOutlineContext?.outlineGenerationContract || {},
     openingReferencePacket: draftBundle?.openingReferencePacket || createEmptyOpeningReferencePacket({ mode: "chapter_outline" }),
     outlineOptions: normalizeOutlineOptions(outlineOptions || draftBundle?.reviewState?.outlineOptions || chapterOutlineContext?.outlineOptions || null),
-    factContext: draftBundle?.factContext || chapterOutlineContext?.factContext || null,
+    factContext,
+    timelineContext,
+    characterKnowledgeBoundary,
     chapterOutlineContext: {
       stagePlanning: chapterOutlineContext.stagePlanning || fallbackStagePlanningContext({
         chapterBase,
@@ -5894,7 +6203,9 @@ function buildChapterOutlineResourcesFromDraft({
       continuityGuard: draftBundle?.continuityGuard || chapterOutlineContext?.continuityGuard || null,
       contextConflicts: draftBundle?.contextConflicts || chapterOutlineContext?.contextConflicts || {},
       outlineGenerationContract: draftBundle?.outlineGenerationContract || chapterOutlineContext?.outlineGenerationContract || {},
-      factContext: draftBundle?.factContext || chapterOutlineContext?.factContext || null,
+      factContext,
+      timelineContext,
+      characterKnowledgeBoundary,
       briefingMarkdown: chapterOutlineContext.briefingMarkdown || "",
       summaryText: chapterOutlineContext.summaryText || "",
       warnings: chapterOutlineContext.warnings || [],
@@ -5947,6 +6258,15 @@ function buildChapterOutlinePreparationSteps(resources, candidates = [], outline
           180,
         ),
       },
+    ),
+    step(
+      "temporal_planning_agent",
+      "TemporalPlanningAgent",
+      "write",
+      resources.timelineContext?.temporalPlanning?.source === "agent"
+        ? "已生成本章时间承接与可用时间跳跃合同。"
+        : "时间规划 Agent 不可用，已使用保守时间承接合同。",
+      { preview: createExcerpt(resources.timelineContext?.temporalPlanning?.recommendedTransition || resources.timelineContext?.summaryText || "", 180) },
     ),
     step(
       "chapter_continuity_agent",
@@ -6051,6 +6371,7 @@ async function stageChapterOutlineManualReview({
     chapterOutlineHistory,
     outlineContinuityAudit,
     selectedChapterOutline,
+    timelineContext: draftBundle?.timelineContext || draftBundle?.chapterOutlineContext?.timelineContext || null,
     reviewState: {
       ...(draftBundle?.reviewState || {}),
       mode: "outline_review",
@@ -6136,6 +6457,8 @@ async function finalizeComposedChapterOutline({
       `历史余波：${resources.chapterOutlineContext.historyPlanning.lastEnding || "无"}`,
       `必须继承的已定事实：${factSections.establishedFactsLine}`,
       `可以继续发酵但不能改写底层结论的开放张力：${factSections.openTensionsLine}`,
+      `时间线合同：\n${resources.timelineContext?.briefingMarkdown || resources.chapterOutlineContext?.timelineContext?.briefingMarkdown || "无"}`,
+      `角色知识边界：\n${renderCharacterKnowledgeBoundary(resources.characterKnowledgeBoundary || resources.chapterOutlineContext?.characterKnowledgeBoundary || null)}`,
       `章节衔接：开场承接=${resources.chapterOutlineContext.continuityPlanning.entryLink || "无"}｜主承接线程=${resources.chapterOutlineContext.continuityPlanning.dominantCarryoverThread || "无"}｜章末递交压力=${resources.chapterOutlineContext.continuityPlanning.exitPressureToNextChapter || "无"}`,
       `作者备注：${authorNotes || "无"}`,
       `已选 scenes：\n${selectedScenes.map((scene, index) => `${index + 1}. [${scene.sourceProposalId}] ${scene.label}｜${scene.location}｜${scene.focus}｜${scene.tension}｜${scene.characters.join("、")}｜线程:${scene.threadId || "main"}｜承接:${scene.inheritsFromPrevious || "无"}｜结果:${scene.outcome || "无"}｜交棒:${scene.handoffToNext || "无"}`).join("\n")}`,
@@ -6277,6 +6600,29 @@ async function prepareChapterWriteResources({
     styleGuideSourcePath,
     researchPacket,
   });
+  const timelineState = await loadTimelineState(store);
+  const chapterNumber = Number(chapterPlan?.chapterNumber || 0);
+  const previousChapterId = chapterNumber > 1 ? chapterIdFromNumber(chapterNumber - 1) : "";
+  const previousChapterTail = previousChapterId
+    ? createExcerpt(await store.readText(path.join(store.paths.chaptersDir, `${previousChapterId}.md`), ""), 900)
+    : "";
+  const committedOutlines = (await store.listCommittedChapterOutlines())
+    .map(chapterOutlineDigest)
+    .filter((item) => item.chapterNumber < chapterNumber);
+  const temporalPlanning = await runTemporalPlanningAgent({
+    provider,
+    project,
+    chapterPlan,
+    timelineState,
+    previousOutline: committedOutlines.at(-1) || null,
+    previousChapterTail,
+    factContext,
+  });
+  const timelineContext = buildTimelineContextPacket({
+    chapterPlan,
+    timelineState,
+    temporalPlanning,
+  });
   const referencePacket = await buildReferencePacket({
     store,
     provider,
@@ -6320,6 +6666,7 @@ async function prepareChapterWriteResources({
     styleGuideText,
     styleGuideSourcePath,
     factContext,
+    timelineContext,
   });
 
   const foreshadowingSummary = summarizeForeshadowingAdvice(foreshadowingAdvice, chapterPlan);
@@ -6341,6 +6688,7 @@ async function prepareChapterWriteResources({
     planContext,
     historyPacket,
     factContext,
+    timelineContext,
     writerContext,
     governance,
     foreshadowingSummary,
@@ -6417,6 +6765,15 @@ function buildChapterPreparationSteps(resources) {
           180,
         ),
       },
+    ),
+    step(
+      "temporal_planning_agent",
+      "TemporalPlanningAgent",
+      "write",
+      resources.timelineContext?.temporalPlanning?.source === "agent"
+        ? "已生成本章时间承接与时间跳跃合同，供 Writer 执行。"
+        : "时间规划 Agent 不可用，已使用保守时间承接合同。",
+      { preview: createExcerpt(resources.timelineContext?.temporalPlanning?.recommendedTransition || resources.timelineContext?.summaryText || "", 180) },
     ),
     step(
       "reference_query_planner_agent",
@@ -6565,6 +6922,7 @@ async function generateChapterDraft({
     foreshadowingRegistry: bundle.foreshadowingRegistry,
     chapterMetas: resources.chapterMetas,
     factContext: resources.factContext,
+    timelineContext: resources.timelineContext,
   };
   const rewriteContext = {
     provider,
@@ -6582,6 +6940,7 @@ async function generateChapterDraft({
     characterDossiers: resources.characterDossiers,
     styleGuideText: resources.styleGuideText,
     factContext: resources.factContext,
+    timelineContext: resources.timelineContext,
     promptTelemetry: {
       writerPromptPacket: null,
     },
@@ -6688,6 +7047,7 @@ async function generateChapterDraft({
     continuityGuard: outlineArtifacts?.continuityGuard || null,
     contextConflicts: outlineArtifacts?.contextConflicts || {},
     outlineGenerationContract: outlineArtifacts?.outlineGenerationContract || {},
+    timelineContext: resources.timelineContext || outlineArtifacts?.timelineContext || null,
     validation,
     auditDrift: validation.auditDrift,
     chapterMeta: derivedState.chapterMeta,
@@ -6704,6 +7064,7 @@ async function generateChapterDraft({
     contextTrace: resources.governance.contextTrace,
     writerPromptPacket: rewriteContext.promptTelemetry.writerPromptPacket || null,
     factContext: resources.factContext,
+    timelineContext: resources.timelineContext,
     providerSnapshot: provider.settings,
     auditDegraded: Boolean(validation?.auditDegraded),
     repairHistory: repairResult.repairHistory,
@@ -6799,6 +7160,9 @@ async function stageChapterOutlineReview({
     continuityGuard: resources.continuityGuard,
     outlineGenerationContract: resources.outlineGenerationContract,
     contextConflicts: resources.contextConflicts,
+    factContext: resources.factContext,
+    timelineContext: resources.timelineContext,
+    characterKnowledgeBoundary: resources.characterKnowledgeBoundary,
     foreshadowingActions: resources.foreshadowingActions,
     styleGuideText: resources.styleGuideText,
     openingReferencePacket: resources.openingReferencePacket,
@@ -6873,6 +7237,7 @@ async function stageChapterOutlineReview({
     contextTrace: previousDraft?.contextTrace || previousDraft?.trace || {},
     writerPromptPacket: previousDraft?.writerPromptPacket || null,
     factContext: resources.factContext,
+    timelineContext: resources.timelineContext,
     providerSnapshot: provider.settings,
     reviewState: {
       mode: "outline_review",
@@ -7026,6 +7391,7 @@ export async function saveManualChapterEdit(
   const writerContext = writerContextFromDraft(draftBundle);
   const governance = governanceFromDraft(draftBundle, chapterPlanBase);
   const factContext = draftBundle?.factContext || null;
+  const timelineContext = draftBundle?.timelineContext || draftBundle?.chapterOutlineContext?.timelineContext || null;
   const validation = createManualEditValidationSnapshot();
   const rewrittenState = buildManualEditDerivedState({
     draftBundle,
@@ -7080,6 +7446,7 @@ export async function saveManualChapterEdit(
     contextTrace: governance.contextTrace,
     writerPromptPacket: draftBundle?.writerPromptPacket || null,
     factContext,
+    timelineContext,
     auditDegraded: Boolean(validation?.auditDegraded),
     repairHistory: draftBundle?.repairHistory || [],
     lastUnresolvedCriticals: [],
@@ -7442,6 +7809,7 @@ export async function reviewChapter(
         continuityGuard: draftBundle.continuityGuard || reviewResources.continuityGuard || null,
         contextConflicts: draftBundle.contextConflicts || reviewResources.contextConflicts || {},
         outlineGenerationContract: draftBundle.outlineGenerationContract || reviewResources.outlineGenerationContract || {},
+        timelineContext: draftBundle.timelineContext || reviewResources.timelineContext || reviewResources.chapterOutlineContext?.timelineContext || null,
       },
     });
   }
@@ -7480,6 +7848,30 @@ export async function reviewChapter(
     } catch (error) {
       factExtractionWarning = ` Canon facts 提取失败：${createExcerpt(error instanceof Error ? error.message : String(error || ""), 180)}`;
     }
+    let timelineExtractionWarning = "";
+    try {
+      const factLedger = await loadFactLedger(store);
+      const previousTimelineState = await loadTimelineState(store);
+      const extraction = await runTimelineExtractionAgent({
+        provider,
+        project: projectState.project,
+        chapterPlan: lockedChapterPlan,
+        chapterDraft: { markdown: draftBundle.chapterMarkdown || "" },
+        previousTimelineState,
+        factLedger,
+      });
+      const nextTimelineState = await updateTimelineStateAfterChapter({
+        store,
+        extraction,
+      });
+      lockedWorldState = {
+        ...lockedWorldState,
+        current_story_time: nextTimelineState.current?.storyTime || lockedWorldState.current_story_time,
+        current_primary_location: nextTimelineState.current?.primaryLocation || lockedWorldState.current_primary_location,
+      };
+    } catch (error) {
+      timelineExtractionWarning = ` 时间线提取失败：${createExcerpt(error instanceof Error ? error.message : String(error || ""), 180)}`;
+    }
 
     if (pending.chapterNumber === 1 && !String(projectState.project?.styleFingerprintId || "").trim()) {
       const styleGuide = await runStyleGuideDeriverAgent({
@@ -7517,7 +7909,7 @@ export async function reviewChapter(
     return {
       project: savedProject,
       run: null,
-      summary: `${pending.chapterId} 已${approvalOverrideRequired ? "在显式 override 后" : ""}锁定，并已按最终正文回写章节细纲，可继续生成下一章。${factExtractionWarning}`,
+      summary: `${pending.chapterId} 已${approvalOverrideRequired ? "在显式 override 后" : ""}锁定，并已按最终正文回写章节细纲，可继续生成下一章。${factExtractionWarning}${timelineExtractionWarning}`,
     };
   }
 
@@ -7550,6 +7942,7 @@ export async function reviewChapter(
   const historyPacket = historyContextFromDraft(draftBundle);
   const writerContext = writerContextFromDraft(draftBundle);
   const governance = governanceFromDraft(draftBundle, chapterPlanBase);
+  const timelineContext = draftBundle?.timelineContext || draftBundle?.chapterOutlineContext?.timelineContext || null;
   const promptTelemetry = {
     writerPromptPacket: draftBundle?.writerPromptPacket || null,
   };
@@ -7592,6 +7985,7 @@ export async function reviewChapter(
         selection: normalizedSelection,
         currentDraftMarkdown: originalMarkdown,
         factContext,
+        timelineContext,
         promptTelemetry,
       });
 
@@ -7703,6 +8097,7 @@ export async function reviewChapter(
       foreshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
       chapterMetas,
       factContext,
+      timelineContext,
     });
 
     const rewrittenState = await buildDerivedChapterStateArtifacts({
@@ -7755,6 +8150,7 @@ export async function reviewChapter(
       contextTrace: governance.contextTrace,
       writerPromptPacket: promptTelemetry.writerPromptPacket || draftBundle?.writerPromptPacket || null,
       factContext,
+      timelineContext,
       auditDegraded: Boolean(validation?.auditDegraded),
       repairHistory: draftBundle?.repairHistory || [],
       lastUnresolvedCriticals: unresolvedCriticalIssueSummaries(validation),
@@ -7876,6 +8272,7 @@ export async function reviewChapter(
       markdown: originalMarkdown,
     },
     factContext: draftBundle?.factContext || null,
+    timelineContext,
   });
   const factContext = draftBundle?.factContext || null;
 
@@ -7905,6 +8302,7 @@ export async function reviewChapter(
         markdown: originalMarkdown,
       },
       factContext: draftBundle?.factContext || null,
+      timelineContext,
     });
   }
 
@@ -7925,6 +8323,7 @@ export async function reviewChapter(
     foreshadowingRegistry: draftBundle.foreshadowingRegistry || bundle.foreshadowingRegistry,
     chapterMetas,
     factContext,
+    timelineContext,
   };
   const rewriteContext = {
     provider,
@@ -7942,6 +8341,7 @@ export async function reviewChapter(
     characterDossiers,
     styleGuideText,
     factContext: draftBundle?.factContext || null,
+    timelineContext,
     promptTelemetry,
   };
 
@@ -8018,6 +8418,7 @@ export async function reviewChapter(
     contextTrace: governance.contextTrace,
     writerPromptPacket: promptTelemetry.writerPromptPacket || draftBundle?.writerPromptPacket || null,
     factContext,
+    timelineContext,
     auditDegraded: Boolean(validation?.auditDegraded),
     repairHistory: repairResult.repairHistory,
     lastUnresolvedCriticals: repairResult.lastUnresolvedCriticals,
@@ -8198,6 +8599,8 @@ export async function deleteLatestLockedChapter(store, { chapterId = "" } = {}) 
 
   await store.removeCommittedChapter(latestChapterId);
   await store.removeChapterDraft(latestChapterId);
+  await store.removeRunsByChapterId(latestChapterId);
+  await store.removeReviewsByChapterId(latestChapterId);
   await store.writeJson(path.join(store.paths.novelStateDir, "bundle.json"), {
     ...committedBundle,
     structureData: {
@@ -8228,16 +8631,27 @@ export async function deleteLatestLockedChapter(store, { chapterId = "" } = {}) 
 
   await rebuildFactLedger(store);
 
-  const nextReviewHistory = remainingMetas.length === 0
-    ? (projectState.history.reviews || []).filter((review) =>
-      review?.target !== REVIEW_TARGETS.CHAPTER_OUTLINE && review?.target !== REVIEW_TARGETS.CHAPTER,
-    )
-    : (projectState.history.reviews || []);
+  const writeReviewTargets = new Set([
+    REVIEW_TARGETS.CHAPTER_OUTLINE,
+    REVIEW_TARGETS.CHAPTER,
+  ]);
+  const nextReviewHistory = (projectState.history.reviews || []).filter((review) => {
+    if (!writeReviewTargets.has(review?.target)) {
+      return true;
+    }
+    if (remainingMetas.length === 0) {
+      return false;
+    }
+    return String(review?.chapterId || "").trim() !== latestChapterId;
+  });
+  const remainingWriteRuns = remainingMetas.length === 0
+    ? []
+    : await store.listRuns("write", 1);
 
   projectState.phase.write = {
     ...projectState.phase.write,
     status: WRITE_STATUS.IDLE,
-    lastRunId: remainingMetas.length === 0 ? null : projectState.phase.write.lastRunId,
+    lastRunId: remainingWriteRuns[0]?.id || null,
     pendingReview: null,
     currentChapterNumber: previousMeta ? chapterNumberFromId(previousMeta.chapter_id) : 0,
     rejectionNotes: [],

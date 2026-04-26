@@ -39,6 +39,16 @@ const DEFAULT_MCP_CONFIG = {
   },
 };
 const OPTIONAL_PROVIDER_DEFAULTS = {
+  DeepSeek: {
+    name: "DeepSeek",
+    base_url: "https://api.deepseek.com",
+    wire_api: "chat_completions",
+    response_model: "deepseek-v4-pro",
+    review_model: "deepseek-v4-pro",
+    codex_model: "deepseek-v4-pro",
+    request_timeout_ms: 300000,
+    overload_retry_window_ms: 1800000,
+  },
   MiniMax: {
     name: "MiniMax",
     base_url: "https://api.minimaxi.com/v1",

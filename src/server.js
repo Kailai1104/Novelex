@@ -288,13 +288,26 @@ async function buildSnapshot(store, projectId) {
   const project = await store.loadProject();
   const provider = publicProviderSettings(resolveProviderSettings(project, store.paths.configRootDir));
   const planRuns = await store.listRuns("plan", 6);
-  const writeRuns = await store.listRuns("write", 6);
   const planDraft = await store.loadPlanDraft();
   const planFinal = await store.loadPlanFinal();
   const pendingChapter = project.phase.write.pendingReview?.chapterId
     ? await store.loadChapterDraft(project.phase.write.pendingReview.chapterId)
     : null;
   const chapters = await store.listChapterMeta();
+  const visibleWriteChapterIds = new Set(
+    chapters
+      .map((chapter) => String(chapter?.chapter_id || chapter?.chapterId || "").trim())
+      .filter(Boolean),
+  );
+  if (project.phase.write.pendingReview?.chapterId) {
+    visibleWriteChapterIds.add(String(project.phase.write.pendingReview.chapterId).trim());
+  }
+  const writeRuns = (await store.listRuns("write", 50))
+    .filter((run) => {
+      const runChapterId = String(run?.chapterId || "").trim();
+      return !runChapterId || visibleWriteChapterIds.has(runChapterId);
+    })
+    .slice(0, 6);
   const documents = await store.buildDocumentIndex();
   const styleFingerprints = await store.listStyleFingerprints();
   const ragCollections = await store.listRagCollections();

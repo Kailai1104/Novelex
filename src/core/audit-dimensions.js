@@ -109,6 +109,13 @@ export const AUDIT_DIMENSIONS = [
     legacyBucket: "consistency",
     promptFocus: "检查正文是否否认、重置、重发明已确立事实；是否把已执行过的命令写成首次提出；是否把可继续争执的执行细节误写成底层结论重新未定。",
   },
+  {
+    id: "timeline_continuity",
+    label: "Timeline Continuity",
+    category: "时间线连续性",
+    legacyBucket: "consistency",
+    promptFocus: "检查时间承接、时间跳跃、离屏变化、资源/伤势/敌情/倒计时是否语义成立。时间跳跃本身是允许的；只有跳跃逃避压力、消除代价、打乱倒计时或造成状态不匹配时才报问题。",
+  },
 ];
 
 export function getAuditDimension(id) {
@@ -129,6 +136,7 @@ export function resolveAuditDimensions({
   foreshadowingRegistry = null,
   historyPacket = null,
   factContext = null,
+  timelineContext = null,
 }) {
   const unresolved = unresolvedForeshadowings(foreshadowingRegistry);
   const enabled = [];
@@ -177,6 +185,14 @@ export function resolveAuditDimensions({
       reason = active
         ? `存在 ${factContext.establishedFacts.length} 条已定事实需要检查连续性。`
         : "当前没有已定事实需要检查连续性，暂不启用。";
+    } else if (dimension.id === "timeline_continuity") {
+      active =
+        hasMeaningfulText(timelineContext?.briefingMarkdown) ||
+        hasMeaningfulText(chapterPlan?.timeInStory) ||
+        chapterMetas.length >= 1;
+      reason = active
+        ? "存在历史章节、章纲时间或时间线合同，可做时间承接语义审查。"
+        : "缺少时间线基准，暂不启用。";
     }
 
     if (!active) {

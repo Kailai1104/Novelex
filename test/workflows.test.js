@@ -9,6 +9,7 @@ import { runAuditHeuristics } from "../src/core/audit-heuristics.js";
 import { assembleChapterMarkdown, buildStructure, runValidations } from "../src/core/generators.js";
 import { buildStyleFingerprintSummary, renderStyleFingerprintPrompt } from "../src/core/style-fingerprint.js";
 import { createProvider, resolveProviderSettings } from "../src/llm/provider.js";
+import { generateStructuredObject } from "../src/llm/structured.js";
 import { closeAllWorkspaceMcpManagers } from "../src/mcp/index.js";
 import { buildOpeningReferencePacket } from "../src/opening/reference.js";
 import { generateStyleFingerprint } from "../src/orchestration/style-fingerprint.js";
@@ -1183,7 +1184,7 @@ async function withStubbedOpenAI(callback) {
       });
     }
 
-    if (instructions.includes("ChapterOutlineConsistencyAuditAgent")) {
+    if (instructions.includes("OutlineConsistencyAgent") || instructions.includes("ChapterOutlineConsistencyAuditAgent")) {
       const proposalIds = [...new Set(
         [...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]).filter(Boolean),
       )].slice(0, 5);
@@ -1202,7 +1203,7 @@ async function withStubbedOpenAI(callback) {
       });
     }
 
-    if (instructions.includes("ChapterOutlineRepairAgent")) {
+    if (instructions.includes("OutlineNormalizationAgent") || instructions.includes("ChapterOutlineRepairAgent")) {
       const chapterMatch = inputText.match(/当前章节：ch(\d+)/);
       const chapterNumber = Number(chapterMatch?.[1] || 1);
       const proposalIds = [...new Set(
@@ -1824,6 +1825,41 @@ async function withStubbedOpenAI(callback) {
       });
     }
 
+    if (instructions.includes("ContinuityResolutionAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          defaultEntryMode: "direct_resume",
+          allowedEntryModes: ["direct_resume", "same_scene_later"],
+          resumeFrom: "承接上一章留下的直接压力。",
+          previousActionPressure: "上一章已完成动作带来的后续压力仍在持续。",
+          resolvedActions: inputText.includes("第 1 章") ? [] : ["上一章关键动作已经完成，只能承接后果。"],
+          nextActionObligations: inputText.includes("第 1 章") ? ["第一场先把主线压力落地。"] : ["第一场直接推进上一章结果的后续执行。"],
+          allowedContinuations: ["对上一章结果做直接回应或执行。"],
+          forbiddenReplays: ["不要重新穿越或重新开篇。", "不要惊醒后重新确认身份。"],
+          mustReferenceEvidenceRefs: [],
+          unsupportedOpenings: ["重新惊醒重开", "把已成立结果重新写成首次发生"],
+          confidence: 0.86,
+          reviewRequired: false,
+        }),
+      });
+    }
+
+    if (instructions.includes("ExecutionContractAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          mustLand: ["把当前章节的主线动作真正落到现场。"],
+          carryoverStates: ["上一章已完成动作只能承接后果，不能重演。"],
+          openTensions: ["开放张力继续发酵，但不能改写底层结论。"],
+          sceneDirectives: [],
+          hardBoundaries: ["不要否认既定事实。"],
+          deferredThreads: ["远期布局可以延后。"],
+          writerWarnings: ["不要把上一章已成立结果重新写成新发现。"],
+          reviewRequired: false,
+          confidence: 0.84,
+        }),
+      });
+    }
+
     if (instructions.includes("StagePlanningContextAgent")) {
       return jsonResponse({
         output_text: JSON.stringify({
@@ -1872,6 +1908,7 @@ async function withStubbedOpenAI(callback) {
         output_text: JSON.stringify({
           entryLink: "承接上一章抬高后的高压盘面与未完成试探。",
           dominantCarryoverThread: "先稳局，再接住外部试探并把压力抬高。",
+          firstSceneMustAdvance: "第一场直接把上一章留下的结果推进成当前执行动作。",
           subordinateThreads: ["人物关系中的互相试探可以轻触，但不要抢戏。"],
           mustAdvanceThisChapter: "把外部试探从背景信号推进成必须回应的正面压力。",
           canPauseThisChapter: ["远期大决战", "过深的终局布局"],
@@ -2042,10 +2079,12 @@ async function runWriteChapterThroughOutline(store, options = {}) {
   const chapterNumber = outlineRun.project.phase.write.pendingReview?.chapterNumber || 1;
   const chapterId = chapterIdFromNumber(chapterNumber);
   const outlineDraft = await store.loadChapterDraft(chapterId);
-  const selectedProposalId = options.selectedProposalId || outlineDraft.chapterOutlineCandidates?.[0]?.proposalId;
 
   assert.ok(Array.isArray(outlineDraft.chapterOutlineCandidates));
   assert.ok(outlineDraft.chapterOutlineCandidates.length >= 1);
+  const selectedProposalId = options.selectedProposalId ||
+    outlineDraft.chapterOutlineCandidates.find((candidate) => candidate?.selectable)?.proposalId ||
+    outlineDraft.chapterOutlineCandidates?.[0]?.proposalId;
 
   return reviewChapter(store, {
     target: "chapter_outline",
@@ -2067,6 +2106,79 @@ async function lockNextChapter(store, options = {}) {
     approved: true,
     feedback: "",
   });
+}
+
+function outlineVariantProposalIdFromInput(inputText = "") {
+  return inputText.match(/当前 Variant：\s*(proposal_[\w-]+)/)?.[1] ||
+    inputText.match(/proposal_[\w-]+/)?.[0] ||
+    "proposal_1";
+}
+
+function buildCarryoverReplayTestProposal(proposalId, mode = "replay") {
+  const firstScene = mode === "direct"
+    ? {
+      label: "直接查验",
+      location: "港口旧仓的封门前",
+      focus: "主角在上一章余波仍未散去时，立刻命人开门查验已暴露的异常源头。",
+      tension: "外部压力还在逼近，查验动作必须马上落地。",
+      characters: ["李凡", "许三娘"],
+      threadId: "main",
+      scenePurpose: "把上一章已经成立的异常判断直接推进成现场执行。",
+      inheritsFromPrevious: "承接上一章已经成立的异常判断与紧逼余波。",
+      outcome: "封门被撬开，众人开始核实异常来源并当场承受后果。",
+      handoffToNext: "查验结果逼出更危险的下一步处置。",
+    }
+    : {
+      label: "重复提出",
+      location: "港口旧仓的封门前",
+      focus: "许三娘再次指出吃水异常与底舱黑货，逼主角正视上一章已经成立的判断。",
+      tension: "队伍还在上一章余波中发紧，却先把同一个钩子重新成立一遍。",
+      characters: ["李凡", "许三娘"],
+      threadId: "main",
+      scenePurpose: "把上一章已成立的吃水异常与底舱重物判断重新当成本场主推进动作。",
+      inheritsFromPrevious: "承接上一章已经指出异常的余波。",
+      outcome: "众人再次确认底舱确实压着异常重物和黑货，准备下一步查验。",
+      handoffToNext: "真正的查验动作被拖到下一场。",
+    };
+
+  return {
+    proposalId,
+    summary: mode === "direct" ? "第一场直接执行上一章留下的查验义务。" : "第一场把上一章已成立钩子重新演了一遍。",
+    rationale: mode === "direct" ? "保留余波，但把第一场改成直接行动。" : "故意把上一章已成立判断重新写成第一场主推进。",
+    diffSummary: mode === "direct" ? "删除重复提出，前移执行动作。" : "重复成立上一章钩子。",
+    title: mode === "direct" ? "第二章·封门立验" : "第二章·再提旧钩",
+    timeInStory: "故事第二日，连续承压",
+    povCharacter: "李凡",
+    location: "旧仓外",
+    keyEvents: mode === "direct"
+      ? ["主角立刻带人开门查验上一章已暴露的异常源头", "查验结果把局势推向更危险的处理压力"]
+      : ["许三娘再次指出上一章已经成立的异常重货判断", "真正查验被拖到下一场"],
+    arcContribution: ["主角必须把上一章已成立的结果转成当前执行动作"],
+    nextHook: "查验后的后果已经逼到眼前。",
+    emotionalTone: "承压推进",
+    threadMode: "single_spine",
+    dominantThread: "围绕上一章已成立异常的后续执行推进本章。",
+    entryMode: "direct_resume",
+    entryLink: "承接上一章已经成立的异常判断与高压余波。",
+    exitPressure: "查验结果带来了更具体也更危险的后续处置压力。",
+    charactersPresent: ["李凡", "许三娘"],
+    continuityAnchors: ["上一章异常判断已成立", "第一场必须直接推进后续执行"],
+    scenes: [
+      firstScene,
+      {
+        label: "后果放大",
+        location: "旧仓内部",
+        focus: "查验结果把局势从怀疑推进成必须立刻处理的现实压力。",
+        tension: "一旦看清真相，拖延就会立刻放大代价。",
+        characters: ["李凡", "许三娘"],
+        threadId: "main",
+        scenePurpose: "把第一场执行动作产出的结果继续推高。",
+        inheritsFromPrevious: "承接第一场已经开始的查验动作。",
+        outcome: "众人确认异常背后的真实风险，必须马上处置。",
+        handoffToNext: "把更危险的后续处置递交给下一章。",
+      },
+    ],
+  };
 }
 
 test("style fingerprint prompt rendering keeps key dimensions and prohibitions stable", () => {
@@ -2127,12 +2239,14 @@ test("Novelex workflows can complete a full draft-and-approve cycle", async () =
   assert.ok(Array.isArray(outlineDraft.chapterOutlineCandidates));
   assert.ok(outlineDraft.chapterOutlineCandidates.length >= 2);
   assert.equal(outlineDraft.reviewState?.target, "chapter_outline");
+  const selectedProposalId = outlineDraft.chapterOutlineCandidates.find((candidate) => candidate?.selectable)?.proposalId
+    || outlineDraft.chapterOutlineCandidates[0].proposalId;
 
   const writeRun = await reviewChapter(store, {
     target: "chapter_outline",
     approved: true,
     reviewAction: "approve_single",
-    selectedProposalId: outlineDraft.chapterOutlineCandidates[0].proposalId,
+    selectedProposalId,
     feedback: "",
   });
   assert.equal(writeRun.project.phase.write.status, "chapter_pending_review");
@@ -2201,7 +2315,7 @@ test("Novelex workflows can complete a full draft-and-approve cycle", async () =
   assert.equal(outlineCandidatesExists[0].chapterPlan.threadMode, "single_spine");
   assert.ok(outlineCandidatesExists[0].chapterPlan.scenes[0].inheritsFromPrevious);
   assert.equal(selectedOutlineExists.mode, "single");
-  assert.equal(selectedOutlineExists.selectedProposalId, outlineDraft.chapterOutlineCandidates[0].proposalId);
+  assert.equal(selectedOutlineExists.selectedProposalId, selectedProposalId);
   assert.equal(selectedOutlineExists.source, "post_lock_sync");
   assert.equal(selectedOutlineExists.syncedFrom.source, "manual_selection");
   assert.match(selectedOutlineExists.chapterPlan.dominantThread, /锁章正文确认/);
@@ -2219,7 +2333,7 @@ test("Novelex workflows can complete a full draft-and-approve cycle", async () =
   );
 })));
 
-test("chapter outline audit repairs rejected candidates to preserve requested count", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+test("chapter outline audit repairs rejected candidates while preserving candidate slots", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-outline-count-repair-"));
   const store = await createStore(tempRoot);
 
@@ -2284,11 +2398,11 @@ test("chapter outline audit repairs rejected candidates to preserve requested co
       });
     }
 
-    if (instructions.includes("ChapterOutlineConsistencyAuditAgent") && inputText.includes("当前章节：ch001")) {
+    if ((instructions.includes("OutlineConsistencyAgent") || instructions.includes("ChapterOutlineConsistencyAuditAgent")) && inputText.includes("当前章节：ch001")) {
       auditCalls += 1;
       const proposalIds = auditCalls === 1
         ? ["proposal_1", "proposal_2", "proposal_3"]
-        : ["proposal_1", "proposal_2_repaired", "proposal_3"];
+        : ["proposal_1", "proposal_2", "proposal_3"];
       return jsonResponse({
         output_text: JSON.stringify({
           summary: auditCalls === 1 ? "两个候选需要修复。" : "所有候选已通过。",
@@ -2316,11 +2430,26 @@ test("chapter outline audit repairs rejected candidates to preserve requested co
       });
     }
 
-    if (instructions.includes("ChapterOutlineRepairAgent") && inputText.includes("当前章节：ch001")) {
+    if ((instructions.includes("OutlineNormalizationAgent") || instructions.includes("ChapterOutlineRepairAgent")) && inputText.includes("当前章节：ch001")) {
       repairCalls += 1;
       return jsonResponse({
         output_text: JSON.stringify({
-          proposals: [makeProposal("proposal_2_repaired", 2)],
+          proposals: [
+            {
+              ...makeProposal("proposal_2", 2),
+              summary: "修复后保留原候选编号。",
+              rationale: "保留原 proposalId，同时把入口和章末压力改回合同要求。",
+              diffSummary: "修复入口和章末压力，保留 proposal_2 槽位。",
+              repairSourceProposalId: "proposal_2",
+            },
+            {
+              ...makeProposal("proposal_3", 3),
+              summary: "未命中独立修复点，按原槽位返回。",
+              rationale: "满足新 repair 合同，显式返回所有待修候选。",
+              diffSummary: "保留 proposal_3 原槽位。",
+              repairSourceProposalId: "proposal_3",
+            },
+          ],
         }),
       });
     }
@@ -2342,10 +2471,21 @@ test("chapter outline audit repairs rejected candidates to preserve requested co
   assert.equal(outlineDraft.chapterOutlineCandidates.length, 3);
   assert.deepEqual(outlineDraft.chapterOutlineCandidates.map((candidate) => candidate.proposalId), [
     "proposal_1",
-    "proposal_2_repaired",
+    "proposal_2",
     "proposal_3",
   ]);
   assert.equal(outlineDraft.outlineContinuityAudit.manualReviewRequired, false);
+  assert.deepEqual(outlineDraft.reviewState.selectableProposalIds, [
+    "proposal_1",
+    "proposal_2",
+    "proposal_3",
+  ]);
+  assert.deepEqual(outlineDraft.reviewState.failedProposalIds, []);
+  assert.equal(outlineDraft.chapterOutlineCandidates[1].repairSourceProposalId, "proposal_2");
+  assert.equal(outlineDraft.chapterOutlineCandidates[1].auditStatus, "passed");
+  assert.equal(outlineDraft.chapterOutlineCandidates[1].selectable, true);
+  assert.equal(outlineDraft.chapterOutlineCandidates[1].auditAttempts, 2);
+  assert.equal(outlineDraft.chapterOutlineCandidates[1].revisionCount, 1);
   assert.equal(auditCalls, 2);
   assert.equal(repairCalls, 1);
 })));
@@ -2696,6 +2836,8 @@ test("chapter outline continuity guard blocks third chapter restart openings", a
 
   const previousFetch = globalThis.fetch;
   let badOutlineCallCount = 0;
+  let auditCalls = 0;
+  let repairCalls = 0;
 
   globalThis.fetch = async (url, options = {}) => {
     const payload = JSON.parse(String(options.body || "{}"));
@@ -2736,123 +2878,155 @@ test("chapter outline continuity guard blocks third chapter restart openings", a
 
     if (isChapterThree && instructions.includes("ChapterOutlineAgent")) {
       badOutlineCallCount += 1;
-      if (badOutlineCallCount === 1) {
-        return jsonResponse({
-          output_text: JSON.stringify({
-            proposals: [
-              {
-                proposalId: "proposal_bad_1",
-                summary: "错误地重开开篇。",
-                rationale: "误用第一章模板。",
-                diffSummary: "惊醒重置。",
-                title: "第三章·惊醒",
-                timeInStory: "故事第三日",
-                povCharacter: "李凡",
-                location: "赤屿内港",
-                keyEvents: ["李凡惊醒", "重新确认自己是谁", "第一次证明自己"],
-                arcContribution: ["重新开篇"],
-                nextHook: "新的危机出现。",
-                emotionalTone: "恍惚",
-                threadMode: "single_spine",
-                dominantThread: "重新确认身份。",
-                entryLink: "李凡惊醒后重新确认自己是谁。",
-                exitPressure: "新的危机出现。",
-                charactersPresent: ["李凡", "宋应星"],
-                continuityAnchors: ["惊醒", "重新确认身份"],
-                scenes: [
-                  {
-                    label: "惊醒",
-                    location: "赤屿内港",
-                    focus: "李凡醒来并重新确认自己是谁",
-                    tension: "身体危机",
-                    characters: ["李凡"],
-                    threadId: "main",
-                    scenePurpose: "重开开篇",
-                    inheritsFromPrevious: "从昏迷惊醒",
-                    outcome: "重新确认身份",
-                    handoffToNext: "第一次证明自己",
-                  },
-                ],
-              },
-              {
-                proposalId: "proposal_bad_2",
-                summary: "同样错误地重演第一章。",
-                rationale: "误用身体危机开场。",
-                diffSummary: "醒来重置。",
-                title: "第三章·再醒",
-                timeInStory: "故事第三日",
-                povCharacter: "李凡",
-                location: "赤屿内港",
-                keyEvents: ["李凡醒来", "再次确认穿越", "首次立威"],
-                arcContribution: ["重新开篇"],
-                nextHook: "新的危机出现。",
-                emotionalTone: "恍惚",
-                threadMode: "single_spine",
-                dominantThread: "再次确认穿越。",
-                entryLink: "李凡醒来，再次确认穿越。",
-                exitPressure: "新的危机出现。",
-                charactersPresent: ["李凡"],
-                continuityAnchors: ["醒来", "首次立威"],
-                scenes: [
-                  {
-                    label: "醒来",
-                    location: "赤屿内港",
-                    focus: "李凡醒来，再次确认穿越",
-                    tension: "身体危机",
-                    characters: ["李凡"],
-                    threadId: "main",
-                    scenePurpose: "重演第一章",
-                    inheritsFromPrevious: "醒来",
-                    outcome: "首次立威",
-                    handoffToNext: "进入危机",
-                  },
-                ],
-              },
-            ],
-          }),
-        });
-      }
-
       return jsonResponse({
         output_text: JSON.stringify({
           proposals: [
             {
-              proposalId: "proposal_guarded_1",
-              summary: "直接承接 ch002 章末压力，把高压盘面推向更具体的执行代价。",
-              rationale: "按连续性护栏承接前章。",
-              diffSummary: "不重开，直接续压。",
-              title: "第三章·续压",
+              proposalId: "proposal_bad_1",
+              summary: "错误地重开开篇。",
+              rationale: "误用第一章模板。",
+              diffSummary: "惊醒重置。",
+              title: "第三章·惊醒",
               timeInStory: "故事第三日",
               povCharacter: "李凡",
               location: "赤屿内港",
-              keyEvents: ["承接上一章高压盘面", "把资源缺口推成执行代价", "章末留下更急压力"],
-              arcContribution: ["李凡在更高风险下继续主导局面"],
-              nextHook: "更急的执行窗口已经压到眼前。",
-              emotionalTone: "承压推进",
+              keyEvents: ["李凡惊醒", "重新确认自己是谁", "第一次证明自己"],
+              arcContribution: ["重新开篇"],
+              nextHook: "新的危机出现。",
+              emotionalTone: "恍惚",
               threadMode: "single_spine",
-              dominantThread: "承接 ch002 压力继续推进。",
-              entryMode: "direct_resume",
-              entryLink: "承接上一章留下的高压盘面与资源压力。",
-              exitPressure: "更急的执行窗口已经压到眼前。",
+              dominantThread: "重新确认身份。",
+              entryLink: "李凡惊醒后重新确认自己是谁。",
+              exitPressure: "新的危机出现。",
               charactersPresent: ["李凡", "宋应星"],
-              continuityAnchors: ["承接上一章压力", "不重开身份确认"],
-              evidenceRefs: ["ch002_outline_exit"],
+              continuityAnchors: ["惊醒", "重新确认身份"],
               scenes: [
                 {
-                  label: "承压续场",
+                  label: "惊醒",
                   location: "赤屿内港",
-                  focus: "承接上一章留下的高压与资源压力",
-                  tension: "执行窗口正在缩短",
-                  characters: ["李凡", "宋应星"],
+                  focus: "李凡醒来并重新确认自己是谁",
+                  tension: "身体危机",
+                  characters: ["李凡"],
                   threadId: "main",
-                  scenePurpose: "把 ch002 章末压力接到当前行动现场",
-                  inheritsFromPrevious: "承接上一章留下的高压盘面与资源压力",
-                  outcome: "本章主问题转成更具体的执行代价",
-                  handoffToNext: "把外部试探压到正面回应",
+                  scenePurpose: "重开开篇",
+                  inheritsFromPrevious: "从昏迷惊醒",
+                  outcome: "重新确认身份",
+                  handoffToNext: "第一次证明自己",
+                },
+              ],
+            },
+            {
+              proposalId: "proposal_bad_2",
+              summary: "同样错误地重演第一章。",
+              rationale: "误用身体危机开场。",
+              diffSummary: "醒来重置。",
+              title: "第三章·再醒",
+              timeInStory: "故事第三日",
+              povCharacter: "李凡",
+              location: "赤屿内港",
+              keyEvents: ["李凡醒来", "再次确认穿越", "首次立威"],
+              arcContribution: ["重新开篇"],
+              nextHook: "新的危机出现。",
+              emotionalTone: "恍惚",
+              threadMode: "single_spine",
+              dominantThread: "再次确认穿越。",
+              entryLink: "李凡醒来，再次确认穿越。",
+              exitPressure: "新的危机出现。",
+              charactersPresent: ["李凡"],
+              continuityAnchors: ["醒来", "首次立威"],
+              scenes: [
+                {
+                  label: "醒来",
+                  location: "赤屿内港",
+                  focus: "李凡醒来，再次确认穿越",
+                  tension: "身体危机",
+                  characters: ["李凡"],
+                  threadId: "main",
+                  scenePurpose: "重演第一章",
+                  inheritsFromPrevious: "醒来",
+                  outcome: "首次立威",
+                  handoffToNext: "进入危机",
                 },
               ],
             },
           ],
+        }),
+      });
+    }
+
+    if (isChapterThree && (instructions.includes("OutlineConsistencyAgent") || instructions.includes("ChapterOutlineConsistencyAuditAgent"))) {
+      auditCalls += 1;
+      const proposalIds = [...new Set(
+        [...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]).filter(Boolean),
+      )];
+      const passed = auditCalls > 1;
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: passed ? "修复后已承接上一章压力。" : "当前候选重开开篇，未承接上一章压力。",
+          candidateAudits: proposalIds.map((proposalId) => ({
+            proposalId,
+            passed,
+            score: passed ? 91 : 28,
+            summary: passed ? "已改成直接承压推进。" : "仍在重演第一章式惊醒开场。",
+            issues: passed ? [] : [
+              {
+                id: "restart_opening",
+                severity: "critical",
+                category: "开场连续性",
+                description: "第三章仍以惊醒/再次确认身份重开，未承接上一章章末压力。",
+                evidence: proposalId,
+                suggestion: "删除惊醒重置，直接从 ch002 留下的高压盘面续写。",
+              },
+            ],
+            revisionNotes: passed ? [] : ["直接承接上一章高压盘面，不要再写惊醒确认身份。"],
+          })),
+        }),
+      });
+    }
+
+    if (isChapterThree && (instructions.includes("OutlineNormalizationAgent") || instructions.includes("ChapterOutlineRepairAgent"))) {
+      repairCalls += 1;
+      const proposalIds = [...new Set(
+        [...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]).filter(Boolean),
+      )];
+      return jsonResponse({
+        output_text: JSON.stringify({
+          proposals: (proposalIds.length ? proposalIds : ["proposal_bad_1"]).map((proposalId, index) => ({
+            proposalId,
+            summary: "直接承接 ch002 章末压力，把高压盘面推向更具体的执行代价。",
+            rationale: "按连续性护栏承接前章，不再重开身份确认。",
+            diffSummary: `第 ${index + 1} 个候选已改成直接续压。`,
+            title: `第三章·续压${index + 1}`,
+            timeInStory: "故事第三日",
+            povCharacter: "李凡",
+            location: "赤屿内港",
+            keyEvents: ["承接上一章高压盘面", "把资源缺口推成执行代价", "章末留下更急压力"],
+            arcContribution: ["李凡在更高风险下继续主导局面"],
+            nextHook: "更急的执行窗口已经压到眼前。",
+            emotionalTone: "承压推进",
+            threadMode: "single_spine",
+            dominantThread: "承接 ch002 压力继续推进。",
+            entryMode: "direct_resume",
+            entryLink: "承接上一章留下的高压盘面与资源压力。",
+            exitPressure: "更急的执行窗口已经压到眼前。",
+            charactersPresent: ["李凡", "宋应星"],
+            continuityAnchors: ["承接上一章压力", "不重开身份确认"],
+            evidenceRefs: ["ch002_outline_exit"],
+            scenes: [
+              {
+                label: "承压续场",
+                location: "赤屿内港",
+                focus: "承接上一章留下的高压与资源压力",
+                tension: "执行窗口正在缩短",
+                characters: ["李凡", "宋应星"],
+                threadId: "main",
+                scenePurpose: "把 ch002 章末压力接到当前行动现场",
+                inheritsFromPrevious: "承接上一章留下的高压盘面与资源压力",
+                outcome: "本章主问题转成更具体的执行代价",
+                handoffToNext: "把外部试探压到正面回应",
+              },
+            ],
+          })),
         }),
       });
     }
@@ -2880,6 +3054,9 @@ test("chapter outline continuity guard blocks third chapter restart openings", a
   assert.match(firstSceneText, /承接|上一章|高压|压力/);
   assert.equal(outlineDraft.continuityGuard?.supportsWakeAfterUnconsciousness, false);
   assert.ok(outlineDraft.chapterOutlineHistory.some((item) => item.action === "outline_audit_regenerate"));
+  assert.equal(badOutlineCallCount, 3);
+  assert.equal(auditCalls, 2);
+  assert.equal(repairCalls, 1);
   assert.ok(await store.exists(path.join(tempRoot, "runtime", "staging", "write", "ch003", "continuity_guard.json")));
   assert.ok(await store.exists(path.join(tempRoot, "runtime", "staging", "write", "ch003", "context_conflicts.json")));
   assert.ok(await store.exists(path.join(tempRoot, "runtime", "staging", "write", "ch003", "outline_generation_contract.json")));
@@ -2896,6 +3073,7 @@ test("chapter outline consistency audit repairs mid-chapter canon fact resets", 
 
   const previousFetch = globalThis.fetch;
   let repairCalls = 0;
+  let auditCalls = 0;
 
   globalThis.fetch = async (url, options = {}) => {
     const payload = JSON.parse(String(options.body || "{}"));
@@ -2958,25 +3136,24 @@ test("chapter outline consistency audit repairs mid-chapter canon fact resets", 
       });
     }
 
-    if (instructions.includes("ChapterOutlineConsistencyAuditAgent") && inputText.includes("proposal_repaired_fact")) {
+    if ((instructions.includes("OutlineConsistencyAgent") || instructions.includes("ChapterOutlineConsistencyAuditAgent")) && inputText.includes("proposal_repaired_fact")) {
+      const proposalIds = [...new Set([...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]))];
       return jsonResponse({
         output_text: JSON.stringify({
           summary: "修复后没有阻断性连续性冲突。",
-          candidateAudits: [
-            {
-              proposalId: "proposal_repaired_fact",
+          candidateAudits: proposalIds.map((proposalId) => ({
+              proposalId,
               passed: true,
               score: 91,
               summary: "已承接上一章既定事实。",
               issues: [],
               revisionNotes: [],
-            },
-          ],
+            })),
         }),
       });
     }
 
-    if (instructions.includes("ChapterOutlineConsistencyAuditAgent") && inputText.includes("第一次临时新提出来")) {
+    if ((instructions.includes("OutlineConsistencyAgent") || instructions.includes("ChapterOutlineConsistencyAuditAgent")) && inputText.includes("第一次临时新提出来")) {
       return jsonResponse({
         output_text: JSON.stringify({
           summary: "细纲中段重置了上一章已定事实。",
@@ -3001,7 +3178,7 @@ test("chapter outline consistency audit repairs mid-chapter canon fact resets", 
       });
     }
 
-    if (instructions.includes("ChapterOutlineRepairAgent") && inputText.includes("第一次临时新提出来")) {
+    if ((instructions.includes("OutlineNormalizationAgent") || instructions.includes("ChapterOutlineRepairAgent")) && inputText.includes("第一次临时新提出来")) {
       repairCalls += 1;
       return jsonResponse({
         output_text: JSON.stringify({
@@ -3061,7 +3238,393 @@ test("chapter outline consistency audit repairs mid-chapter canon fact resets", 
   assert.equal(repairCalls, 1);
   assert.equal(outlineDraft.chapterOutlineCandidates[0].proposalId, "proposal_repaired_fact");
   assert.equal(outlineDraft.outlineContinuityAudit.manualReviewRequired, false);
+  assert.equal(outlineDraft.chapterOutlineCandidates[0].selectable, true);
+  assert.equal(outlineDraft.chapterOutlineCandidates[0].revisionCount, 1);
   assert.ok(outlineDraft.chapterOutlineHistory.some((item) => item.action === "outline_consistency_repair"));
+})));
+
+test("first scene cannot replay resolved previous-chapter hook", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-outline-hook-replay-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+  await lockNextChapter(store);
+
+  const previousFetch = globalThis.fetch;
+  let repairCalls = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input);
+    const isChapterTwo = inputText.includes("当前章节：ch002");
+
+    if (isChapterTwo && instructions.includes("ContinuityResolutionAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          defaultEntryMode: "direct_resume",
+          allowedEntryModes: ["direct_resume", "same_scene_later"],
+          resumeFrom: "许三娘已经指出吃水异常与底舱重物，下一步必须立刻查验。",
+          previousActionPressure: "上一章已完成异常判断，现场余波还在持续。",
+          resolvedActions: ["许三娘已指出吃水线异常与底舱重物，只能推进查验/揭晓，不可重新完整演发现过程"],
+          nextActionObligations: ["第一场直接推进开门查验与异常来源核实。"],
+          allowedContinuations: ["立刻查验异常源头并承接后果。"],
+          forbiddenReplays: ["不要重新穿越或重新开篇。"],
+          mustReferenceEvidenceRefs: [],
+          unsupportedOpenings: ["把已成立异常重新写成新发现"],
+          confidence: 0.9,
+          reviewRequired: false,
+        }),
+      });
+    }
+
+    if (isChapterTwo && instructions.includes("StagePlanningContextAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          chapterMission: "把上一章已经成立的异常判断直接推进成现场查验。",
+          requiredBeats: ["第一场直接执行查验动作", "查验结果立刻放大后续压力"],
+          mustPreserve: ["不要把上一章已成立判断重新写成新发现"],
+          deferRules: ["不要提前解决终局"],
+          suggestedConflictAxis: ["余波尚在时立即执行"],
+          titleSignals: ["封门", "查验"],
+          nextPressure: "查验结果把局势推向更危险的后续处置。",
+        }),
+      });
+    }
+
+    if (isChapterTwo && instructions.includes("ChapterContinuityAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          entryMode: "direct_resume",
+          entryLink: "承接上一章已经成立的异常判断与高压余波。",
+          dominantCarryoverThread: "对上一章已成立异常进行直接查验。",
+          firstSceneMustAdvance: "第一场必须直接推进开门查验与异常来源核实。",
+          subordinateThreads: ["现场余波可以保留，但不能盖过执行动作。"],
+          mustAdvanceThisChapter: "完成查验并把后果推成新的处置压力。",
+          canPauseThisChapter: ["远期布局"],
+          exitPressureToNextChapter: "查验后的真实风险已经压到眼前。",
+          continuityRisks: ["不要把上一章已成立异常再次写成新的判断。"],
+          evidenceRefs: [],
+          unsupportedClaims: [],
+        }),
+      });
+    }
+
+    if (isChapterTwo && instructions.includes("ChapterOutlineAgent")) {
+      const proposalId = outlineVariantProposalIdFromInput(inputText);
+      return jsonResponse({
+        output_text: JSON.stringify({
+          proposal: buildCarryoverReplayTestProposal(proposalId, "replay"),
+        }),
+      });
+    }
+
+    if (isChapterTwo && (instructions.includes("OutlineConsistencyAgent") || instructions.includes("ChapterOutlineConsistencyAuditAgent"))) {
+      auditCalls += 1;
+      const proposalIds = [...new Set([...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]))];
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: auditCalls === 1 ? "第一场重演了上一章已成立钩子，必须修复。" : "修复后已改成直接推进。",
+          candidateAudits: proposalIds.map((proposalId) => ({
+            proposalId,
+            passed: auditCalls > 1,
+            score: auditCalls > 1 ? 93 : 32,
+            summary: auditCalls > 1 ? "第一场已改成直接推进。" : "第一场把上一章已成立钩子重新当成主推进。",
+            issues: auditCalls > 1 ? [] : [
+              {
+                id: "carryover_hook_replay",
+                severity: "critical",
+                category: "开场连续性",
+                description: "第一场没有直接推进上一章钩子的后续执行，而是把已成立判断重新演成主动作。",
+                evidence: proposalId,
+                suggestion: "保留余波，删除重复提出，把第一场改成直接查验或执行。",
+              },
+            ],
+            revisionNotes: auditCalls > 1 ? [] : ["第一场直接推进查验动作，不要重复成立上一章钩子。"],
+          })),
+        }),
+      });
+    }
+
+    if (isChapterTwo && (instructions.includes("OutlineNormalizationAgent") || instructions.includes("ChapterOutlineRepairAgent"))) {
+      repairCalls += 1;
+      const proposalIds = [...new Set([...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]))];
+      return jsonResponse({
+        output_text: JSON.stringify({
+          proposals: proposalIds.map((proposalId) => buildCarryoverReplayTestProposal(proposalId, "direct")),
+        }),
+      });
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    const outlineRun = await runWriteChapter(store, {
+      outlineOptions: { variantCount: 2, diversityPreset: "standard" },
+    });
+    assert.equal(outlineRun.project.phase.write.status, "chapter_outline_pending_review");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const outlineDraft = await store.loadChapterDraft("ch002");
+  assert.ok(outlineDraft.outlineContinuityAudit.attempts[0].candidateAudits.every((audit) =>
+    audit.issues.some((issue) => issue.id === "carryover_hook_replay" && issue.severity === "critical")));
+})));
+
+test("repair converts replayed hook into direct continuation", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-outline-hook-repair-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+  await lockNextChapter(store);
+
+  const previousFetch = globalThis.fetch;
+  let auditCalls = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input);
+    const isChapterTwo = inputText.includes("当前章节：ch002");
+
+    if (isChapterTwo && instructions.includes("ContinuityResolutionAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          defaultEntryMode: "direct_resume",
+          allowedEntryModes: ["direct_resume", "same_scene_later"],
+          resumeFrom: "许三娘已经指出吃水异常与底舱重物，下一步必须立刻查验。",
+          previousActionPressure: "上一章已完成异常判断，现场余波还在持续。",
+          resolvedActions: ["许三娘已指出吃水线异常与底舱重物，只能推进查验/揭晓，不可重新完整演发现过程"],
+          nextActionObligations: ["第一场直接推进开门查验与异常来源核实。"],
+          allowedContinuations: ["立刻查验异常源头并承接后果。"],
+          forbiddenReplays: ["不要重新穿越或重新开篇。"],
+          mustReferenceEvidenceRefs: [],
+          unsupportedOpenings: ["把已成立异常重新写成新发现"],
+          confidence: 0.9,
+          reviewRequired: false,
+        }),
+      });
+    }
+
+    if (isChapterTwo && instructions.includes("StagePlanningContextAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          chapterMission: "把上一章已经成立的异常判断直接推进成现场查验。",
+          requiredBeats: ["第一场直接执行查验动作", "查验结果立刻放大后续压力"],
+          mustPreserve: ["不要把上一章已成立判断重新写成新发现"],
+          deferRules: ["不要提前解决终局"],
+          suggestedConflictAxis: ["余波尚在时立即执行"],
+          titleSignals: ["封门", "查验"],
+          nextPressure: "查验结果把局势推向更危险的后续处置。",
+        }),
+      });
+    }
+
+    if (isChapterTwo && instructions.includes("ChapterContinuityAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          entryMode: "direct_resume",
+          entryLink: "承接上一章已经成立的异常判断与高压余波。",
+          dominantCarryoverThread: "对上一章已成立异常进行直接查验。",
+          firstSceneMustAdvance: "第一场必须直接推进开门查验与异常来源核实。",
+          subordinateThreads: ["现场余波可以保留，但不能盖过执行动作。"],
+          mustAdvanceThisChapter: "完成查验并把后果推成新的处置压力。",
+          canPauseThisChapter: ["远期布局"],
+          exitPressureToNextChapter: "查验后的真实风险已经压到眼前。",
+          continuityRisks: ["不要把上一章已成立异常再次写成新的判断。"],
+          evidenceRefs: [],
+          unsupportedClaims: [],
+        }),
+      });
+    }
+
+    if (isChapterTwo && instructions.includes("ChapterOutlineAgent")) {
+      const proposalId = outlineVariantProposalIdFromInput(inputText);
+      return jsonResponse({
+        output_text: JSON.stringify({
+          proposal: buildCarryoverReplayTestProposal(proposalId, "replay"),
+        }),
+      });
+    }
+
+    if (isChapterTwo && (instructions.includes("OutlineConsistencyAgent") || instructions.includes("ChapterOutlineConsistencyAuditAgent"))) {
+      auditCalls += 1;
+      const proposalIds = [...new Set([...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]))];
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: auditCalls === 1 ? "第一场重演了上一章已成立钩子，必须修复。" : "修复后已改成直接推进。",
+          candidateAudits: proposalIds.map((proposalId) => ({
+            proposalId,
+            passed: auditCalls > 1,
+            score: auditCalls > 1 ? 93 : 32,
+            summary: auditCalls > 1 ? "第一场已改成直接推进。" : "第一场把上一章已成立钩子重新当成主推进。",
+            issues: auditCalls > 1 ? [] : [
+              {
+                id: "carryover_hook_replay",
+                severity: "critical",
+                category: "开场连续性",
+                description: "第一场没有直接推进上一章钩子的后续执行，而是把已成立判断重新演成主动作。",
+                evidence: proposalId,
+                suggestion: "保留余波，删除重复提出，把第一场改成直接查验或执行。",
+              },
+            ],
+            revisionNotes: auditCalls > 1 ? [] : ["第一场直接推进查验动作，不要重复成立上一章钩子。"],
+          })),
+        }),
+      });
+    }
+
+    if (isChapterTwo && (instructions.includes("OutlineNormalizationAgent") || instructions.includes("ChapterOutlineRepairAgent"))) {
+      const proposalIds = [...new Set([...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]))];
+      return jsonResponse({
+        output_text: JSON.stringify({
+          proposals: proposalIds.map((proposalId) => buildCarryoverReplayTestProposal(proposalId, "direct")),
+        }),
+      });
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    await runWriteChapter(store, {
+      outlineOptions: { variantCount: 2, diversityPreset: "standard" },
+    });
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const outlineDraft = await store.loadChapterDraft("ch002");
+  const firstScene = outlineDraft.chapterOutlineCandidates[0]?.chapterPlan?.scenes?.[0] || {};
+  const firstSceneText = JSON.stringify(firstScene);
+  assert.ok(outlineDraft.chapterOutlineHistory.some((item) => item.action === "outline_consistency_repair"));
+  assert.doesNotMatch(firstSceneText, /再次提出|再次指出|重新确认|重新发现/);
+  assert.match(firstSceneText, /查验|开门|核实|执行/);
+})));
+
+test("direct continuation candidate passes without replay repair", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-outline-hook-direct-pass-"));
+  const store = await createStore(tempRoot);
+
+  await runPlanDraft(store);
+  await reviewPlanDraft(store, { approved: true, feedback: "" });
+  await reviewPlanFinal(store, { approved: true, feedback: "" });
+  await lockNextChapter(store);
+
+  const previousFetch = globalThis.fetch;
+  let repairCalls = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const instructions = String(payload.instructions || "");
+    const inputText = extractInputText(payload.input);
+    const isChapterTwo = inputText.includes("当前章节：ch002");
+
+    if (isChapterTwo && instructions.includes("ContinuityResolutionAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          defaultEntryMode: "direct_resume",
+          allowedEntryModes: ["direct_resume", "same_scene_later"],
+          resumeFrom: "许三娘已经指出吃水异常与底舱重物，下一步必须立刻查验。",
+          previousActionPressure: "上一章已完成异常判断，现场余波还在持续。",
+          resolvedActions: ["许三娘已指出吃水线异常与底舱重物，只能推进查验/揭晓，不可重新完整演发现过程"],
+          nextActionObligations: ["第一场直接推进开门查验与异常来源核实。"],
+          allowedContinuations: ["立刻查验异常源头并承接后果。"],
+          forbiddenReplays: ["不要重新穿越或重新开篇。"],
+          mustReferenceEvidenceRefs: [],
+          unsupportedOpenings: ["把已成立异常重新写成新发现"],
+          confidence: 0.9,
+          reviewRequired: false,
+        }),
+      });
+    }
+
+    if (isChapterTwo && instructions.includes("StagePlanningContextAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          chapterMission: "把上一章已经成立的异常判断直接推进成现场查验。",
+          requiredBeats: ["第一场直接执行查验动作", "查验结果立刻放大后续压力"],
+          mustPreserve: ["不要把上一章已成立判断重新写成新发现"],
+          deferRules: ["不要提前解决终局"],
+          suggestedConflictAxis: ["余波尚在时立即执行"],
+          titleSignals: ["封门", "查验"],
+          nextPressure: "查验结果把局势推向更危险的后续处置。",
+        }),
+      });
+    }
+
+    if (isChapterTwo && instructions.includes("ChapterContinuityAgent")) {
+      return jsonResponse({
+        output_text: JSON.stringify({
+          entryMode: "direct_resume",
+          entryLink: "承接上一章已经成立的异常判断与高压余波。",
+          dominantCarryoverThread: "对上一章已成立异常进行直接查验。",
+          firstSceneMustAdvance: "第一场必须直接推进开门查验与异常来源核实。",
+          subordinateThreads: ["现场余波可以保留，但不能盖过执行动作。"],
+          mustAdvanceThisChapter: "完成查验并把后果推成新的处置压力。",
+          canPauseThisChapter: ["远期布局"],
+          exitPressureToNextChapter: "查验后的真实风险已经压到眼前。",
+          continuityRisks: ["不要把上一章已成立异常再次写成新的判断。"],
+          evidenceRefs: [],
+          unsupportedClaims: [],
+        }),
+      });
+    }
+
+    if (isChapterTwo && instructions.includes("ChapterOutlineAgent")) {
+      const proposalId = outlineVariantProposalIdFromInput(inputText);
+      return jsonResponse({
+        output_text: JSON.stringify({
+          proposal: buildCarryoverReplayTestProposal(proposalId, "direct"),
+        }),
+      });
+    }
+
+    if (isChapterTwo && (instructions.includes("OutlineConsistencyAgent") || instructions.includes("ChapterOutlineConsistencyAuditAgent"))) {
+      const proposalIds = [...new Set([...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]))];
+      return jsonResponse({
+        output_text: JSON.stringify({
+          summary: "候选已按合同直接推进上一章钩子的后续执行。",
+          candidateAudits: proposalIds.map((proposalId) => ({
+            proposalId,
+            passed: true,
+            score: 94,
+            summary: "第一场承接正确，没有软重演。",
+            issues: [],
+            revisionNotes: [],
+          })),
+        }),
+      });
+    }
+
+    if (isChapterTwo && (instructions.includes("OutlineNormalizationAgent") || instructions.includes("ChapterOutlineRepairAgent"))) {
+      repairCalls += 1;
+    }
+
+    return previousFetch(url, options);
+  };
+
+  try {
+    const outlineRun = await runWriteChapter(store, {
+      outlineOptions: { variantCount: 2, diversityPreset: "standard" },
+    });
+    assert.equal(outlineRun.project.phase.write.status, "chapter_outline_pending_review");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const outlineDraft = await store.loadChapterDraft("ch002");
+  assert.equal(repairCalls, 0);
+  assert.ok(outlineDraft.outlineContinuityAudit.attempts[0].candidateAudits.every((audit) =>
+    !audit.issues.some((issue) => issue.id === "carryover_hook_replay")));
+  assert.ok(!outlineDraft.chapterOutlineHistory.some((item) => item.action === "outline_consistency_repair"));
+  assert.ok(outlineDraft.chapterOutlineCandidates.every((candidate) => candidate.selectable));
 })));
 
 test("chapter outline consistency repair can pass on the third audit round", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
@@ -3082,14 +3645,13 @@ test("chapter outline consistency repair can pass on the third audit round", asy
     const instructions = String(payload.instructions || "");
     const inputText = extractInputText(payload.input);
 
-    if (instructions.includes("ChapterOutlineConsistencyAuditAgent") && inputText.includes("当前章节：ch002")) {
+    if ((instructions.includes("OutlineConsistencyAgent") || instructions.includes("ChapterOutlineConsistencyAuditAgent")) && inputText.includes("当前章节：ch002")) {
       auditCalls += 1;
-      const proposalId = [...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]).at(-1) || "proposal_1";
+      const proposalIds = [...new Set([...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]))];
       return jsonResponse({
         output_text: JSON.stringify({
           summary: auditCalls < 3 ? "仍有残留连续性冲突。" : "第三轮已修复。",
-          candidateAudits: [
-            {
+          candidateAudits: proposalIds.map((proposalId) => ({
               proposalId,
               passed: auditCalls >= 3,
               score: auditCalls >= 3 ? 90 : 40,
@@ -3105,13 +3667,12 @@ test("chapter outline consistency repair can pass on the third audit round", asy
                 },
               ],
               revisionNotes: auditCalls >= 3 ? [] : ["补上上章压力和章末交棒。"],
-            },
-          ],
+            })),
         }),
       });
     }
 
-    if (instructions.includes("ChapterOutlineRepairAgent") && inputText.includes("当前章节：ch002")) {
+    if ((instructions.includes("OutlineNormalizationAgent") || instructions.includes("ChapterOutlineRepairAgent")) && inputText.includes("当前章节：ch002")) {
       repairCalls += 1;
       return previousFetch(url, options);
     }
@@ -3133,8 +3694,8 @@ test("chapter outline consistency repair can pass on the third audit round", asy
   assert.equal(outlineDraft.chapterOutlineHistory.filter((item) => item.action === "outline_consistency_repair").length, 2);
 })));
 
-test("chapter outline consistency audit enters manual review after five failing rounds", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
-  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-outline-manual-after-five-"));
+test("chapter outline consistency audit enters manual review after two failed repairs but still allows human force-approve", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-outline-manual-after-two-repairs-"));
   const store = await createStore(tempRoot);
 
   await runPlanDraft(store);
@@ -3156,14 +3717,13 @@ test("chapter outline consistency audit enters manual review after five failing 
       writerCalls += 1;
     }
 
-    if (instructions.includes("ChapterOutlineConsistencyAuditAgent") && inputText.includes("当前章节：ch002")) {
+    if ((instructions.includes("OutlineConsistencyAgent") || instructions.includes("ChapterOutlineConsistencyAuditAgent")) && inputText.includes("当前章节：ch002")) {
       auditCalls += 1;
-      const proposalId = [...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]).at(-1) || "proposal_1";
+      const proposalIds = [...new Set([...inputText.matchAll(/proposal_[\w-]+/g)].map((match) => match[0]))];
       return jsonResponse({
         output_text: JSON.stringify({
           summary: "持续存在阻断性连续性冲突。",
-          candidateAudits: [
-            {
+          candidateAudits: proposalIds.map((proposalId) => ({
               proposalId,
               passed: false,
               score: 30,
@@ -3179,13 +3739,12 @@ test("chapter outline consistency audit enters manual review after five failing 
                 },
               ],
               revisionNotes: ["彻底删除事实重置。"],
-            },
-          ],
+            })),
         }),
       });
     }
 
-    if (instructions.includes("ChapterOutlineRepairAgent") && inputText.includes("当前章节：ch002")) {
+    if ((instructions.includes("OutlineNormalizationAgent") || instructions.includes("ChapterOutlineRepairAgent")) && inputText.includes("当前章节：ch002")) {
       repairCalls += 1;
       return previousFetch(url, options);
     }
@@ -3204,13 +3763,25 @@ test("chapter outline consistency audit enters manual review after five failing 
   assert.equal(outlineRun.project.phase.write.status, "chapter_outline_pending_review");
   assert.equal(outlineDraft.reviewState.manualReviewRequired, true);
   assert.equal(outlineDraft.outlineContinuityAudit.manualReviewRequired, true);
-  assert.equal(outlineDraft.outlineContinuityAudit.attempts.length, 5);
-  assert.equal(auditCalls, 5);
-  assert.equal(repairCalls, 4);
+  assert.equal(outlineDraft.outlineContinuityAudit.attempts.length, 3);
+  assert.equal(auditCalls, 3);
+  assert.equal(repairCalls, 2);
+  assert.equal(outlineDraft.reviewState.selectableProposalIds.length, 0);
+  assert.equal(outlineDraft.reviewState.failedProposalIds.length, outlineDraft.chapterOutlineCandidates.length);
   assert.equal(writerCalls, 0);
+
+  const failedProposalId = outlineDraft.chapterOutlineCandidates[0]?.proposalId;
+  const writeRun = await reviewChapter(store, {
+    target: "chapter_outline",
+    approved: true,
+    reviewAction: "approve_single",
+    selectedProposalId: failedProposalId,
+    feedback: "",
+  });
+  assert.equal(writeRun.project.phase.write.status, "chapter_pending_review");
 })));
 
-test("composed chapter outline finalization is re-audited before writer generation", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
+test("composed chapter outline finalization goes directly to writer generation", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "novelex-outline-compose-reaudit-"));
   const store = await createStore(tempRoot);
 
@@ -3227,6 +3798,7 @@ test("composed chapter outline finalization is re-audited before writer generati
 
   const previousFetch = globalThis.fetch;
   let sawFinalize = false;
+  let outlineAuditCalls = 0;
   let writerCalls = 0;
 
   globalThis.fetch = async (url, options = {}) => {
@@ -3270,31 +3842,9 @@ test("composed chapter outline finalization is re-audited before writer generati
       });
     }
 
-    if (instructions.includes("ChapterOutlineConsistencyAuditAgent") && sawFinalize) {
-      return jsonResponse({
-        output_text: JSON.stringify({
-          summary: "组合细纲最终稿存在历史冲突。",
-          candidateAudits: [
-            {
-              proposalId: "proposal_1",
-              passed: false,
-              score: 25,
-              summary: "组合稿重置历史。",
-              issues: [
-                {
-                  id: "history_fact_conflict",
-                  severity: "critical",
-                  category: "历史事实冲突",
-                  description: "组合细纲把已经发生的事件重新写成未发生。",
-                  evidence: "重新写成未发生",
-                  suggestion: "按已锁章节事实重接 scene。",
-                },
-              ],
-              revisionNotes: ["按已锁章节事实重接 scene。"],
-            },
-          ],
-        }),
-      });
+    if ((instructions.includes("OutlineConsistencyAgent") || instructions.includes("ChapterOutlineConsistencyAuditAgent")) && sawFinalize) {
+      outlineAuditCalls += 1;
+      return previousFetch(url, options);
     }
 
     if (instructions.includes("WriterAgent")) {
@@ -3319,10 +3869,12 @@ test("composed chapter outline finalization is re-audited before writer generati
   }
 
   const nextDraft = await store.loadChapterDraft("ch001");
-  assert.equal(reviewRun.project.phase.write.status, "chapter_outline_pending_review");
-  assert.equal(nextDraft.reviewState.manualReviewRequired, true);
-  assert.equal(nextDraft.outlineContinuityAudit.manualReviewRequired, true);
-  assert.equal(writerCalls, 0);
+  assert.equal(reviewRun.project.phase.write.status, "chapter_pending_review");
+  assert.equal(nextDraft.selectedChapterOutline.mode, "composed");
+  assert.equal(nextDraft.selectedChapterOutline.source, "manual_composed");
+  assert.equal(sawFinalize, true);
+  assert.equal(outlineAuditCalls, 0);
+  assert.equal(writerCalls, 1);
 })));
 
 test("style fingerprints are stored globally, editable, and reusable across projects", async () => withIsolatedProviderEnv(async () => withStubbedOpenAI(async () => {
@@ -6610,6 +7162,16 @@ test("agent model slots can route complex and simple calls to different provider
       input: `请输出 JSON：\n{"ok":true}`,
       agentComplexity: "simple",
     });
+    const secondaryStructuredResult = await generateStructuredObject(provider, {
+      label: "SecondaryStructuredAgent",
+      instructions: "只输出 JSON，不要解释。",
+      input: `请输出 JSON：\n{"ok":true}`,
+      agentComplexity: "simple",
+      preferredAgentSlot: "secondary",
+      normalize(parsed) {
+        return parsed;
+      },
+    });
     const defaultResult = await provider.generateText({
       instructions: "default route",
       input: "default",
@@ -6618,6 +7180,7 @@ test("agent model slots can route complex and simple calls to different provider
     assert.equal(complexResult.text, "complex-ok");
     assert.equal(simpleResult.text, "simple-ok");
     assert.equal(strictStructuredResult.text, "{\"ok\":true}");
+    assert.equal(secondaryStructuredResult.ok, true);
     assert.equal(defaultResult.text, "default-ok");
     assert.deepEqual(
       seenCalls.map((entry) => entry.targetUrl),
@@ -6625,6 +7188,7 @@ test("agent model slots can route complex and simple calls to different provider
         "https://openai.example/v1/responses",
         "https://api.minimaxi.com/v1/chat/completions",
         "https://openai.example/v1/responses",
+        "https://api.minimaxi.com/v1/chat/completions",
         "https://openai.example/v1/responses",
       ],
     );
@@ -6633,7 +7197,8 @@ test("agent model slots can route complex and simple calls to different provider
     assert.equal(seenCalls[2].payload.model, "gpt-5.4");
     assert.match(seenCalls[2].payload.instructions, /输出格式规则（必须严格遵守）/);
     assert.match(seenCalls[2].payload.instructions, /不要使用 ```/);
-    assert.equal(seenCalls[3].payload.model, "gpt-5.4");
+    assert.equal(seenCalls[3].payload.model, "MiniMax-M2.5-highspeed");
+    assert.equal(seenCalls[4].payload.model, "gpt-5.4");
   } finally {
     globalThis.fetch = previousFetch;
   }

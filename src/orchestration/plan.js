@@ -1047,7 +1047,7 @@ async function generateStageBlueprintViaProvider(
   openingReferencePacket = null,
   retryNotes = [],
 ) {
-  const stageForeshadowings = foreshadowingRegistry.foreshadowings.filter((item) =>
+  const stageForeshadowings = (foreshadowingRegistry?.foreshadowings || []).filter((item) =>
     foreshadowingTouchesStage(item, stageSpec),
   );
 
@@ -1111,7 +1111,7 @@ async function generateStructureBatchViaProvider(
   batchSpec,
   retryNotes = [],
 ) {
-  const batchForeshadowings = foreshadowingRegistry.foreshadowings.filter((item) =>
+  const batchForeshadowings = (foreshadowingRegistry?.foreshadowings || []).filter((item) =>
     foreshadowingTouchesRange(item, batchSpec.chapterStart, batchSpec.chapterEnd),
   );
 

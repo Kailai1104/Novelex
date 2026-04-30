@@ -2291,6 +2291,10 @@ function slotNameForAgentComplexity(settings, agentComplexity = "complex") {
 }
 
 function slotNameForRequest(settings, options = {}) {
+  const preferredAgentSlot = String(options?.preferredAgentSlot || "").trim();
+  if (preferredAgentSlot === "primary" || preferredAgentSlot === "secondary") {
+    return preferredAgentSlot;
+  }
   if (looksLikeStrictStructuredOutput(options)) {
     return settings?.agentRouting?.complex || "primary";
   }

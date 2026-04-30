@@ -9,6 +9,7 @@ import {
   runFactSelectorAgent,
 } from "../core/facts.js";
 import { createExcerpt, extractJsonObject, nowIso, safeJsonParse, unique } from "../core/text.js";
+import { generateTextWithJsonFallback } from "../llm/structured.js";
 
 const OUTLINE_EXCERPT_LIMIT = 4200;
 const WORLDBUILDING_EXCERPT_LIMIT = 3400;
@@ -16,6 +17,7 @@ const CHARACTER_DOC_EXCERPT_LIMIT = 1000;
 const HISTORY_MARKDOWN_EXCERPT_LIMIT = 2200;
 const HISTORY_CANDIDATE_EXCERPT_LIMIT = 220;
 const MAX_HISTORY_SELECTION = 4;
+const CONTEXT_ROUTING_SLOT = "secondary";
 const STRICT_JSON_OUTPUT_RULES = [
   "硬性输出规则：",
   "1. 最终回复必须且只能是一个合法 JSON 对象。",
@@ -635,8 +637,10 @@ async function runOutlineContextAgent({
 }) {
   const structureData = bundle?.structureData || {};
   const stage = stageForChapter(structureData, chapterPlan);
-  const result = await provider.generateText({
+  const parsed = await generateTextWithJsonFallback(provider, {
+    label: "OutlineContextAgent",
     agentComplexity: "simple",
+    preferredAgentSlot: CONTEXT_ROUTING_SLOT,
     instructions: withStrictJsonInstructions(
       "你是 Novelex 的 OutlineContextAgent。你负责从已锁定的大纲包里，为当前章节筛选真正会影响写作的总纲、阶段与章节上下文。不要复述全书，只保留当前章节必须兑现、必须保留、必须延后、最容易写偏的内容。只输出 JSON。",
     ),
@@ -668,7 +672,6 @@ async function runOutlineContextAgent({
     },
   });
 
-  const parsed = parseAgentJson(result, "OutlineContextAgent");
   return {
     source: "agent",
     storyPromises: normalizeStringArray(parsed.storyPromises, 4),
@@ -769,8 +772,10 @@ async function runWorldContextAgent({
   styleGuideText,
   researchPacket,
 }) {
-  const result = await provider.generateText({
+  const parsed = await generateTextWithJsonFallback(provider, {
+    label: "WorldContextAgent",
     agentComplexity: "simple",
+    preferredAgentSlot: CONTEXT_ROUTING_SLOT,
     instructions: withStrictJsonInstructions(
       "你是 Novelex 的 WorldContextAgent。你负责从世界观、世界状态、伏笔注册表与风格指南中，筛出当前章节真正需要的世界约束。重点只保留会影响这一章写法的时代细节、世界规则、伏笔任务、风格禁忌与连续性提醒。只输出 JSON。",
     ),
@@ -798,7 +803,6 @@ async function runWorldContextAgent({
     },
   });
 
-  const parsed = parseAgentJson(result, "WorldContextAgent");
   return {
     source: "agent",
     worldConstraints: normalizeStringArray(parsed.worldConstraints, 6),
@@ -844,8 +848,10 @@ async function runHistorySelectorAgent({
   chapterPlan,
   candidates,
 }) {
-  const result = await provider.generateText({
+  const parsed = await generateTextWithJsonFallback(provider, {
+    label: "HistorySelectorAgent",
     agentComplexity: "simple",
+    preferredAgentSlot: CONTEXT_ROUTING_SLOT,
     instructions:
       "你是 Novelex 的 HistorySelectorAgent。你能看到所有已完成历史章节的摘要。请根据当前章节需求，挑出最值得 Writer 回看的 0 到 4 章。只选真正会影响这一章的连续性、人物余波、未完线程或世界状态的章节。只输出 JSON。",
     input: [
@@ -866,7 +872,6 @@ async function runHistorySelectorAgent({
     },
   });
 
-  const parsed = parseAgentJson(result, "HistorySelectorAgent");
   const reasons = parsed.reasons && typeof parsed.reasons === "object" ? parsed.reasons : {};
 
   return (Array.isArray(parsed.selectedChapterIds) ? parsed.selectedChapterIds : [])
@@ -885,8 +890,10 @@ async function runHistoryDigestAgent({
   chapterPlan,
   selectedCandidates,
 }) {
-  const result = await provider.generateText({
+  const parsed = await generateTextWithJsonFallback(provider, {
+    label: "HistoryContextAgent",
     agentComplexity: "simple",
+    preferredAgentSlot: CONTEXT_ROUTING_SLOT,
     instructions:
       "你是 Novelex 的 HistoryContextAgent。你负责阅读被挑中的历史章节，为 Writer 整理当前章节真正需要承接的历史内容。不要复述整章，只保留必须承接的事实、情绪余波、未完线程和不能冲突的点。只输出 JSON。",
     input: [
@@ -916,7 +923,6 @@ async function runHistoryDigestAgent({
     },
   });
 
-  const parsed = parseAgentJson(result, "HistoryContextAgent");
   const continuityAnchors = unique([
     ...normalizeStringArray(parsed.mustNotContradict, 8),
     ...selectedCandidates.flatMap((item) => item.continuityAnchors || []),

@@ -1,5 +1,6 @@
 import path from "node:path";
 
+import { generateTextWithJsonFallback } from "../llm/structured.js";
 import {
   chapterNumberFromId,
   createExcerpt,
@@ -16,6 +17,7 @@ const FACT_TYPE_VALUES = new Set([
   "judgement",
   "relationship",
 ]);
+const FACT_ROUTING_SLOT = "secondary";
 
 const FACT_STATUS_VALUES = new Set(["established", "open_tension"]);
 
@@ -76,8 +78,10 @@ export async function runChapterFactExtractionAgent({
   const chapterId = chapterPlan?.chapterId || "ch000";
   const excerpt = createExcerpt(chapterDraft?.markdown || "", 6000);
 
-  const result = await provider.generateText({
+  const parsed = await generateTextWithJsonFallback(provider, {
+    label: "ChapterFactExtractionAgent",
     agentComplexity: "simple",
+    preferredAgentSlot: FACT_ROUTING_SLOT,
     instructions:
       "你是 Novelex 的 ChapterFactExtractionAgent。你的任务是从已批准的章节正文中提取结构化 canon facts（既定事实账本）。只输出 JSON，不要解释。",
     input: [
@@ -99,11 +103,6 @@ export async function runChapterFactExtractionAgent({
       chapterId,
     },
   });
-
-  const parsed = safeJsonParse(extractJsonObject(result.text), null);
-  if (!parsed || typeof parsed !== "object") {
-    throw new Error(`ChapterFactExtractionAgent 返回了无法解析的 JSON：${createExcerpt(result.text || "", 220)}`);
-  }
 
   return normalizeExtractionResult(parsed, chapterId);
 }
@@ -228,8 +227,10 @@ export async function runFactSelectorAgent({
     .map((f) => `- ${f.factId}｜${f.chapterId}｜${f.status}｜type=${f.type}｜subject=${f.subject}｜assertion=${f.assertion}`)
     .join("\n");
 
-  const result = await provider.generateText({
+  const parsed = await generateTextWithJsonFallback(provider, {
+    label: "FactSelectorAgent",
     agentComplexity: "simple",
+    preferredAgentSlot: FACT_ROUTING_SLOT,
     instructions:
       "你是 Novelex 的 FactSelectorAgent。请从已批准章节的事实账本中，挑出与当前章节最相关的一组事实。只输出 JSON，不要解释。",
     input: [
@@ -249,9 +250,8 @@ export async function runFactSelectorAgent({
     },
   });
 
-  const parsed = safeJsonParse(extractJsonObject(result.text), null);
-  if (!parsed || !Array.isArray(parsed.selectedFactIds)) {
-    throw new Error(`FactSelectorAgent 返回了无效结果：${createExcerpt(result.text || "", 220)}`);
+  if (!Array.isArray(parsed.selectedFactIds)) {
+    throw new Error(`FactSelectorAgent 返回了无效结果：selectedFactIds 不是数组`);
   }
 
   const selectedIds = new Set(parsed.selectedFactIds.map((id) => String(id || "").trim()).filter(Boolean));
@@ -278,6 +278,7 @@ export function buildFactContextMarkdown({
   chapterPlan,
   establishedFacts,
   openTensions,
+  closedThreads = [],
   selectionRationale,
 }) {
   const establishedLines = establishedFacts.length
@@ -286,6 +287,9 @@ export function buildFactContextMarkdown({
 
   const tensionLines = openTensions.length
     ? openTensions.map((f) => `- [${f.factId}] ${f.subject}｜${f.assertion}${f.evidence ? `｜证据：${createExcerpt(f.evidence, 60)}` : ""}`).join("\n")
+    : "- 无";
+  const closedLines = closedThreads.length
+    ? closedThreads.map((item) => `- [${item.sourceRef || item.factId || item.threadId}] ${item.label || item.subject || "已关闭线程"}｜${item.summary || item.assertion || ""}`).join("\n")
     : "- 无";
 
   return [
@@ -301,6 +305,10 @@ export function buildFactContextMarkdown({
     `## 可以继续发酵的开放张力（${openTensions.length} 条）`,
     "允许角色继续争执执行方式/代价/后果，但不能改写底层结论。",
     tensionLines,
+    "",
+    `## 已完成/已失效线程（不可重开，${closedThreads.length} 条）`,
+    "这些线程只能回收后果、余波或失效代价，不能重新写成当前待完成任务。",
+    closedLines,
   ].join("\n");
 }
 
@@ -308,6 +316,7 @@ export function buildFactContextPacket({
   chapterPlan,
   establishedFacts,
   openTensions,
+  closedThreads = [],
   selectionRationale,
   catalogStats,
 }) {
@@ -315,6 +324,7 @@ export function buildFactContextPacket({
     chapterPlan,
     establishedFacts,
     openTensions,
+    closedThreads,
     selectionRationale,
   });
 
@@ -336,6 +346,15 @@ export function buildFactContextPacket({
       subject: f.subject,
       assertion: f.assertion,
       evidence: f.evidence,
+    })),
+    closedThreads: closedThreads.map((item) => ({
+      threadId: item.threadId,
+      label: item.label,
+      status: item.status,
+      summary: item.summary,
+      chapterId: item.chapterId,
+      sourceRef: item.sourceRef,
+      evidence: item.evidence,
     })),
     selectionRationale: String(selectionRationale || "").trim(),
     catalogStats: catalogStats || { totalFacts: 0, selected: 0 },

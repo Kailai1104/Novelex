@@ -1326,22 +1326,48 @@ function renderChapterOutlineReviewBody(pending = null) {
   const chapterId = pending?.chapterPlan?.chapterId || pending?.chapterId || "pending";
   const selectedScenes = selectedOutlineScenes(pending);
   const candidates = pending?.chapterOutlineCandidates || [];
+  const composedAuditSummary = String(pending?.reviewState?.composedAuditSummary || "").trim();
+  const composedAuditIssues = (pending?.reviewState?.composedAuditIssues || []).filter(Boolean);
 
   return `
     <div class="review-body">
       <p>先确定本章细纲，再进入正文生成。你可以直接采用某个方案，也可以把不同方案里的 scene 组合成最终细纲。</p>
       <textarea id="feedback-chapter-outline" placeholder="写下组合说明或重生反馈，比如想强化哪条关系线、换成更险的冲突轴、让章末更狠一点。" ${disabledAttr(mutationBusy())}>${escapeHtml(pending?.selectedChapterOutline?.authorNotes || "")}</textarea>
+      ${composedAuditSummary ? `
+        <div class="outline-audit-panel" data-tone="danger">
+          <strong>组合稿未通过审计</strong>
+          <p>${escapeHtml(composedAuditSummary)}</p>
+          ${composedAuditIssues.length ? `
+            <ul class="outline-issue-list">
+              ${composedAuditIssues.slice(0, 4).map((issue) => `<li>${escapeHtml(issue.description || String(issue || ""))}</li>`).join("")}
+            </ul>
+          ` : ""}
+          <p><small>请重新组合，或直接选择已通过预审的候选。</small></p>
+        </div>
+      ` : ""}
       <div class="candidate-stack">
-        ${candidates.map((candidate) => `
-          <div class="candidate-card">
+        ${candidates.map((candidate) => {
+          const candidateSelectable = candidate?.selectable !== false && candidate?.auditStatus !== "failed";
+          return `
+          <div class="candidate-card ${candidateSelectable ? "is-passed" : "is-failed"}">
             <div class="candidate-head">
               <div>
                 <strong>${escapeHtml(candidate.proposalId)} · ${escapeHtml(candidate.chapterPlan?.title || "")}</strong>
+                <div class="pill-row candidate-status-row">
+                  <span class="mini-pill" data-tone="${candidateSelectable ? "success" : "danger"}">${candidateSelectable ? "预审通过" : "预审失败"}</span>
+                  ${Number.isFinite(Number(candidate?.auditScore)) ? `<span class="mini-pill" data-tone="${candidateSelectable ? "success" : "danger"}">score ${escapeHtml(candidate.auditScore)}</span>` : ""}
+                </div>
                 <p>${escapeHtml(candidate.summary || "")}</p>
                 <p><small>${escapeHtml(candidate.diffSummary || "")}</small></p>
+                ${candidate.auditSummary ? `<p><small>${escapeHtml(candidate.auditSummary)}</small></p>` : ""}
+                ${!candidateSelectable && (candidate.auditIssues || []).length ? `
+                  <ul class="outline-issue-list">
+                    ${(candidate.auditIssues || []).slice(0, 3).map((issue) => `<li>${escapeHtml(issue.description || String(issue || ""))}</li>`).join("")}
+                  </ul>
+                ` : ""}
               </div>
               <button class="button button-primary" data-review-target="chapter_outline" data-review-action="approve_single" data-selected-proposal-id="${escapeHtml(candidate.proposalId)}" ${disabledAttr(mutationBusy())}>
-                ${mutationBusy("chapter_review") ? "提交中..." : "直接采用"}
+                ${mutationBusy("chapter_review") ? "提交中..." : candidateSelectable ? "直接采用" : "仍然采用"}
               </button>
             </div>
             <div class="candidate-scene-list">
@@ -1359,7 +1385,7 @@ function renderChapterOutlineReviewBody(pending = null) {
               `).join("")}
             </div>
           </div>
-        `).join("") || `<div class="empty">当前没有可用的细纲候选。</div>`}
+        `; }).join("") || `<div class="empty">当前没有可用的细纲候选。</div>`}
       </div>
       <div class="compose-card">
         <strong>最终细纲工作区</strong>
@@ -1393,6 +1419,10 @@ function renderChapterReviewBody(pending = null) {
   const reviewState = pending?.reviewState || {};
   const wordCount = pendingChapterWordCount(pending);
   const issueCounts = validation.issueCounts || { critical: 0, warning: 0, info: 0 };
+  const validationIssues = Array.isArray(validation.issues) ? validation.issues : [];
+  const activeDimensions = Array.isArray(validation.activeDimensions) ? validation.activeDimensions : [];
+  const auditGroups = Array.isArray(validation.auditGroups) ? validation.auditGroups : [];
+  const dimensionMeta = new Map(activeDimensions.map((item) => [item.id, item]));
   const manualReviewRequired = Boolean(reviewState.manualReviewRequired);
   const feedbackSupervisionPassed = reviewState.feedbackSupervisionPassed !== false;
   const approvalOverrideRequired = manualReviewRequired || validation?.overallPassed === false || !feedbackSupervisionPassed;
@@ -1430,6 +1460,49 @@ function renderChapterReviewBody(pending = null) {
       : issueCounts.warning
         ? "当前章节可批准，但仍有 warning"
         : "当前没有阻止通过的 critical 问题";
+  const auditGroupsMarkup = auditGroups.length ? `
+      <div class="compose-card">
+        <strong>分组审计</strong>
+        <p><small>当前正文审计被拆为 3 个并行方向；下面展示每组负责的维度、命中问题数和分组摘要。</small></p>
+        <div class="compose-list">
+          ${auditGroups.map((group) => {
+            const dimensionIds = Array.isArray(group?.dimensionIds) ? group.dimensionIds : [];
+            const groupIssues = validationIssues.filter((issue) => dimensionIds.includes(issue?.id));
+            const groupCounts = groupIssues.reduce((acc, issue) => {
+              const severity = String(issue?.severity || "").trim();
+              if (severity in acc) acc[severity] += 1;
+              return acc;
+            }, { critical: 0, warning: 0, info: 0 });
+            const dimensionLabels = dimensionIds.map((id) => {
+              const meta = dimensionMeta.get(id);
+              return meta ? `${id}（${meta.category}）` : id;
+            });
+            const slotLabel = group?.preferredAgentSlot === "primary" ? "主审计槽" : "辅审计槽";
+            const stateLabel = group?.error
+              ? "执行失败"
+              : groupCounts.critical
+                ? "存在 critical"
+                : groupCounts.warning
+                  ? "存在 warning"
+                  : groupCounts.info
+                    ? "仅 info"
+                    : "通过";
+
+            return `
+              <div class="compose-item">
+                <div>
+                  <strong>${escapeHtml(group?.label || group?.id || "未命名分组")}</strong>
+                  <p><small>${escapeHtml(`${slotLabel}｜状态：${stateLabel}｜critical ${groupCounts.critical} / warning ${groupCounts.warning} / info ${groupCounts.info}`)}</small></p>
+                  <p><small>${escapeHtml(`负责维度：${dimensionLabels.join("、") || "无"}`)}</small></p>
+                  ${group?.summary ? `<p><small>${escapeHtml(`摘要：${group.summary}`)}</small></p>` : ""}
+                  ${group?.error ? `<p><small>${escapeHtml(`错误：${group.error}`)}</small></p>` : ""}
+                </div>
+              </div>
+            `;
+          }).join("")}
+        </div>
+      </div>
+    ` : "";
 
   return `
     <div class="review-body">
@@ -1448,6 +1521,7 @@ function renderChapterReviewBody(pending = null) {
         ${blockingFeedbackIssues.length ? `<p><small>未落实反馈：${escapeHtml(blockingFeedbackIssues.join("；"))}</small></p>` : ""}
         ${blockingIssues.length ? `<p><small>未解决问题：${escapeHtml(blockingIssues.join("；"))}</small></p>` : ""}
       </div>
+      ${auditGroupsMarkup}
       <textarea id="feedback-chapter" placeholder="写下你的修改意见，比如要加强哪段冲突、调整节奏、补足人物动机或优化章末牵引。" ${disabledAttr(mutationBusy() || directEditActive)}></textarea>
       <div class="actions">
         <button class="button button-primary" data-review-target="chapter" data-review-action="approve" ${disabledAttr(mutationBusy() || directEditActive)}>${mutationBusy("chapter_review") ? "提交中..." : approveLabel}</button>
@@ -3129,6 +3203,21 @@ function bindEvents() {
         showToast("先往最终细纲工作区加入至少一个 scene，再提交组合定稿。");
         return;
       }
+      if (isOutlineReview && reviewAction === "approve_single") {
+        const selectedCandidate = (pending?.chapterOutlineCandidates || []).find((candidate) => candidate?.proposalId === selectedProposalId) || null;
+        const candidateSelectable = selectedCandidate?.selectable !== false && selectedCandidate?.auditStatus !== "failed";
+        if (!candidateSelectable) {
+          const outlineIssues = (selectedCandidate?.auditIssues || []).filter(Boolean).slice(0, 4);
+          const confirmationText = [
+            "该细纲候选未通过预审，确认仍要直接采用并进入正文写作吗？",
+            selectedCandidate?.auditSummary ? `审计结论：${selectedCandidate.auditSummary}` : "",
+            ...outlineIssues.map((issue) => `- ${issue.description || String(issue || "")}`),
+          ].filter(Boolean).join("\n");
+          if (!window.confirm(confirmationText)) {
+            return;
+          }
+        }
+      }
       if (isPartialRewrite && !String(partialWorkbench?.selectedText || "").trim()) {
         showToast("先在正文 body 中框选一段要修改的文本，再提交局部修订。");
         return;
@@ -3181,7 +3270,9 @@ function bindEvents() {
           render();
           showToast(
             isOutlineReview
-              ? approved ? "细纲已确认，系统正在生成正文。" : "细纲反馈已提交，系统正在重生候选。"
+              ? approved
+                ? "细纲已确认，系统正在生成正文。"
+                : "细纲反馈已提交，系统正在重生候选。"
               : approved
                 ? approvalOverrideRequired ? "未通过审计的章节已在显式确认后锁章。" : "审查结果已提交。"
                 : isPartialRewrite ? "局部修订意见已提交，系统正在只改选中片段。" : "修改意见已提交，系统正在根据反馈重写。",

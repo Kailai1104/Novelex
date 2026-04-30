@@ -7,6 +7,7 @@ import {
   safeJsonParse,
   unique,
 } from "../core/text.js";
+import { generateTextWithJsonFallback } from "../llm/structured.js";
 
 function buildQueryText(chapterPlan) {
   return [
@@ -87,7 +88,8 @@ async function chooseFilesWithAgent(provider, queryText, candidates) {
     return [];
   }
 
-  const result = await provider.generateText({
+  const parsed = await generateTextWithJsonFallback(provider, {
+    label: "FileRetrievalAgent",
     agentComplexity: "simple",
     instructions:
       "你是 Novelex 的 FileRetrievalAgent。你只能根据候选文件的文件名和描述做选择。请选出对当前章节写作最有帮助的 1 到 4 个文件。只输出 JSON，不要解释。",
@@ -109,9 +111,8 @@ async function chooseFilesWithAgent(provider, queryText, candidates) {
     ].join("\n"),
   });
 
-  const parsed = safeJsonParse(extractJsonObject(result.text), null);
-  if (!parsed || !Array.isArray(parsed.selectedIds) || !parsed.selectedIds.length) {
-    throw new Error(`FileRetrievalAgent 返回了无效结果：${createExcerpt(result.text || "", 240)}`);
+  if (!Array.isArray(parsed.selectedIds) || !parsed.selectedIds.length) {
+    throw new Error(`FileRetrievalAgent 返回了无效结果：selectedIds 不是非空数组`);
   }
 
   const reasons = parsed.reasons && typeof parsed.reasons === "object" ? parsed.reasons : {};

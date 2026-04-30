@@ -7,6 +7,12 @@ import {
   unique,
 } from "./text.js";
 import { generateStructuredObject } from "../llm/structured.js";
+import {
+  filterTimelineStateWithClosures,
+  renderContinuityClosuresMarkdown,
+} from "./continuity-closures.js";
+
+const TIMELINE_ROUTING_SLOT = "secondary";
 
 function normalizeString(value, fallback = "") {
   const normalized = String(value || "").trim();
@@ -42,10 +48,11 @@ function normalizeTimelineEntry(raw = {}, fallbackChapterId = "") {
 }
 
 function normalizeDeadline(raw = {}) {
+  const normalizedStatus = normalizeString(raw.status, "active").toLowerCase();
   return {
     id: normalizeString(raw.id || raw.name, "deadline"),
     label: normalizeString(raw.label || raw.name, "未命名期限"),
-    status: normalizeString(raw.status, "active"),
+    status: normalizedStatus === "expired" ? "invalidated" : normalizedStatus,
     firstEstablishedChapter: normalizeString(raw.firstEstablishedChapter || raw.first_established_chapter),
     latestMentionChapter: normalizeString(raw.latestMentionChapter || raw.latest_mention_chapter),
     latestStatement: normalizeString(raw.latestStatement || raw.latest_statement),
@@ -119,7 +126,13 @@ export async function loadChapterTimeline(store, chapterId) {
 export function renderTimelineContextMarkdown(timelineContext = {}) {
   const planning = timelineContext.temporalPlanning || {};
   const state = timelineContext.timelineState || createEmptyTimelineState();
-  const deadlineLines = (state.deadlines || [])
+  const activeDeadlineLines = (state.deadlines || [])
+    .filter((item) => item.status === "active")
+    .slice(0, 8)
+    .map((item) => `- ${item.label}｜${item.status}｜${item.latestStatement || item.narrativeMeaning || "无说明"}`)
+    .join("\n");
+  const closedDeadlineLines = (state.deadlines || [])
+    .filter((item) => item.status === "resolved" || item.status === "invalidated")
     .slice(0, 8)
     .map((item) => `- ${item.label}｜${item.status}｜${item.latestStatement || item.narrativeMeaning || "无说明"}`)
     .join("\n");
@@ -127,6 +140,9 @@ export function renderTimelineContextMarkdown(timelineContext = {}) {
     .slice(-4)
     .map((item) => `- ${item.chapterId}｜${item.timeLabel || "未标注"}｜${item.timeTransition || "无转场"}｜${item.endState || "无结束状态"}`)
     .join("\n");
+  const closureSection = timelineContext.continuityClosures
+    ? renderContinuityClosuresMarkdown(timelineContext.continuityClosures)
+    : "";
 
   return [
     `# ${timelineContext.chapterId || "chapter"} 时间线上下文`,
@@ -140,7 +156,10 @@ export function renderTimelineContextMarkdown(timelineContext = {}) {
     recentLines || "- 无已锁定时间线。",
     "",
     "## 有效倒计时",
-    deadlineLines || "- 无明确倒计时。",
+    activeDeadlineLines || "- 无明确倒计时。",
+    "",
+    "## 已关闭期限",
+    closedDeadlineLines || "- 无已关闭期限。",
     "",
     "## 本章时间合同",
     `- 推荐承接：${planning.recommendedTransition || "直接承接上章压力。"}`,
@@ -150,19 +169,27 @@ export function renderTimelineContextMarkdown(timelineContext = {}) {
     `- 跳跃理由：${planning.skipRationale || "无"}`,
     `- 跳过期间必须保留/交代：${(planning.mustCarryThrough || []).join("；") || "无"}`,
     `- 禁止的时间处理：${(planning.mustNotDo || []).join("；") || "无"}`,
-  ].join("\n");
+    closureSection ? "" : null,
+    closureSection || null,
+  ].filter((item) => item !== null).join("\n");
 }
 
 export function buildTimelineContextPacket({
   chapterPlan,
   timelineState,
   temporalPlanning = null,
+  continuityClosures = null,
 }) {
+  const filteredTimelineState = filterTimelineStateWithClosures(
+    normalizeTimelineState(timelineState),
+    continuityClosures,
+  );
   const packet = {
     chapterId: chapterPlan?.chapterId || "",
     generatedAt: nowIso(),
-    timelineState: normalizeTimelineState(timelineState),
-    temporalPlanning: temporalPlanning || createFallbackTemporalPlanning({ chapterPlan, timelineState }),
+    timelineState: filteredTimelineState,
+    temporalPlanning: temporalPlanning || createFallbackTemporalPlanning({ chapterPlan, timelineState: filteredTimelineState }),
+    continuityClosures,
   };
   packet.briefingMarkdown = renderTimelineContextMarkdown(packet);
   packet.summaryText = createExcerpt(packet.briefingMarkdown, 320);
@@ -205,16 +232,22 @@ export async function runTemporalPlanningAgent({
   project,
   chapterPlan,
   timelineState,
+  continuityClosures = null,
   previousOutline = null,
   previousChapterTail = "",
   factContext = null,
 }) {
   try {
+    const filteredTimelineState = filterTimelineStateWithClosures(
+      normalizeTimelineState(timelineState),
+      continuityClosures,
+    );
     return await generateStructuredObject(provider, {
       label: "TemporalPlanningAgent",
       agentComplexity: "simple",
+      preferredAgentSlot: TIMELINE_ROUTING_SLOT,
       instructions:
-        "你是 Novelex 的 TemporalPlanningAgent。你只负责章节时间承接与时间跳跃规划。时间跳跃是正常叙事工具，不要默认阻止；但必须判断跳跃是否逃避上一章压力、是否保留资源/伤势/敌情/倒计时代价。只输出 JSON。",
+        "你是 Novelex 的 TemporalPlanningAgent。你只负责章节时间承接与时间跳跃规划。时间跳跃是正常叙事工具，不要默认阻止；但必须判断跳跃是否逃避上一章压力、是否保留资源/伤势/敌情/倒计时代价。若某期限或线程已被标记为 resolved / invalidated，只能回顾其后果，不能把它重新写成当前章需启动或继续推进的 live deadline。只输出 JSON。",
       input: [
         `作品：${project.title}`,
         `题材：${project.genre}`,
@@ -225,7 +258,8 @@ export async function runTemporalPlanningAgent({
         `上一章细纲：\n${previousOutline ? JSON.stringify(previousOutline, null, 2) : "无"}`,
         `上一章正文尾部：\n${previousChapterTail || "无"}`,
         `已定事实/开放张力：\n${factContext?.briefingMarkdown || "无"}`,
-        `全局时间线：\n${timelineStateForPrompt(timelineState)}`,
+        `已关闭线程：\n${continuityClosures?.briefingMarkdown || "无"}`,
+        `全局时间线：\n${timelineStateForPrompt(filteredTimelineState)}`,
         `请输出 JSON：
 {
   "recommendedTransition": "本章开头应如何承接时间与压力",
@@ -259,7 +293,10 @@ export async function runTemporalPlanningAgent({
       },
     });
   } catch {
-    return createFallbackTemporalPlanning({ chapterPlan, timelineState });
+    return createFallbackTemporalPlanning({
+      chapterPlan,
+      timelineState: filterTimelineStateWithClosures(normalizeTimelineState(timelineState), continuityClosures),
+    });
   }
 }
 
@@ -274,6 +311,7 @@ export async function runTimelineExtractionAgent({
   return generateStructuredObject(provider, {
     label: "TimelineExtractionAgent",
     agentComplexity: "simple",
+    preferredAgentSlot: TIMELINE_ROUTING_SLOT,
     instructions:
       "你是 Novelex 的 TimelineExtractionAgent。你负责从最终批准正文中提取时间线状态，不做规则判断。请识别本章起止时间、时间跳跃、离屏变化、倒计时变化、资源/伤势/敌情等时间压力。只输出 JSON。",
     input: [
@@ -308,7 +346,7 @@ export async function runTimelineExtractionAgent({
     {
       "id": "deadline_1",
       "label": "期限名",
-      "status": "active / resolved / expired / uncertain",
+      "status": "active / resolved / invalidated / uncertain",
       "firstEstablishedChapter": "ch001",
       "latestMentionChapter": "ch001",
       "latestStatement": "最新期限表述",
@@ -394,6 +432,7 @@ export async function runTimelineAuditAgent({
   return generateStructuredObject(provider, {
     label: "TimelineAuditAgent",
     agentComplexity: "simple",
+    preferredAgentSlot: TIMELINE_ROUTING_SLOT,
     instructions:
       "你是 Novelex 的 TimelineAuditAgent。你只用语义判断审查章节时间线，不使用规则。时间跳跃本身是允许的；只有当跳跃逃避压力、消除代价、打乱倒计时或让人物/地点/资源状态不匹配时才报问题。只输出 JSON。",
     input: [

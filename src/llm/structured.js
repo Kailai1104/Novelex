@@ -13,11 +13,16 @@ export function parseStructuredObject(result, label = "StructuredAgent") {
   return parsed;
 }
 
+function isUsingAuxiliaryModel(options = {}) {
+  return options.preferredAgentSlot === "secondary" || options.agentComplexity === "simple";
+}
+
 export async function generateStructuredObject(provider, {
   label = "StructuredAgent",
   instructions,
   input,
   agentComplexity,
+  preferredAgentSlot,
   useReviewModel = false,
   model,
   tools,
@@ -32,10 +37,11 @@ export async function generateStructuredObject(provider, {
     throw new Error(`${label} 缺少可用 provider。`);
   }
 
-  const result = await provider.generateText({
+  const baseOptions = {
     instructions,
     input,
     agentComplexity,
+    preferredAgentSlot,
     useReviewModel,
     model,
     tools,
@@ -47,8 +53,49 @@ export async function generateStructuredObject(provider, {
       strictStructuredOutput: true,
     },
     temperature,
-  });
-  const parsed = parseStructuredObject(result, label);
+  };
+
+  let result = await provider.generateText(baseOptions);
+
+  try {
+    const parsed = parseStructuredObject(result, label);
+    return typeof normalize === "function" ? normalize(parsed, result) : parsed;
+  } catch (firstError) {
+    if (preferredAgentSlot !== "primary" && isUsingAuxiliaryModel(baseOptions)) {
+      result = await provider.generateText({
+        ...baseOptions,
+        preferredAgentSlot: "primary",
+      });
+      const parsed = parseStructuredObject(result, label);
+      return typeof normalize === "function" ? normalize(parsed, result) : parsed;
+    }
+    throw firstError;
+  }
+}
+
+export async function generateTextWithJsonFallback(provider, options = {}) {
+  if (!provider?.generateText) {
+    throw new Error(`${options.label || "Agent"} 缺少可用 provider。`);
+  }
+
+  const { label = "Agent", normalize = null, ...generateOptions } = options;
+  let result = await provider.generateText(generateOptions);
+  let parsed = safeJsonParse(extractJsonObject(result?.text || ""), null);
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    if (generateOptions.preferredAgentSlot !== "primary" && isUsingAuxiliaryModel(generateOptions)) {
+      result = await provider.generateText({
+        ...generateOptions,
+        preferredAgentSlot: "primary",
+      });
+      parsed = safeJsonParse(extractJsonObject(result?.text || ""), null);
+    }
+
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`${label} 返回了无法解析的 JSON：${createExcerpt(result?.text || "", 240)}`);
+    }
+  }
+
   return typeof normalize === "function" ? normalize(parsed, result) : parsed;
 }
 

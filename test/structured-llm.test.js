@@ -9,6 +9,7 @@ import { analyzeCharacterPresence } from "../src/core/character-presence.js";
 import {
   createMiniMaxValidationProvider,
   generateStructuredObject,
+  generateTextWithJsonFallback,
   parseStructuredObject,
 } from "../src/llm/structured.js";
 
@@ -49,6 +50,64 @@ test("generateStructuredObject normalizes provider JSON output", async () => {
     summary: "ok",
     items: ["A", "B"],
   });
+});
+
+test("generateStructuredObject retries with primary slot after secondary returns invalid JSON", async () => {
+  const calls = [];
+  const provider = {
+    async generateText(options) {
+      calls.push(options);
+      if (calls.length === 1) {
+        return { text: "not json" };
+      }
+      return { text: '{"summary":"fallback-ok","items":["A"]}' };
+    },
+  };
+
+  const result = await generateStructuredObject(provider, {
+    label: "FallbackStructuredAgent",
+    instructions: "ignored",
+    input: "ignored",
+    agentComplexity: "simple",
+    preferredAgentSlot: "secondary",
+  });
+
+  assert.deepEqual(result, {
+    summary: "fallback-ok",
+    items: ["A"],
+  });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].preferredAgentSlot, "secondary");
+  assert.equal(calls[1].preferredAgentSlot, "primary");
+});
+
+test("generateTextWithJsonFallback retries with primary slot after secondary returns invalid JSON", async () => {
+  const calls = [];
+  const provider = {
+    async generateText(options) {
+      calls.push(options);
+      if (calls.length === 1) {
+        return { text: "still not json" };
+      }
+      return { text: '{"summary":"fallback-ok","items":["A","B"]}' };
+    },
+  };
+
+  const result = await generateTextWithJsonFallback(provider, {
+    label: "FallbackTextAgent",
+    instructions: "ignored",
+    input: "ignored",
+    agentComplexity: "simple",
+    preferredAgentSlot: "secondary",
+  });
+
+  assert.deepEqual(result, {
+    summary: "fallback-ok",
+    items: ["A", "B"],
+  });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].preferredAgentSlot, "secondary");
+  assert.equal(calls[1].preferredAgentSlot, "primary");
 });
 
 test("CharacterPresenceAgent keeps only actually present planned characters", async () => {

@@ -41,6 +41,20 @@ function createIssue(id, severity, category, description, evidence = "", suggest
   };
 }
 
+function normalizeStringList(values, limit = Infinity) {
+  return unique((Array.isArray(values) ? values : [])
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)).slice(0, limit);
+}
+
+function normalizeReplayComparableText(value = "") {
+  return String(value || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/[“”"'`~!@#$%^&*()_\-+=[\]{}\\|;:,.<>/?！？。，、；：“”‘’（）《》【】\s]/g, "")
+    .trim()
+    .toLowerCase();
+}
+
 function stripDialogue(text = "") {
   return normalizeText(text)
     .replace(/“[^”]*”/g, "")
@@ -235,6 +249,29 @@ const CHAPTER_REPLAY_PATTERNS = [
   },
 ];
 
+const CARRYOVER_REPLAY_SIGNAL_DEFINITIONS = [
+  {
+    id: "lin_dinghai_first_aid",
+    resolvedText: "李凡已对林定海做第一轮勒脉止血，只能承接伤情后果，不可重新完整演止血",
+    hintPatterns: [/林定海/u, /止血|勒脉|绞标|扎紧|包扎/u],
+    detectionPatterns: [/林定海/u, /血|伤口|血脉/u, /止血|勒脉|绞标|扎紧|包扎/u, /麻布|布条|缠|按住|撕下/u],
+    minPatternMatches: 3,
+    category: "既定事实连续性",
+    description: "章节开头把上一章已经完成的急救止血重新写成了本章首次事件。",
+    suggestion: "上一章已完成第一轮止血；本章只能承接伤情后果、后续固定或伤势升级，不能重新完整演一遍止血过程。",
+  },
+  {
+    id: "draft_black_cargo_discovery",
+    resolvedText: "许三娘已指出吃水线异常与底舱重物，只能推进查验/揭晓，不可重新完整演发现过程",
+    hintPatterns: [/许三娘/u, /吃水|水线/u, /黑货|底舱|重物|盐袋/u],
+    detectionPatterns: [/许三娘/u, /吃水|水线|船身压得太低|压得深/u, /黑货|底舱|重物|盐袋/u, /盯着|看准|算死|掀开|查验/u],
+    minPatternMatches: 3,
+    category: "既定事实连续性",
+    description: "章节开头把上一章已经完成的黑货判断重新写成了本章首次发现。",
+    suggestion: "上一章已指出吃水线异常与底舱重物；本章只能推进查验、开舱或揭晓，不可重新完整演一遍发现与判断过程。",
+  },
+];
+
 function detectRepeatedChapterReplay(markdown = "") {
   const paragraphs = extractParagraphs(markdown);
   if (paragraphs.length < 8) {
@@ -319,6 +356,57 @@ function detectRepeatedChapterReplay(markdown = "") {
     reasons,
     evidence: unique(evidence).slice(0, 3),
   };
+}
+
+function countPatternMatches(text = "", patterns = []) {
+  return patterns.reduce((count, pattern) => (pattern.test(text) ? count + 1 : count), 0);
+}
+
+function resolveCarryoverReplayDefinitions(factContext = null, resolvedCarryoverBeats = []) {
+  const hints = normalizeReplayComparableText([
+    ...normalizeStringList(resolvedCarryoverBeats, 6),
+    ...((factContext?.openTensions || []).flatMap((item) => [item?.subject, item?.assertion])),
+    ...((factContext?.establishedFacts || []).flatMap((item) => [item?.subject, item?.assertion])),
+  ].join("\n"));
+
+  return CARRYOVER_REPLAY_SIGNAL_DEFINITIONS.filter((definition) => {
+    if (!hints) {
+      return false;
+    }
+    return definition.hintPatterns.some((pattern) => pattern.test(hints));
+  });
+}
+
+function detectCarryoverReplay(markdown = "", factContext = null, resolvedCarryoverBeats = []) {
+  const definitions = resolveCarryoverReplayDefinitions(factContext, resolvedCarryoverBeats);
+  if (!definitions.length) {
+    return [];
+  }
+
+  const openingParagraphs = extractParagraphs(markdown).slice(0, 4);
+  const issues = [];
+
+  for (const definition of definitions) {
+    const evidence = openingParagraphs
+      .filter((paragraph) => countPatternMatches(paragraph, definition.detectionPatterns) >= definition.minPatternMatches)
+      .map((paragraph) => createExcerpt(paragraph, 120))
+      .slice(0, 2);
+
+    if (!evidence.length) {
+      continue;
+    }
+
+    issues.push(createIssue(
+      "carryover_replay",
+      "critical",
+      definition.category,
+      definition.description,
+      evidence.join(" / "),
+      definition.suggestion,
+    ));
+  }
+
+  return issues;
 }
 
 function detectSummaryHeavyPacing(markdown = "") {
@@ -629,6 +717,8 @@ export function runAuditHeuristics({
   researchPacket,
   foreshadowingRegistry,
   recentChapters = [],
+  factContext = null,
+  resolvedCarryoverBeats = [],
 }) {
   const markdown = chapterDraft?.markdown || "";
   const issues = [];
@@ -692,6 +782,8 @@ export function runAuditHeuristics({
       "只保留一条完整事件链，删除重复开场、重复建立初始困局和重复验证段落。",
     ));
   }
+
+  issues.push(...detectCarryoverReplay(markdown, factContext, resolvedCarryoverBeats));
 
   const pacingSignals = detectSummaryHeavyPacing(markdown);
   if (

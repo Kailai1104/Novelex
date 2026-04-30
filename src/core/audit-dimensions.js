@@ -72,6 +72,13 @@ export const AUDIT_DIMENSIONS = [
     promptFocus: "检查单章内部是否空转、概述过多、重复推进、段落拼接痕迹重或节奏失衡。",
   },
   {
+    id: "chapter_restart_replay",
+    label: "Chapter Restart Replay",
+    category: "单章节奏",
+    legacyBucket: "plausibility",
+    promptFocus: "检查章节内部是否出现重复开场、重复建立同一困局或把同一条验证链当成新正文再演一遍。",
+  },
+  {
     id: "chapter_word_count",
     label: "Chapter Word Count",
     category: "章节字数",
@@ -108,6 +115,13 @@ export const AUDIT_DIMENSIONS = [
     category: "既定事实连续性",
     legacyBucket: "consistency",
     promptFocus: "检查正文是否否认、重置、重发明已确立事实；是否把已执行过的命令写成首次提出；是否把可继续争执的执行细节误写成底层结论重新未定。",
+  },
+  {
+    id: "carryover_replay",
+    label: "Carryover Replay",
+    category: "既定事实连续性",
+    legacyBucket: "consistency",
+    promptFocus: "检查上一章末尾已完成的动作是否被本章开头重新当成首次事件完整重演；允许承接后果，不允许把已完成动作再次写成核心场景。",
   },
   {
     id: "timeline_continuity",

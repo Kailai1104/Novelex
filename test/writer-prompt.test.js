@@ -281,6 +281,119 @@ test("writer prompt includes timeline skip contract when provided", () => {
   assert.match(promptPacket.markdown, /有效倒计时：天亮返航/u);
 });
 
+test("writer prompt downgrades resolved carryover beats into consequence-forward instructions", () => {
+  const promptPacket = buildWriterPromptPacket({
+    project: baseProject(),
+    chapterPlan: {
+      ...baseChapterPlan(),
+      chapterId: "ch015",
+      chapterNumber: 15,
+      title: "第十五章：黑货与催命符",
+      keyEvents: [
+        "李凡用绞标为林定海止血",
+        "许三娘通过吃水线判断底舱压着黑货",
+        "众人决定立刻开舱查验",
+      ],
+      scenes: [
+        {
+          id: "scene_1",
+          label: "先救人",
+          focus: "李凡制作简易绞标替林定海止血",
+          characters: ["李凡", "林定海", "众水手"],
+          outcome: "林定海的血暂时被勒住",
+          handoffToNext: "众人必须决定先救人还是先稳船",
+        },
+        {
+          id: "scene_2",
+          label: "看吃水",
+          focus: "许三娘通过吃水线看出底舱压着黑货",
+          characters: ["许三娘", "李凡", "众水手"],
+          outcome: "众人确认舱底可能藏着黑货",
+          handoffToNext: "下一步必须立刻开舱查验",
+        },
+      ],
+    },
+    historyPacket: {
+      ...baseHistoryPacket(),
+      lastEnding: "上一章末尾，李凡已经为林定海做了第一轮止血，许三娘也指出吃水线异常。",
+    },
+    writerContextPacket: baseWriterContext(),
+    governance: {
+      ruleStack: {
+        hardFacts: [
+          "只能承接上一章余波，不可把已完成动作重写成首次事件。",
+        ],
+        currentTask: [
+          "李凡用绞标为林定海止血",
+          "许三娘通过吃水线判断底舱压着黑货",
+          "众人必须决定是否立刻开舱查验",
+        ],
+        deferRules: [],
+      },
+    },
+    factContext: {
+      establishedFacts: [
+        { factId: "fact_ch014_006", subject: "许三娘", assertion: "已指出吃水线异常与底舱重物" },
+        { factId: "fact_ch014_007", subject: "林定海", assertion: "李凡已完成第一轮勒脉止血" },
+      ],
+      openTensions: [
+        { factId: "fact_ch014_006", subject: "黑货", assertion: "本章只能推进查验与揭晓，不可重演首次发现" },
+        { factId: "fact_ch014_007", subject: "林定海", assertion: "本章只能推进伤情后果，不可重演第一轮止血" },
+      ],
+    },
+    continuityGuard: {
+      resolvedCarryoverBeats: [
+        "李凡已对林定海做第一轮勒脉止血，只能承接伤情后果，不可重新完整演止血",
+        "许三娘已指出吃水线异常与底舱重物，只能推进查验/揭晓，不可重新完整演发现过程",
+      ],
+    },
+  });
+
+  assert.equal(/制作简易绞标替林定海止血|通过吃水线看出底舱压着黑货/u.test(promptPacket.markdown), false);
+  assert.match(promptPacket.markdown, /推进林定海伤情的后果与保命代价，不重演第一轮止血/u);
+  assert.match(promptPacket.markdown, /直接推进底舱查验与黑货揭晓，不重演吃水异常的首次判断/u);
+  assert.match(promptPacket.markdown, /已完成动作不可重演：李凡已对林定海做第一轮勒脉止血/u);
+  assert.match(promptPacket.markdown, /承接上一章已完成的第一轮止血/u);
+  assert.match(promptPacket.markdown, /承接上一章已指出的吃水异常/u);
+});
+
+test("writer prompt renders execution contract directly when provided", () => {
+  const promptPacket = buildWriterPromptPacket({
+    project: baseProject(),
+    chapterPlan: {
+      ...baseChapterPlan(),
+      chapterId: "ch015",
+      chapterNumber: 15,
+      title: "第十五章：黑货与催命符",
+    },
+    historyPacket: baseHistoryPacket(),
+    writerContextPacket: baseWriterContext(),
+    governance: baseGovernance(),
+    executionContract: {
+      mustLand: ["直接推进开舱查验", "让伤情后果逼近不可拖延的代价"],
+      carryoverStates: ["上一章止血已完成，只能承接后果"],
+      openTensions: ["黑货是否属实要在本章推进到可验证状态"],
+      sceneDirectives: [
+        {
+          label: "先稳局势",
+          mission: "让甲板众人先围绕伤情和船况做出选择",
+          characters: ["李凡", "林定海", "众水手"],
+          outcome: "局势逼出查验决定",
+          handoff: "压向开舱",
+        },
+      ],
+      hardBoundaries: ["不得把上一章已完成动作重写成首次事件"],
+      deferredThreads: ["不要提前回收更后面的旧债"],
+      writerWarnings: ["不要把余波写成第一次发现"],
+    },
+  });
+
+  assert.match(promptPacket.markdown, /直接推进开舱查验/u);
+  assert.match(promptPacket.markdown, /不得把上一章已完成动作重写成首次事件/u);
+  assert.match(promptPacket.markdown, /先稳局势｜任务:让甲板众人先围绕伤情和船况做出选择/u);
+  assert.match(promptPacket.markdown, /不要把余波写成第一次发现/u);
+});
+
 test("project-2 ch002 fixture produces compact writer prompt without polluted names or object noise", async (t) => {
   const fixtureDir = path.join(process.cwd(), "projects", "project-2", "runtime", "staging", "write", "ch002");
   try {

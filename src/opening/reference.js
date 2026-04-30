@@ -2,9 +2,11 @@ import path from "node:path";
 
 import { createContextSource, mergeContextSources } from "../core/input-governance.js";
 import { createExcerpt, extractJsonObject, safeJsonParse, unique } from "../core/text.js";
-import { generateStructuredObject } from "../llm/structured.js";
+import { generateStructuredObject, generateTextWithJsonFallback } from "../llm/structured.js";
 import { renderWriterContextMarkdown } from "../retrieval/writer-context.js";
 import { loadOpeningCollectionChunks } from "./index.js";
+
+const OPENING_ROUTING_SLOT = "secondary";
 
 function normalizeList(values, limit = 8) {
   return unique((Array.isArray(values) ? values : [])
@@ -141,8 +143,10 @@ async function runOpeningQueryPlannerAgent({
       ? `${chapterBase.chapterId} ${chapterBase.title}`
       : `${project.title} 的开头设计`;
 
-  const result = await provider.generateText({
+  const parsed = await generateTextWithJsonFallback(provider, {
+    label: "OpeningQueryPlannerAgent",
     agentComplexity: "simple",
+    preferredAgentSlot: OPENING_ROUTING_SLOT,
     instructions:
       "你是 Novelex 的 OpeningQueryPlannerAgent。请围绕优秀网文前三章的结构学习，为当前任务生成少量高价值检索问题。重点关注开场钩子、主角亮相、冲突点燃、信息投放顺序、前三章升级节奏与章末牵引。严格避免要求模仿原句。只输出 JSON。",
     input: [
@@ -167,7 +171,6 @@ async function runOpeningQueryPlannerAgent({
     },
   });
 
-  const parsed = parseAgentJson(result, "OpeningQueryPlannerAgent");
   return {
     queries: normalizeList(parsed.queries, 4),
     focusAspects: normalizeList(parsed.focusAspects, 6),
@@ -232,8 +235,10 @@ async function runOpeningRecallAgent({
   planner,
   chunks,
 }) {
-  const result = await provider.generateText({
+  const parsed = await generateTextWithJsonFallback(provider, {
+    label: "OpeningRecallAgent",
     agentComplexity: "simple",
+    preferredAgentSlot: OPENING_ROUTING_SLOT,
     instructions:
       "你是 Novelex 的 OpeningRecallAgent。你会看到优秀网文前三章的 chunk 摘要目录。请只挑出最值得进入二次精读的片段，重点学习开场钩子、主角亮相、冲突点燃、前三章升级和章末牵引。只输出 JSON。",
     input: [
@@ -256,7 +261,6 @@ async function runOpeningRecallAgent({
     },
   });
 
-  const parsed = parseAgentJson(result, "OpeningRecallAgent");
   const reasons = parsed.reasons && typeof parsed.reasons === "object" ? parsed.reasons : {};
   const selectedIds = new Set((Array.isArray(parsed.selectedChunkIds) ? parsed.selectedChunkIds : [])
     .map((id) => String(id || "").trim())
@@ -464,6 +468,7 @@ export async function scopeOpeningReferencePacketWithAgent(provider, packet, {
   return generateStructuredObject(provider, {
     label: "OpeningReferenceScoperAgent",
     agentComplexity: "simple",
+    preferredAgentSlot: OPENING_ROUTING_SLOT,
     instructions:
       "你是 Novelex 的 OpeningReferenceScoperAgent。你负责把黄金三章参考包压缩成适合当前章节位的抽象结构信号。对非第一章，必须主动压制第一章冷启动模板、源小说人物名、具体桥段和 Beat 编号，只保留连续章节也能安全继承的结构方法。只输出 JSON。",
     input: [

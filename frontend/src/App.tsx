@@ -1073,6 +1073,8 @@ export default function App() {
   const renderChapterOutlineReviewBody = () => {
     const chapterId = pending?.chapterPlan?.chapterId || pending?.chapterId || "pending";
     const workbench = outlineWorkbenchFor(chapterId, pending);
+    const composedAuditSummary = String(pending?.reviewState?.composedAuditSummary || "").trim();
+    const composedAuditIssues = (pending?.reviewState?.composedAuditIssues || []).filter(Boolean);
     return (
       <div className="review-body">
         <p>先确定本章细纲，再进入正文生成。你可以直接采用某个方案，也可以把不同方案里的场景片段组合成最终细纲。</p>
@@ -1085,20 +1087,67 @@ export default function App() {
             setReviewFeedback((current) => ({ ...current, chapter_outline: event.target.value }));
           }}
         />
+        {composedAuditSummary ? (
+          <div className="outline-audit-panel" data-tone="danger">
+            <strong>组合稿未通过审计</strong>
+            <p>{composedAuditSummary}</p>
+            {composedAuditIssues.length ? (
+              <ul className="outline-issue-list">
+                {composedAuditIssues.slice(0, 4).map((issue: any, index: number) => (
+                  <li key={`${issue.id || "issue"}-${index}`}>{issue.description || String(issue)}</li>
+                ))}
+              </ul>
+            ) : null}
+            <p><small>请重新组合，或直接选择已通过预审的候选。</small></p>
+          </div>
+        ) : null}
         <div className="candidate-stack">
-          {(pending?.chapterOutlineCandidates || []).length ? (pending?.chapterOutlineCandidates || []).map((candidate: any) => (
-            <div className="candidate-card" key={candidate.proposalId}>
+          {(pending?.chapterOutlineCandidates || []).length ? (pending?.chapterOutlineCandidates || []).map((candidate: any) => {
+            const candidateSelectable = candidate?.selectable !== false && candidate?.auditStatus !== "failed";
+            return (
+            <div
+              className={`candidate-card ${candidateSelectable ? "is-passed" : "is-failed"}`}
+              key={candidate.proposalId}
+            >
               <div className="candidate-head">
                 <div>
                   <strong>{candidate.proposalId} · {candidate.chapterPlan?.title || ""}</strong>
+                  <div className="pill-row candidate-status-row">
+                    <span className="mini-pill" data-tone={candidateSelectable ? "success" : "danger"}>
+                      {candidateSelectable ? "预审通过" : "预审失败"}
+                    </span>
+                    {Number.isFinite(Number(candidate.auditScore)) ? (
+                      <span className="mini-pill" data-tone={candidateSelectable ? "success" : "danger"}>
+                        score {candidate.auditScore}
+                      </span>
+                    ) : null}
+                  </div>
                   <p>{candidate.summary || ""}</p>
                   <p><small>{candidate.diffSummary || ""}</small></p>
+                  {candidate.auditSummary ? <p><small>{candidate.auditSummary}</small></p> : null}
+                  {!candidateSelectable && (candidate.auditIssues || []).length ? (
+                    <ul className="outline-issue-list">
+                      {(candidate.auditIssues || []).slice(0, 3).map((issue: any, index: number) => (
+                        <li key={`${candidate.proposalId}-issue-${index}`}>{issue.description || String(issue)}</li>
+                      ))}
+                    </ul>
+                  ) : null}
                 </div>
                 <button
                   className="button button-primary"
                   type="button"
                   disabled={mutationBusy()}
                   onClick={async () => {
+                    if (!candidateSelectable) {
+                      const confirmationText = [
+                        "该细纲候选未通过预审，确认仍要直接采用并进入正文写作吗？",
+                        candidate.auditSummary ? `审计结论：${candidate.auditSummary}` : "",
+                        ...((candidate.auditIssues || []).slice(0, 4).map((issue: any) => `- ${issue.description || String(issue)}`)),
+                      ].filter(Boolean).join("\n");
+                      if (!window.confirm(confirmationText)) {
+                        return;
+                      }
+                    }
                     await runMutation("chapter_review", () => reviewWrite(effectiveProjectId!, {
                       target: "chapter_outline",
                       approved: true,
@@ -1108,14 +1157,14 @@ export default function App() {
                       authorNotes: reviewFeedback.chapter_outline || "",
                       outlineOptions,
                     }), {
-                      successMessage: "细纲已确认，系统正在生成正文。",
                       onSuccess: () => {
                         setActiveMainSection("write");
+                        showToast("细纲已确认，系统正在生成正文。");
                       },
                     });
                   }}
                 >
-                  {mutationBusy("chapter_review") ? "提交中..." : "直接采用"}
+                  {mutationBusy("chapter_review") ? "提交中..." : candidateSelectable ? "直接采用" : "仍然采用"}
                 </button>
               </div>
               <div className="candidate-scene-list">
@@ -1142,7 +1191,7 @@ export default function App() {
                 ))}
               </div>
             </div>
-          )) : <div className="empty">当前没有可用的细纲候选。</div>}
+          ); }) : <div className="empty">当前没有可用的细纲候选。</div>}
         </div>
         <div className="compose-card">
           <strong>最终细纲工作区</strong>
@@ -1217,9 +1266,9 @@ export default function App() {
                 authorNotes: reviewFeedback.chapter_outline || "",
                 outlineOptions,
               }), {
-                successMessage: "细纲已确认，系统正在生成正文。",
                 onSuccess: () => {
                   setActiveMainSection("write");
+                  showToast("细纲已确认，系统正在生成正文。");
                 },
               });
             }}
@@ -1257,6 +1306,10 @@ export default function App() {
     const validation = pending?.validation || {};
     const reviewState = pending?.reviewState || {};
     const issueCounts = validation.issueCounts || { critical: 0, warning: 0, info: 0 };
+    const validationIssues = Array.isArray(validation.issues) ? validation.issues : [];
+    const activeDimensions = Array.isArray(validation.activeDimensions) ? validation.activeDimensions : [];
+    const auditGroups = Array.isArray(validation.auditGroups) ? validation.auditGroups : [];
+    const dimensionMeta = new Map(activeDimensions.map((item: any) => [item.id, item]));
     const manualReviewRequired = Boolean(reviewState.manualReviewRequired);
     const feedbackSupervisionPassed = reviewState.feedbackSupervisionPassed !== false;
     const approvalOverrideRequired = manualReviewRequired || validation?.overallPassed === false || !feedbackSupervisionPassed;
@@ -1359,6 +1412,49 @@ export default function App() {
           {blockingFeedbackIssues.length ? <p><small>未落实反馈：{blockingFeedbackIssues.join("；")}</small></p> : null}
           {blockingIssues.length ? <p><small>未解决问题：{blockingIssues.join("；")}</small></p> : null}
         </div>
+        {auditGroups.length ? (
+          <div className="compose-card">
+            <strong>分组审计</strong>
+            <p><small>当前正文审计被拆为 3 个并行方向；下面展示每组负责的维度、命中问题数和分组摘要。</small></p>
+            <div className="compose-list">
+              {auditGroups.map((group: any) => {
+                const dimensionIds = Array.isArray(group?.dimensionIds) ? group.dimensionIds : [];
+                const groupIssues = validationIssues.filter((issue: any) => dimensionIds.includes(issue?.id));
+                const groupCounts = groupIssues.reduce((acc: any, issue: any) => {
+                  const severity = String(issue?.severity || "").trim();
+                  if (severity in acc) acc[severity] += 1;
+                  return acc;
+                }, { critical: 0, warning: 0, info: 0 });
+                const dimensionLabels = dimensionIds.map((id: string) => {
+                  const meta = dimensionMeta.get(id);
+                  return meta ? `${id}（${meta.category}）` : id;
+                });
+                const slotLabel = group?.preferredAgentSlot === "primary" ? "主审计槽" : "辅审计槽";
+                const stateLabel = group?.error
+                  ? "执行失败"
+                  : groupCounts.critical
+                    ? "存在 critical"
+                    : groupCounts.warning
+                      ? "存在 warning"
+                      : groupCounts.info
+                        ? "仅 info"
+                        : "通过";
+
+                return (
+                  <div className="compose-item" key={group?.id || group?.label}>
+                    <div>
+                      <strong>{group?.label || group?.id || "未命名分组"}</strong>
+                      <p><small>{slotLabel}｜状态：{stateLabel}｜critical {groupCounts.critical} / warning {groupCounts.warning} / info {groupCounts.info}</small></p>
+                      <p><small>负责维度：{dimensionLabels.join("、") || "无"}</small></p>
+                      {group?.summary ? <p><small>摘要：{group.summary}</small></p> : null}
+                      {group?.error ? <p><small>错误：{group.error}</small></p> : null}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
         <textarea
           id="feedback-chapter"
           placeholder="写下你的修改意见，比如要加强哪段冲突、调整节奏、补足人物动机或优化章末牵引。"
@@ -2026,40 +2122,37 @@ function ChapterBody(props: {
   onInput?: (value: string) => void;
   onSelectionCapture?: (container: HTMLDivElement) => void;
 }) {
+  if (props.editable) {
+    return (
+      <textarea
+        className="chapter-body-selectable chapter-body-editor is-editing"
+        data-chapter-id={props.chapterId}
+        spellCheck={false}
+        value={props.body}
+        onChange={(event) => {
+          props.onInput?.(event.target.value.replace(/\r\n?/g, "\n"));
+        }}
+      />
+    );
+  }
+
   return (
     <div
-      className={`chapter-body-selectable ${props.editable ? "is-editing" : ""}`}
+      className="chapter-body-selectable"
       data-chapter-id={props.chapterId}
-      data-chapter-body-selectable={props.editable ? undefined : "true"}
-      data-chapter-body-editable={props.editable ? "true" : undefined}
+      data-chapter-body-selectable="true"
       tabIndex={0}
-      contentEditable={props.editable}
-      suppressContentEditableWarning
-      spellCheck={false}
-      onInput={(event) => {
-        if (props.editable) {
-          props.onInput?.(
-            String((event.currentTarget as HTMLDivElement).innerText || "")
-              .replace(/\u00a0/g, " ")
-              .replace(/\r\n?/g, "\n"),
-          );
-        }
-      }}
       onMouseUp={(event) => {
-        if (!props.editable) {
-          const container = event.currentTarget;
-          window.setTimeout(() => {
-            props.onSelectionCapture?.(container);
-          }, 0);
-        }
+        const container = event.currentTarget;
+        window.setTimeout(() => {
+          props.onSelectionCapture?.(container);
+        }, 0);
       }}
       onKeyUp={(event) => {
-        if (!props.editable) {
-          const container = event.currentTarget;
-          window.setTimeout(() => {
-            props.onSelectionCapture?.(container);
-          }, 0);
-        }
+        const container = event.currentTarget;
+        window.setTimeout(() => {
+          props.onSelectionCapture?.(container);
+        }, 0);
       }}
     >
       {props.body}

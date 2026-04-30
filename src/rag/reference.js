@@ -2,10 +2,12 @@ import path from "node:path";
 
 import { createContextSource, mergeContextSources } from "../core/input-governance.js";
 import { createExcerpt, extractJsonObject, safeJsonParse, unique } from "../core/text.js";
+import { generateTextWithJsonFallback } from "../llm/structured.js";
 import { renderWriterContextMarkdown } from "../retrieval/writer-context.js";
 import { loadCollectionChunks, runHybridRetrieval } from "./index.js";
 
 const REFERENCE_RECALL_CANDIDATE_LIMIT = 12;
+const REFERENCE_ROUTING_SLOT = "secondary";
 
 function normalizeList(values, limit = 8) {
   return unique((Array.isArray(values) ? values : [])
@@ -118,8 +120,10 @@ async function runReferenceQueryPlannerAgent({
   historyContext,
   researchPacket,
 }) {
-  const result = await provider.generateText({
+  const parsed = await generateTextWithJsonFallback(provider, {
+    label: "ReferenceQueryPlannerAgent",
     agentComplexity: "simple",
+    preferredAgentSlot: REFERENCE_ROUTING_SLOT,
     instructions:
       "你是 Novelex 的 ReferenceQueryPlannerAgent。请根据当前章节写作任务，给范文检索系统生成少量高价值查询。重点是要检索叙事处理方式、场景组织方式、人物出场节奏、对白/动作推进和氛围写法，而不是事实考据。只输出 JSON。",
     input: [
@@ -143,7 +147,6 @@ async function runReferenceQueryPlannerAgent({
     },
   });
 
-  const parsed = parseAgentJson(result, "ReferenceQueryPlannerAgent");
   return {
     queries: normalizeList(parsed.queries, 4),
     focusAspects: normalizeList(parsed.focusAspects, 6),
@@ -158,8 +161,10 @@ async function runReferenceSynthesizerAgent({
   planner,
   matches,
 }) {
-  const result = await provider.generateText({
+  const parsed = await generateTextWithJsonFallback(provider, {
+    label: "ReferenceSynthesizerAgent",
     agentComplexity: "simple",
+    preferredAgentSlot: REFERENCE_ROUTING_SLOT,
     instructions:
       "你是 Novelex 的 ReferenceSynthesizerAgent。你会看到若干命中的范文片段。请把它们压缩成 Writer 直接能消费的范文参考包。只总结可借鉴的叙事技法、场景处理、人物推进方式和需要避免的模仿风险，不要鼓励照抄原文。只输出 JSON。",
     input: [
@@ -186,7 +191,6 @@ async function runReferenceSynthesizerAgent({
     },
   });
 
-  const parsed = parseAgentJson(result, "ReferenceSynthesizerAgent");
   return {
     summary: String(parsed.summary || "").trim(),
     styleSignals: normalizeReferenceSignalList(parsed.styleSignals, 6),
@@ -202,8 +206,10 @@ async function runReferenceRecallAgent({
   planner,
   chunks,
 }) {
-  const result = await provider.generateText({
+  const parsed = await generateTextWithJsonFallback(provider, {
+    label: "ReferenceRecallAgent",
     agentComplexity: "simple",
+    preferredAgentSlot: REFERENCE_ROUTING_SLOT,
     instructions:
       "你是 Novelex 的 ReferenceRecallAgent。你会看到范文库的 chunk 摘要目录。请只挑出最值得进入二次精读的候选片段，重点看叙事技法、场景组织、人物推进和动作/对白节奏，不要挑纯设定说明。只输出 JSON。",
     input: [
@@ -227,7 +233,6 @@ async function runReferenceRecallAgent({
     },
   });
 
-  const parsed = parseAgentJson(result, "ReferenceRecallAgent");
   const reasons = parsed.reasons && typeof parsed.reasons === "object" ? parsed.reasons : {};
   const selectedIds = new Set((Array.isArray(parsed.selectedChunkIds) ? parsed.selectedChunkIds : [])
     .map((id) => String(id || "").trim())

@@ -1,18 +1,15 @@
 import { normalizeStyleFingerprint, buildStyleFingerprintId, buildStyleFingerprintStats, buildStyleFingerprintSummary, renderStyleFingerprintPrompt } from "../core/style-fingerprint.js";
 import { createExcerpt, extractJsonObject, nowIso, safeJsonParse } from "../core/text.js";
+import { generateTextWithJsonFallback } from "../llm/structured.js";
 import { createProvider } from "../llm/provider.js";
 
-function parseAgentJson(result) {
-  const parsed = safeJsonParse(extractJsonObject(result?.text || ""), null);
-  if (!parsed || typeof parsed !== "object") {
-    throw new Error(`StyleFingerprintAgent 返回了无法解析的 JSON：${createExcerpt(result?.text || "", 240)}`);
-  }
-  return parsed;
-}
+const STYLE_FINGERPRINT_ROUTING_SLOT = "secondary";
 
 async function runStyleFingerprintAgent(provider, { name, sampleText }) {
-  const result = await provider.generateText({
+  const parsed = await generateTextWithJsonFallback(provider, {
+    label: "StyleFingerprintAgent",
     agentComplexity: "simple",
+    preferredAgentSlot: STYLE_FINGERPRINT_ROUTING_SLOT,
     instructions: [
       "你是 Novelex 的 StyleFingerprintAgent。",
       "你的任务是读取一篇范文，抽取它在写作层面的稳定风格特征，并输出结构化 JSON。",
@@ -42,7 +39,7 @@ async function runStyleFingerprintAgent(provider, { name, sampleText }) {
     },
   });
 
-  return normalizeStyleFingerprint(parseAgentJson(result));
+  return normalizeStyleFingerprint(parsed);
 }
 
 export async function generateStyleFingerprint(store, { name, sampleText }) {
